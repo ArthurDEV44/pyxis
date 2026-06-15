@@ -1,0 +1,3 @@
+# mold = link plus rapide (présent dans l'env d'Arthur). sccache absent → non câblé ici.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]

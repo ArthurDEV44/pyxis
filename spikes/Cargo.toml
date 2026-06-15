@@ -1,0 +1,43 @@
+# Workspace JETABLE de Phase 0 (EP-001). Ces crates prouvent une hypothèse,
+# pas une feature finie — ils ne survivront pas tels quels au MVP (cf.
+# docs/ROADMAP.md « Phase 0 », DoD EP-001). Le futur workspace MVP vivra à la
+# racine du repo avec des crates `agent-*` ; ces spikes sont préfixés `s*` et
+# `canon` pour qu'aucune ligne de MVP ne soit confondue avec eux.
+[workspace]
+resolver = "3"
+members = [
+    "s1-provider-access",
+    "s2-canonical-sse",
+    "s3-agent-loop",
+    "s4-tui-stream",
+    "s5-sandbox",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-stream = "0.3"
+anyhow = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+landlock = "0.4"
+
+# Lints clippy obligatoires (mandat global Arthur). Throwaway ≠ sale :
+# panic/unimplemented/dbg = deny ; unwrap/expect = warn (pas deny, cf. CLAUDE.md).
+[workspace.lints.clippy]
+panic = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+unwrap_in_result = "warn"
