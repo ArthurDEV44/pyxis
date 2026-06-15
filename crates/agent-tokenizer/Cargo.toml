@@ -1,0 +1,18 @@
+[package]
+name = "agent-tokenizer"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Headless : aucune dépendance TUI/HTTP (invariant 1). tiktoken-rs derrière un
+# feature pour garder le build léger ; l'heuristique suffit au seuil de compaction.
+[features]
+default = []
+tiktoken = ["dep:tiktoken-rs"]
+
+[dependencies]
+tiktoken-rs = { version = "0.7", optional = true }
