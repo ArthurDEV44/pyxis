@@ -1,0 +1,27 @@
+[package]
+name = "agent-tools"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# `agent-tools` implémente le trait `ToolDispatch` du cœur (la seule frontière,
+# ARCHITECTURE §4) : Registry, pipeline strict, permissions, taint. Dépend
+# d'`agent-core` pour les types canoniques (ToolInvocation/ToolOutcome/ToolSpec).
+[dependencies]
+agent-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+tokio = { workspace = true, features = ["process", "fs"] }
+thiserror.workspace = true
+regex.workspace = true
+globset.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
