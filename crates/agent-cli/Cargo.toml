@@ -1,0 +1,31 @@
+[package]
+name = "agent-cli"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Binaire publié `numen` (ADR-5/ADR-8). SEUL crate qui dépend de tout : il câble
+# le cœur, le provider, les outils, la session, le sandbox et le frontend.
+[[bin]]
+name = "numen"
+path = "src/main.rs"
+
+[dependencies]
+agent-core.workspace = true
+agent-tokenizer.workspace = true
+agent-session.workspace = true
+agent-auth.workspace = true
+agent-provider.workspace = true
+agent-tools.workspace = true
+agent-sandbox.workspace = true
+agent-tui.workspace = true
+tokio.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+anyhow.workspace = true
