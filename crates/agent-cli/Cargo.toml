@@ -22,6 +22,7 @@ agent-auth.workspace = true
 agent-provider.workspace = true
 agent-tools.workspace = true
 agent-sandbox.workspace = true
+agent-mcp.workspace = true
 agent-tui.workspace = true
 tokio.workspace = true
 crossterm.workspace = true

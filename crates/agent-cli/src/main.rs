@@ -42,7 +42,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         prompt: None,
-        model: "gpt-5".to_string(),
+        model: agent_provider::DEFAULT_MODEL.to_string(),
         allow_hosts: Vec::new(),
         yes: false,
         sandbox: true,
@@ -78,6 +78,19 @@ fn main() -> anyhow::Result<()> {
     let args = parse_args();
     let workspace = std::env::current_dir()?;
 
+    // Skills lus AVANT le sandbox : `~/.agents/skills` est hors workspace, donc
+    // inaccessible une fois Landlock appliqué.
+    let skills = read_skills();
+
+    // Config MCP lue AVANT le sandbox : `~/.claude.json` (serveurs Claude Code
+    // réutilisés) est hors workspace, donc inaccessible une fois Landlock posé. En
+    // mode -p (headless) le menu /mcp n'existe pas → on ne lit rien (latence).
+    let mcp_config = if args.prompt.is_none() {
+        read_mcp_config(&workspace)
+    } else {
+        agent_mcp::McpConfigFile::default()
+    };
+
     // Sandbox FS AVANT le runtime (thread principal → hérité par les workers).
     if args.sandbox {
         match agent_sandbox::enforce_process(&workspace) {
@@ -93,10 +106,56 @@ fn main() -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(args, workspace))
+    rt.block_on(run(args, workspace, skills, mcp_config))
 }
 
-async fn run(args: Args, workspace: std::path::PathBuf) -> anyhow::Result<()> {
+/// Découvre les serveurs MCP avant le sandbox : `<workspace>/.mcp.json` (priorité
+/// haute) fusionné sous les `mcpServers` user-scope de `~/.claude.json` (réutilise
+/// les serveurs déjà installés pour Claude Code). Best-effort : un fichier
+/// illisible ou invalide est signalé puis ignoré.
+fn read_mcp_config(workspace: &std::path::Path) -> agent_mcp::McpConfigFile {
+    let workspace_cfg = agent_mcp::McpConfigFile::load(workspace).unwrap_or_else(|e| {
+        eprintln!("[mcp] {e}");
+        agent_mcp::McpConfigFile::default()
+    });
+    let claude_cfg = std::env::var_os("HOME")
+        .map(|home| {
+            let path = std::path::Path::new(&home).join(".claude.json");
+            agent_mcp::McpConfigFile::load_claude(&path).unwrap_or_else(|e| {
+                eprintln!("[mcp] ~/.claude.json : {e}");
+                agent_mcp::McpConfigFile::default()
+            })
+        })
+        .unwrap_or_default();
+    workspace_cfg.merge_under(claude_cfg)
+}
+
+/// Liste les skills disponibles dans `~/.agents/skills` (un dossier = un skill,
+/// nom = nom du dossier), triés. Symlink partagé entre CLIs ; lecture best-effort.
+fn read_skills() -> Vec<String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let dir = std::path::Path::new(&home).join(".agents").join("skills");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut skills: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.'))
+        .collect();
+    skills.sort();
+    skills
+}
+
+async fn run(
+    args: Args,
+    workspace: std::path::PathBuf,
+    skills: Vec<String>,
+    mcp_config: agent_mcp::McpConfigFile,
+) -> anyhow::Result<()> {
     // 1. Credential abonnement ChatGPT (keyring). Absente → on guide vers le login.
     let cred = match store::load(KEYRING_ACCOUNT)? {
         Some(agent_auth::Credential::Oauth(o)) => o,
@@ -119,12 +178,25 @@ async fn run(args: Args, workspace: std::path::PathBuf) -> anyhow::Result<()> {
     let harden: agent_tools::CommandHardener =
         Arc::new(move |cmd: &mut tokio::process::Command| set_proxy_env(cmd, &proxy_addr));
 
-    // 3. Session persistante (JSONL sous <workspace>/.numen) + snapshot mémoire.
-    let session_dir = workspace.join(".numen").join("sessions");
-    std::fs::create_dir_all(&session_dir)?;
-    let jsonl = agent_session::JsonlSession::create_in(&session_dir)
+    // 3. Session persistante : un fichier JSONL par conversation (horodaté) sous
+    // <workspace>/.numen/sessions/, listable/reprenable via `/resume`.
+    let sessions_dir = workspace.join(".numen").join("sessions");
+    std::fs::create_dir_all(&sessions_dir)?;
+    let session_millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let current_session = sessions_dir.join(format!("{session_millis}.jsonl"));
+    let jsonl = agent_session::JsonlSession::create_at(&current_session)
         .map_err(|e| anyhow::anyhow!("session : {e}"))?;
     let (shared_session, conversation) = SharedSession::new(jsonl);
+
+    // Objectif de session persistant (`/goal`) : chargé du sidecar `.numen/goal`
+    // (survit au redémarrage), composé dans le system prompt à chaque tour.
+    let goal = std::fs::read_to_string(workspace.join(".numen").join("goal"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     // 4. Registry d'outils + approbateur (TUI en interactif, auto en headless).
     let headless = args.prompt.is_some();
@@ -158,7 +230,7 @@ async fn run(args: Args, workspace: std::path::PathBuf) -> anyhow::Result<()> {
     // 5. Deps injectées dans la boucle.
     let deps = Deps {
         provider,
-        session: shared_session,
+        session: shared_session.clone(),
         tokenizer: Arc::new(HeuristicCounter),
         clock: Arc::new(SystemClock),
         tools: Arc::new(registry),
@@ -168,28 +240,55 @@ async fn run(args: Args, workspace: std::path::PathBuf) -> anyhow::Result<()> {
     if let Some(prompt) = args.prompt {
         let ctx = AgentContext {
             model: args.model,
-            system: Some(SYSTEM_PROMPT.to_string()),
+            system: Some(interactive::compose_system(SYSTEM_PROMPT, goal.as_deref())),
             messages: vec![Message::user(prompt)],
             tools: tool_specs,
             config: RunConfig::default(),
         };
         let result = agent_core::run_headless(ctx, deps).await;
-        print!("{}", result.text);
-        if !result.text.ends_with('\n') {
+        // En one-shot, pas de boucle d'objectif : on retire juste le marqueur.
+        let text = result
+            .text
+            .replace(interactive::GOAL_DONE_MARKER, "")
+            .trim_end()
+            .to_string();
+        print!("{text}");
+        if !text.ends_with('\n') {
             println!();
         }
         if let agent_core::HeadlessEnd::Error(e) = result.ended {
             anyhow::bail!("{e}");
         }
     } else {
+        // Registre MCP construit depuis la config découverte avant le sandbox
+        // (workspace + ~/.claude.json). Tous les serveurs démarrent déconnectés ;
+        // la connexion se fait à la demande via `/mcp`.
+        let mcp = Arc::new(std::sync::Mutex::new(agent_mcp::McpRegistry::from_config(
+            mcp_config,
+        )));
+
         let cfg = InteractiveConfig {
             model: args.model,
             system: SYSTEM_PROMPT.to_string(),
             run_config: RunConfig::default(),
             tool_specs,
             truecolor: agent_tui::supports_truecolor(),
+            // credential chargée plus haut (sinon on a bail) → connecté.
+            connected: true,
+            skills,
+            goal,
         };
-        interactive::run(deps, conversation, perm_rx, cfg).await?;
+        interactive::run(
+            deps,
+            conversation,
+            perm_rx,
+            cfg,
+            shared_session,
+            sessions_dir,
+            current_session,
+            mcp,
+        )
+        .await?;
     }
     Ok(())
 }
