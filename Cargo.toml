@@ -47,8 +47,12 @@ ratatui = "0.29"
 crossterm = "0.28"
 landlock = "0.4"
 anyhow = "1"
+# MCP (ARCHITECTURE §6) : SDK Rust officiel. Client stdio uniquement au départ
+# (transport-child-process) ; SSE/HTTP + OAuth = Phase 2.
+rmcp = { version = "1.7.0", default-features = false, features = ["client", "transport-child-process"] }
 # crates internes
 agent-tokenizer = { path = "crates/agent-tokenizer" }
+agent-mcp = { path = "crates/agent-mcp" }
 agent-core = { path = "crates/agent-core" }
 agent-session = { path = "crates/agent-session" }
 agent-tools = { path = "crates/agent-tools" }
