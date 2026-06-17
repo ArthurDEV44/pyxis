@@ -16,6 +16,9 @@ use crate::tool::{Tool, ToolCtx, ToolOutput};
 const MAX_MATCHES: usize = 500;
 /// Fichiers plus gros que ça sont ignorés (probablement des artefacts).
 const MAX_FILE_BYTES: u64 = 5_000_000;
+/// Borne d'affichage d'une ligne de correspondance (évite un flood sur une ligne
+/// minifiée). Coupe sur une frontière de caractère (cf. `truncate_line`).
+const MAX_LINE_BYTES: usize = 300;
 
 #[derive(Debug, Deserialize)]
 pub struct GrepInput {
@@ -129,7 +132,7 @@ impl Tool for Grep {
                     .into_owned();
                 for (idx, line) in text.lines().enumerate() {
                     if re.is_match(line) {
-                        let trimmed = if line.len() > 300 { &line[..300] } else { line };
+                        let trimmed = truncate_line(line, MAX_LINE_BYTES);
                         out.push(format!("{}:{}: {}", rel, idx + 1, trimmed));
                         if out.len() >= MAX_MATCHES {
                             truncated = true;
@@ -151,8 +154,55 @@ impl Tool for Grep {
         }
         let mut body = lines.join("\n");
         if truncated {
-            body.push_str(&format!("\n… (tronqué à {MAX_MATCHES} correspondances)"));
+            // US-026 : signaler la troncation ET le moyen de paginer (grep n'a pas
+            // d'offset → on guide vers un resserrage de la recherche).
+            body.push_str(&format!(
+                "\n[truncated: {MAX_MATCHES} correspondances atteintes — affinez avec un \
+                 pattern plus précis, un glob, ou un path plus étroit pour voir la suite]"
+            ));
         }
         Ok(ToolOutput::text(body))
+    }
+}
+
+/// Tronque une ligne d'affichage à `max` OCTETS sur une frontière de caractère
+/// UTF-8. Indispensable : `&line[..max]` panique si l'octet `max` tombe au milieu
+/// d'un codepoint multi-octets (ligne à accents/CJK > `max` octets) — récurrent sur
+/// du source à commentaires français. On recule jusqu'à la frontière la plus proche.
+fn truncate_line(line: &str, max: usize) -> &str {
+    if line.len() <= max {
+        return line;
+    }
+    let mut end = max;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_line_is_untouched() {
+        assert_eq!(truncate_line("court", MAX_LINE_BYTES), "court");
+    }
+
+    #[test]
+    fn long_ascii_line_is_cut_at_max() {
+        let line = "x".repeat(400);
+        assert_eq!(truncate_line(&line, MAX_LINE_BYTES).len(), MAX_LINE_BYTES);
+    }
+
+    #[test]
+    fn multibyte_boundary_does_not_panic_and_stays_valid_utf8() {
+        // "a" + 150 × 'é' = 301 octets : l'octet 300 tombe au MILIEU du 150ᵉ 'é'
+        // → `&line[..300]` paniquerait. La coupe recule sur la frontière (299).
+        let line = format!("a{}", "é".repeat(150));
+        assert!(line.len() > MAX_LINE_BYTES && !line.is_char_boundary(MAX_LINE_BYTES));
+        let cut = truncate_line(&line, MAX_LINE_BYTES);
+        assert!(cut.len() <= MAX_LINE_BYTES, "borné");
+        assert!(line.starts_with(cut), "préfixe valide, aucune coupe mid-codepoint");
     }
 }

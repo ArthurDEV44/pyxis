@@ -85,30 +85,120 @@ impl Tool for Read {
                 input.path
             )));
         }
-        if bytes.len() > MAX_BYTES {
-            return Err(ToolError::Rejected(format!(
-                "{} dépasse {} octets (lecture partielle non supportée en MVP)",
-                input.path, MAX_BYTES
-            )));
-        }
-        let text = String::from_utf8_lossy(&bytes);
+        // US-026 : au-delà de MAX_BYTES, lecture PARTIELLE (tête du fichier, coupée
+        // sur une frontière de caractère) + hint de pagination, au lieu d'un rejet sec.
+        let full = String::from_utf8_lossy(&bytes);
+        let oversize = bytes.len() > MAX_BYTES;
+        let text: &str = if oversize {
+            let mut cut = MAX_BYTES;
+            while cut > 0 && !full.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            &full[..cut]
+        } else {
+            full.as_ref()
+        };
         let start = input.offset.unwrap_or(1).max(1);
-        let mut out = String::new();
-        let mut count = 0usize;
-        for (idx, line) in text.lines().enumerate() {
-            let lineno = idx + 1;
-            if lineno < start {
-                continue;
-            }
-            if input.limit.is_some_and(|limit| count >= limit) {
-                break;
-            }
-            out.push_str(&format!("{lineno:>6}\t{line}\n"));
-            count += 1;
+        Ok(ToolOutput::text(render_read(text, start, input.limit, oversize)))
+    }
+}
+
+/// Rend les lignes numérotées de `text` depuis `start` (1-indexé), au plus `limit`
+/// lignes, avec des HINTS de continuation (US-026) : limite atteinte →
+/// `[lignes X-Y sur Z ; offset=Y+1 pour continuer]` ; `oversize` → hint de lecture
+/// partielle ; plage hors limites → hint plutôt qu'un message vague. Pur → testable
+/// sans I/O.
+fn render_read(text: &str, start: usize, limit: Option<usize>, oversize: bool) -> String {
+    let total = text.lines().count();
+    let mut out = String::new();
+    let mut emitted = 0usize;
+    let mut last_line = 0usize;
+    let mut truncated_by_limit = false;
+    for (idx, line) in text.lines().enumerate() {
+        let lineno = idx + 1;
+        if lineno < start {
+            continue;
         }
-        if out.is_empty() {
-            out.push_str("(fichier vide ou plage hors limites)");
+        if limit.is_some_and(|l| emitted >= l) {
+            truncated_by_limit = true;
+            break;
         }
-        Ok(ToolOutput::text(out))
+        out.push_str(&format!("{lineno:>6}\t{line}\n"));
+        emitted += 1;
+        last_line = lineno;
+    }
+    if out.is_empty() {
+        if total == 0 {
+            out.push_str("(fichier vide)");
+        } else {
+            out.push_str(&format!("[plage hors limites : offset={start} > {total} lignes]"));
+        }
+        return out;
+    }
+    if oversize {
+        out.push_str(&format!(
+            "[fichier tronqué à {MAX_BYTES} octets ({emitted} lignes lues) — lisez par \
+             plages avec offset/limit]"
+        ));
+    } else if truncated_by_limit {
+        out.push_str(&format!(
+            "[lignes {start}-{last_line} sur {total} ; offset={} pour continuer]",
+            last_line + 1
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text5() -> &'static str {
+        "l1\nl2\nl3\nl4\nl5\n"
+    }
+
+    #[test]
+    fn full_read_has_no_hint() {
+        let out = render_read(text5(), 1, None, false);
+        assert!(out.contains("     1\tl1"));
+        assert!(out.contains("     5\tl5"));
+        assert!(!out.contains("offset="), "lecture complète → pas de hint: {out}");
+    }
+
+    #[test]
+    fn limit_truncation_emits_continuation_hint() {
+        // 5 lignes, limit 2 depuis offset 1 → lignes 1-2, hint offset=3.
+        let out = render_read(text5(), 1, Some(2), false);
+        assert!(out.contains("     1\tl1"));
+        assert!(out.contains("     2\tl2"));
+        assert!(!out.contains("\tl3"));
+        assert!(
+            out.contains("[lignes 1-2 sur 5 ; offset=3 pour continuer]"),
+            "hint de pagination attendu: {out}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_offset_hints_instead_of_vague_message() {
+        let out = render_read(text5(), 99, None, false);
+        assert!(
+            out.contains("[plage hors limites : offset=99 > 5 lignes]"),
+            "hint hors-plage attendu: {out}"
+        );
+    }
+
+    #[test]
+    fn oversize_emits_partial_read_hint() {
+        let out = render_read("a\nb\n", 1, None, true);
+        assert!(out.contains("     1\ta"));
+        assert!(
+            out.contains("fichier tronqué à") && out.contains("lisez par plages"),
+            "hint de lecture partielle attendu: {out}"
+        );
+    }
+
+    #[test]
+    fn empty_file_reports_empty() {
+        assert_eq!(render_read("", 1, None, false), "(fichier vide)");
     }
 }

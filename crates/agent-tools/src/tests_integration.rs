@@ -737,3 +737,67 @@ async fn default_registry_exposes_six_tool_specs() {
     assert_eq!(names, ["bash", "edit", "glob", "grep", "read", "write"]);
     assert!(specs.iter().all(|s| !s.description.is_empty()));
 }
+
+// ══════════════════════════ EP-007 ══════════════════════════
+
+#[tokio::test]
+async fn edit_absorbs_unicode_divergence() {
+    // US-025 : ancre ASCII vs fichier portant guillemets typographiques + NBSP →
+    // la passe Unicode localise et applique sur la ligne originale.
+    let ws = TempWs::new("edit-fuzzy");
+    let reg = mut_registry(&ws, PermissionMode::AcceptEdits);
+    ws.write("u.rs", "let x = \u{201C}a\u{00A0}b\u{201D};\nkeep\n");
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "edit",
+            serde_json::json!({
+                "path": "u.rs",
+                "old_string": "let x = \"a b\";",
+                "new_string": "let x = REPLACED;"
+            }),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(!o.is_error, "{}", o.content);
+    assert!(
+        o.content.contains("niveau 4"),
+        "le niveau de passe doit être rapporté: {}",
+        o.content
+    );
+    assert_eq!(ws.read("u.rs"), "let x = REPLACED;\nkeep\n");
+}
+
+#[tokio::test]
+async fn grep_truncation_signals_pagination() {
+    // US-026 : > 500 correspondances → signal truncated + moyen de paginer.
+    let ws = TempWs::new("grep-trunc");
+    let content: String = (0..600).map(|i| format!("match line {i}\n")).collect();
+    ws.write("big.txt", &content);
+    let reg = read_registry(&ws);
+    let out = reg
+        .dispatch(vec![call(
+            "a",
+            "grep",
+            serde_json::json!({"pattern": "match line"}),
+        )])
+        .await;
+    let o = by_id(&out, "a");
+    assert!(!o.is_error, "{}", o.content);
+    assert!(
+        o.content.contains("[truncated:") && o.content.contains("affinez"),
+        "signal de troncation + pagination attendus: {}",
+        &o.content[o.content.len().saturating_sub(200)..]
+    );
+}
+
+#[tokio::test]
+async fn registry_collects_tool_behavioral_guidelines() {
+    // US-026 : les guidelines des outils sont collectées (pour injection prompt).
+    let reg = crate::default_registry("/tmp", PermissionMode::Default, allow_approver());
+    let guidelines = reg.behavioral_guidelines();
+    assert!(
+        guidelines.iter().any(|g| g.contains("old_string")),
+        "la guideline edit (ancre sur fichier original) doit être collectée: {guidelines:?}"
+    );
+}

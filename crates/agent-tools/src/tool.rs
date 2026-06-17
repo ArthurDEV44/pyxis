@@ -125,6 +125,14 @@ pub trait Tool: Send + Sync {
         true
     }
 
+    /// Invariants comportementaux co-localisés avec l'outil (US-026) : règles que
+    /// le modèle doit connaître pour bien s'en servir (ex. « l'ancre est cherchée
+    /// dans le fichier original »). Collectés par le Registry et injectés dans le
+    /// system prompt. Défaut : aucune.
+    fn behavioral_guidelines(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Validation d'entrée (pré-permission, pré-exécution). Défaut : accepte.
     fn validate_input(&self, _input: &Self::Input) -> Result<(), ValidationError> {
         Ok(())
@@ -151,6 +159,8 @@ pub trait DynTool: Send + Sync {
     fn is_read_only(&self) -> bool;
     fn is_sensitive(&self) -> bool;
     fn returns_untrusted(&self) -> bool;
+    /// Invariants comportementaux de l'outil (US-026), forwardés depuis `Tool`.
+    fn behavioral_guidelines(&self) -> &[&'static str];
     /// Parse + `validate_input` SANS exécuter (fail-closed, US-010 AC3). Erreur
     /// ⇒ le Registry renvoie l'échec à l'agent sans appeler `call`.
     fn precheck(&self, raw: &serde_json::Value) -> Result<(), ToolError>;
@@ -193,6 +203,9 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
     }
     fn returns_untrusted(&self) -> bool {
         self.inner.returns_untrusted()
+    }
+    fn behavioral_guidelines(&self) -> &[&'static str] {
+        self.inner.behavioral_guidelines()
     }
     fn precheck(&self, raw: &serde_json::Value) -> Result<(), ToolError> {
         let input: T::Input =

@@ -99,8 +99,7 @@ impl Tool for Bash {
             body.push_str(&stderr);
         }
         if body.len() > MAX_OUTPUT {
-            body.truncate(MAX_OUTPUT);
-            body.push_str("\n… (sortie tronquée)");
+            body = truncate_tail(&body, MAX_OUTPUT);
         }
 
         let code = output.status.code();
@@ -120,5 +119,51 @@ impl Tool for Bash {
                 Ok(ToolOutput::error(body))
             }
         }
+    }
+}
+
+/// Tronque `body` en gardant la QUEUE (tail) sur `max` octets (US-026) : sur une
+/// sortie longue (compilation : warnings en tête, erreurs + exit code en queue),
+/// le tail préserve l'information critique. Le point de coupe est aligné sur une
+/// frontière de caractère UTF-8 (jamais de panic d'indexation).
+fn truncate_tail(body: &str, max: usize) -> String {
+    if body.len() <= max {
+        return body.to_string();
+    }
+    let mut cut = body.len() - max;
+    while cut < body.len() && !body.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("[... sortie tronquée, {cut} octets, début omis]\n{}", &body[cut..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_truncation_keeps_the_end_and_marks_omission() {
+        // 10 lignes ; on tronque pour ne garder que la fin (où vivent erreurs/exit).
+        let body: String = (0..10).map(|i| format!("ligne{i}\n")).collect();
+        let out = truncate_tail(&body, 20);
+        assert!(out.starts_with("[... sortie tronquée, "));
+        assert!(out.contains("octets, début omis]"));
+        assert!(out.contains("ligne9"), "la fin doit être conservée: {out}");
+        assert!(!out.contains("ligne0"), "le début doit être omis: {out}");
+    }
+
+    #[test]
+    fn tail_truncation_is_char_boundary_safe() {
+        // coupe au milieu d'un flux multi-octets → pas de panic, frontière respectée.
+        let body = "é".repeat(100); // 200 octets
+        let out = truncate_tail(&body, 51);
+        assert!(out.contains("début omis]"));
+        // le suffixe conservé est de l'UTF-8 valide (aucune coupe mid-codepoint).
+        assert!(out.ends_with('é'));
+    }
+
+    #[test]
+    fn short_output_is_untouched() {
+        assert_eq!(truncate_tail("court", 30_000), "court");
     }
 }

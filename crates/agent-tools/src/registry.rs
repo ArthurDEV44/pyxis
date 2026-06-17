@@ -81,6 +81,24 @@ impl Registry {
         specs
     }
 
+    /// Collecte les guidelines comportementales de tous les outils (US-026), pour
+    /// injection dans le system prompt. Ordre déterministe (tri par nom d'outil,
+    /// guidelines de l'outil dans l'ordre de déclaration) → prompt stable et
+    /// cache-friendly.
+    pub fn behavioral_guidelines(&self) -> Vec<String> {
+        let mut names: Vec<&String> = self.tools.keys().collect();
+        names.sort();
+        let mut out = Vec::new();
+        for n in names {
+            if let Some(t) = self.tools.get(n) {
+                for g in t.behavioral_guidelines() {
+                    out.push((*g).to_string());
+                }
+            }
+        }
+        out
+    }
+
     /// Pipeline strict d'un seul appel. Ne panique jamais : retourne toujours un
     /// `ToolOutcome` corrélé par `id`.
     async fn run_one(&self, call: ToolInvocation) -> ToolOutcome {
