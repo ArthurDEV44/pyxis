@@ -7,7 +7,7 @@
 //! **refuse** par défaut.
 
 use agent_tools::permission::{Approver, PermissionRequest};
-use agent_tui::{DiffKind, DiffLine, PermissionPrompt};
+use agent_tui::{PermissionPrompt, diff};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
@@ -35,63 +35,38 @@ impl Approver for TuiApprover {
     }
 }
 
-/// Construit le prompt visuel depuis la demande : un aperçu adapté à l'outil
-/// (diff `-`/`+` pour `edit`, commande pour `bash`, début de contenu pour
-/// `write`).
+/// Construit le prompt visuel depuis la demande : titre adapté à l'outil + aperçu
+/// via le MÊME moteur de diff que le transcript (`diff::from_tool` pour `edit` /
+/// `write` ; lignes de contexte pour `bash` / inconnu). US-039.
 pub fn to_prompt(req: &PermissionRequest) -> PermissionPrompt {
     let v = &req.input;
     let str_field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or_default();
 
-    let (title, detail) = match req.tool.as_str() {
-        "edit" => {
-            let path = str_field("path");
-            let mut detail = Vec::new();
-            for line in str_field("old_string").split('\n') {
-                detail.push(DiffLine {
-                    kind: DiffKind::Remove,
-                    text: line.to_string(),
-                });
-            }
-            for line in str_field("new_string").split('\n') {
-                detail.push(DiffLine {
-                    kind: DiffKind::Add,
-                    text: line.to_string(),
-                });
-            }
-            (format!("edit {path}"), detail)
-        }
-        "write" => {
-            let path = str_field("path");
-            let detail = str_field("content")
-                .split('\n')
-                .take(10)
-                .map(|l| DiffLine {
-                    kind: DiffKind::Add,
-                    text: l.to_string(),
-                })
-                .collect();
-            (format!("write {path}"), detail)
-        }
-        "bash" => {
-            let detail = vec![DiffLine {
-                kind: DiffKind::Context,
-                text: str_field("command").to_string(),
-            }];
-            ("bash".to_string(), detail)
-        }
-        other => {
-            let detail = vec![DiffLine {
-                kind: DiffKind::Context,
-                text: req.input_summary.clone(),
-            }];
-            (other.to_string(), detail)
-        }
+    let (title, preview) = match req.tool.as_str() {
+        "edit" => (
+            format!("edit {}", str_field("path")),
+            diff::from_tool("edit", v).unwrap_or_default(),
+        ),
+        "write" => (
+            format!("write {}", str_field("path")),
+            diff::from_tool("write", v).unwrap_or_default(),
+        ),
+        "bash" => (
+            "bash".to_string(),
+            diff::note([str_field("command").to_string()]),
+        ),
+        // `note` attend une ligne par item : on splitte (un résumé multi-lignes ne
+        // doit pas se retrouver en un seul `Row::Context` avec des `\n` embarqués).
+        other => (
+            other.to_string(),
+            diff::note(req.input_summary.lines().map(str::to_string)),
+        ),
     };
 
     PermissionPrompt {
         title,
         reason: req.reason.clone(),
-        detail,
+        preview,
     }
 }
 
@@ -110,28 +85,29 @@ mod tests {
 
     #[test]
     fn edit_request_becomes_diff() {
+        use agent_tui::diff::Row;
         let p = to_prompt(&req(
             "edit",
             serde_json::json!({ "path": "a.rs", "old_string": "x", "new_string": "y" }),
         ));
         assert_eq!(p.title, "edit a.rs");
-        assert!(p.detail.contains(&DiffLine {
-            kind: DiffKind::Remove,
-            text: "x".into()
-        }));
-        assert!(p.detail.contains(&DiffLine {
-            kind: DiffKind::Add,
-            text: "y".into()
-        }));
+        assert!(
+            p.preview
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Remove { .. }))
+        );
+        assert!(p.preview.rows.iter().any(|r| matches!(r, Row::Add { .. })));
     }
 
     #[test]
     fn bash_request_shows_command() {
+        use agent_tui::diff::Row;
         let p = to_prompt(&req(
             "bash",
             serde_json::json!({ "command": "rm -rf /tmp/x" }),
         ));
         assert_eq!(p.title, "bash");
-        assert_eq!(p.detail[0].text, "rm -rf /tmp/x");
+        assert!(matches!(&p.preview.rows[0], Row::Context { text, .. } if text == "rm -rf /tmp/x"));
     }
 }

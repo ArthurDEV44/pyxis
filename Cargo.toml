@@ -50,6 +50,18 @@ ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 # rendu markdown des réponses (CommonMark + GFM) → spans ratatui.
 pulldown-cmark = { version = "0.12", default-features = false }
+# diff inline des éditions (EP-011) : lignes + emphase intra-ligne (word-diff). La
+# feature `inline` expose `iter_inline_changes` ; `unicode` aligne la segmentation
+# des mots sur les graphèmes.
+similar = { version = "2", features = ["inline", "unicode"] }
+# coloration syntaxique des code-blocks et diffs (EP-012, US-040/042). `default-fancy`
+# = grammaires/thèmes Sublime embarqués via `fancy-regex` (PUR RUST, aucune toolchain
+# C : pas d'oniguruma) → binaire distribuable. La coloration ne tourne JAMAIS par
+# frame (cache US-041). `two-face` comble les grammaires manquantes de syntect (TS,
+# TOML…) avec le set curé de `bat` ; `syntect-default-fancy` garde le backend fancy
+# (onig hors du dependency tree, vérifié au `cargo tree`).
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-default-fancy"] }
 landlock = "0.4"
 anyhow = "1"
 # MCP (ARCHITECTURE §6) : SDK Rust officiel. Client stdio uniquement au départ

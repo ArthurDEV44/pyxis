@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::message::Message;
 use agent_core::provider::ToolSpec;
@@ -55,6 +55,9 @@ pub struct InteractiveConfig {
     pub run_config: RunConfig,
     pub tool_specs: Vec<ToolSpec>,
     pub truecolor: bool,
+    /// Reduced-motion (`NO_COLOR` / `NUMEN_REDUCED_MOTION`) : spinner dégradé en
+    /// point pulsé plutôt qu'animé (US-044).
+    pub reduced_motion: bool,
     /// Credential du fournisseur présente (badge connecté + sous-menu providers).
     pub connected: bool,
     /// Skills disponibles (lus avant le sandbox), sous-menu `/skills`.
@@ -216,6 +219,7 @@ async fn event_loop(
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_default();
     state.provider_connected = cfg.connected;
+    state.reduced_motion = cfg.reduced_motion;
     state.skills = std::mem::take(&mut cfg.skills);
     state.sessions = load_sessions(&sessions_dir, &current_session);
     state.mcp_servers = mcp_metas(&mcp);
@@ -248,7 +252,28 @@ async fn event_loop(
     let mut goal_iters: u32 = 0;
     let mut pending_resp: Option<oneshot::Sender<bool>> = None;
 
+    // Tick d'animation du spinner (US-044). 100 ms ≈ 10 fps : fluide et quasi gratuit
+    // (le cache de rendu sert les blocs bakés). `Skip` évite tout burst de redraw au
+    // retour d'idle. La branche `select!` est gardée par `if running` → 0 CPU en idle.
+    let mut spinner = tokio::time::interval(Duration::from_millis(100));
+    spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Début du tour courant (front montant de `running`) pour la durée écoulée.
+    let mut turn_start: Option<Instant> = None;
+
     loop {
+        // Front montant/descendant de `running` : démarre / fige le suivi de
+        // progression (spinner, durée, tokens). N'altère PAS l'orchestration.
+        match (running, turn_start.is_some()) {
+            (true, false) => {
+                turn_start = Some(Instant::now());
+                state.begin_turn();
+            }
+            (false, true) => {
+                turn_start = None;
+                state.end_turn();
+            }
+            _ => {}
+        }
         tui.draw(|f| agent_tui::render(f, &state))?;
         if state.should_quit {
             break;
@@ -553,6 +578,15 @@ async fn event_loop(
                     state.mcp_servers = mcp_metas(&mcp);
                 }
             }
+            // Tick d'animation : réveille la boucle UNIQUEMENT pendant un tour ACTIF
+            // (`if running`) et hors attente de permission (`pending.is_none()` : on
+            // attend l'humain, pas l'agent → 0 CPU, pas de redraw à 10 fps du dialog).
+            // Le redraw a lieu en tête de boucle ; ici on ne fait qu'avancer l'état
+            // d'animation (spinner, durée). US-044.
+            _ = spinner.tick(), if running && state.pending.is_none() => {
+                let elapsed = turn_start.map(|t| t.elapsed()).unwrap_or_default();
+                state.tick_progress(elapsed);
+            }
         }
     }
     Ok(())
@@ -744,7 +778,11 @@ mod tests {
     fn compose_system_pins_completion_directive() {
         let base = "Tu es Numen.";
         assert_eq!(compose_system(base, None), base);
-        assert_eq!(compose_system(base, Some("   ")), base, "objectif vide → base");
+        assert_eq!(
+            compose_system(base, Some("   ")),
+            base,
+            "objectif vide → base"
+        );
         let with = compose_system(base, Some("refonds l'UI"));
         assert!(with.starts_with(base));
         assert!(with.contains("NE T'ARRÊTE PAS"), "directive de complétion");

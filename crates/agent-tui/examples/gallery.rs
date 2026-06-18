@@ -5,8 +5,8 @@
 
 use agent_core::AgentEvent;
 use agent_core::event::{ToolCallView, ToolResultView};
-use agent_tui::state::{DiffKind, DiffLine, PermissionPrompt};
-use agent_tui::{AppState, render};
+use agent_tui::state::PermissionPrompt;
+use agent_tui::{AppState, diff, render};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -58,24 +58,15 @@ fn main() {
     p.pending = Some(PermissionPrompt {
         title: "edit src/lexer.rs".into(),
         reason: "action sensible nécessitant confirmation".into(),
-        detail: vec![
-            DiffLine {
-                kind: DiffKind::Context,
-                text: "fn lex(input: &str) -> Vec<Token> {".into(),
-            },
-            DiffLine {
-                kind: DiffKind::Remove,
-                text: "    todo!()".into(),
-            },
-            DiffLine {
-                kind: DiffKind::Add,
-                text: "    input.chars().map(Token::from).collect()".into(),
-            },
-            DiffLine {
-                kind: DiffKind::Context,
-                text: "}".into(),
-            },
-        ],
+        preview: diff::from_tool(
+            "edit",
+            &serde_json::json!({
+                "path": "src/lexer.rs",
+                "old_string": "fn lex(input: &str) -> Vec<Token> {\n    todo!()\n}",
+                "new_string": "fn lex(input: &str) -> Vec<Token> {\n    input.chars().map(Token::from).collect()\n}"
+            }),
+        )
+        .unwrap_or_default(),
     });
     dump(&p, 64, 14, "permission + diff");
 

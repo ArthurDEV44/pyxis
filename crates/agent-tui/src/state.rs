@@ -3,10 +3,11 @@
 //! décide seul de la présentation. La gestion clavier renvoie une `InputAction`
 //! que la boucle agent-cli interprète (soumission, permission, quit, scroll).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::time::Duration;
 
-use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::AgentEvent;
+use agent_core::message::{ContentBlock, Message, Role, ToolCallId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Un élément du transcript. Le rendu choisit poids/teinte ; aucune couleur ici.
@@ -18,10 +19,18 @@ pub enum Block {
     Assistant { text: String, streaming: bool },
     /// Raisonnement du modèle (rendu en sourdine).
     Reasoning(String),
-    /// Un outil va s'exécuter.
-    ToolCall { name: String, summary: String },
-    /// Résultat d'un outil (taint + erreur portés pour le rendu).
+    /// Un outil va s'exécuter. L'`input` brut est CONSERVÉ (US-033) : le rendu en
+    /// dérive le label `Verb(cible)` et, à terme, le diff (EP-011) ; `id` apparie
+    /// l'appel à son résultat.
+    ToolCall {
+        id: ToolCallId,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Résultat d'un outil (taint + erreur portés pour le rendu). `call_id` pointe
+    /// vers le `ToolCall` correspondant (US-033) pour le résumé `⎿`.
     ToolResult {
+        call_id: ToolCallId,
         content: String,
         untrusted: bool,
         is_error: bool,
@@ -205,10 +214,11 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
                     });
                 }
                 for b in &m.content {
-                    if let ContentBlock::ToolUse { name, input, .. } = b {
+                    if let ContentBlock::ToolUse { id, name, input } = b {
                         blocks.push(Block::ToolCall {
+                            id: id.clone(),
                             name: name.clone(),
-                            summary: summarize(input),
+                            input: input.clone(),
                         });
                     }
                 }
@@ -216,10 +226,13 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
             Role::Tool => {
                 for b in &m.content {
                     if let ContentBlock::ToolResult {
-                        content, is_error, ..
+                        tool_use_id,
+                        content,
+                        is_error,
                     } = b
                     {
                         blocks.push(Block::ToolResult {
+                            call_id: tool_use_id.clone(),
                             content: content.clone(),
                             untrusted: false,
                             is_error: *is_error,
@@ -243,28 +256,15 @@ pub fn prompts_from_messages(messages: &[Message]) -> Vec<String> {
         .collect()
 }
 
-/// Une ligne d'un aperçu de mutation (diff) présenté dans le dialog de permission.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DiffKind {
-    Add,
-    Remove,
-    Context,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiffLine {
-    pub kind: DiffKind,
-    pub text: String,
-}
-
 /// Demande de confirmation présentée à l'utilisateur (générique : la boucle
 /// agent-cli la construit depuis la `PermissionRequest` d'`agent-tools`, en
-/// pré-rendant un diff pour les éditions).
+/// pré-rendant l'aperçu via `diff` : vrai diff pour `edit`/`write`, lignes de
+/// contexte pour bash/inconnu, PARTAGÉ avec le diff inline du transcript (US-039).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionPrompt {
     pub title: String,
     pub reason: String,
-    pub detail: Vec<DiffLine>,
+    pub preview: crate::diff::Diff,
 }
 
 #[derive(Clone)]
@@ -283,6 +283,10 @@ pub struct AppState {
     /// wrap − hauteur visible). Cache de feedback rendu→entrée : permet de clamper
     /// le scroll sans dupliquer le calcul de wrap hors de `render`.
     pub scroll_max: Cell<u16>,
+    /// Cache des lignes stylées par bloc (US-041) : ne reconstruire que le bloc en
+    /// stream, servir les autres depuis le cache. Interior mutability (même patron
+    /// que `scroll_max`) pour que `render` reste pur (signature `&AppState`).
+    pub(crate) render_cache: RefCell<crate::cache::RenderCache>,
     pub model: String,
     /// Nom du workspace (dossier courant) affiché dans la status line ; vide = masqué.
     pub workspace: String,
@@ -306,6 +310,22 @@ pub struct AppState {
     history_pos: Option<usize>,
     draft: String,
     pub should_quit: bool,
+    // ── Progression vivante (EP-013) ────────────────────────────────────────────
+    /// Tick d'animation du spinner, avancé par la boucle (~10 fps) tant qu'un tour
+    /// est actif. Le rendu choisit la frame depuis ce compteur (reste pur).
+    pub spinner_tick: usize,
+    /// Durée écoulée du tour en cours (`None` hors tour) ; alimentée par la boucle
+    /// (qui possède l'horloge) — `render` ne lit jamais l'heure.
+    pub turn_elapsed: Option<Duration>,
+    /// Caractères cumulés (texte + raisonnement) du tour en cours → estimation de
+    /// tokens (/4). Sur une boucle `/goal`, cumule l'ensemble des relances (vue coût
+    /// total) : remis à zéro seulement au front montant de `running` (`begin_turn`).
+    pub turn_chars: usize,
+    /// Reduced-motion (`NO_COLOR` / `NUMEN_REDUCED_MOTION`) : spinner dégradé en point pulsé.
+    pub reduced_motion: bool,
+    /// Nouveaux blocs arrivés pendant que l'utilisateur a remonté le transcript
+    /// (pill « revenir en bas », US-046). Remis à 0 dès le retour au bas.
+    pub unseen: usize,
 }
 
 /// Action déduite d'une touche, interprétée par la boucle agent-cli.
@@ -332,6 +352,7 @@ impl AppState {
             truecolor,
             scroll: 0,
             scroll_max: Cell::new(0),
+            render_cache: RefCell::new(crate::cache::RenderCache::default()),
             model: model.into(),
             workspace: String::new(),
             context_pct: None,
@@ -344,6 +365,11 @@ impl AppState {
             history_pos: None,
             draft: String::new(),
             should_quit: false,
+            spinner_tick: 0,
+            turn_elapsed: None,
+            turn_chars: 0,
+            reduced_motion: false,
+            unseen: 0,
         }
     }
 
@@ -423,9 +449,11 @@ impl AppState {
 
     /// Range un `AgentEvent` du cœur dans le transcript.
     pub fn apply(&mut self, ev: &AgentEvent) {
+        let before = self.blocks.len();
         match ev {
             AgentEvent::Text(t) => {
                 self.status = Status::Thinking;
+                self.turn_chars += t.chars().count();
                 match self.blocks.last_mut() {
                     Some(Block::Assistant {
                         text,
@@ -439,6 +467,7 @@ impl AppState {
             }
             AgentEvent::Reasoning(t) => {
                 self.status = Status::Thinking;
+                self.turn_chars += t.chars().count();
                 match self.blocks.last_mut() {
                     Some(Block::Reasoning(r)) => r.push_str(t),
                     _ => self.blocks.push(Block::Reasoning(t.clone())),
@@ -447,12 +476,18 @@ impl AppState {
             AgentEvent::ToolCall(view) => {
                 self.finalize_streaming();
                 self.blocks.push(Block::ToolCall {
+                    id: view.id.clone(),
                     name: view.name.clone(),
-                    summary: summarize(&view.input),
+                    input: view.input.clone(),
                 });
             }
             AgentEvent::ToolResult(view) => {
+                // Symétrie défensive avec ToolCall : si un résultat orphelin arrivait
+                // sans appel préalable, un Assistant{streaming} resté ouvert ne doit pas
+                // garder un curseur live fantôme.
+                self.finalize_streaming();
                 self.blocks.push(Block::ToolResult {
+                    call_id: view.id.clone(),
                     content: view.content.clone(),
                     untrusted: view.untrusted,
                     is_error: view.is_error,
@@ -478,6 +513,17 @@ impl AppState {
                 self.status = Status::Idle;
             }
         }
+        // Pill « nouveau message » (US-046) : si l'utilisateur a remonté le
+        // transcript, signaler le contenu apparu hors de sa vue.
+        if self.scroll > 0 {
+            if self.blocks.len() > before {
+                self.unseen += self.blocks.len() - before;
+            } else if matches!(ev, AgentEvent::Text(_) | AgentEvent::Reasoning(_)) {
+                // Stream qui APPEND au dernier bloc (pas de nouveau bloc) : signaler au
+                // moins « du contenu est arrivé » sans gonfler le compteur par token.
+                self.unseen = self.unseen.max(1);
+            }
+        }
     }
 
     /// Pousse le tour utilisateur (appelé à la soumission) et l'enregistre dans
@@ -492,6 +538,7 @@ impl AppState {
         self.blocks.push(Block::User(text));
         self.status = Status::Thinking;
         self.scroll = 0;
+        self.unseen = 0;
     }
 
     /// Remplace l'historique navigable (resume d'une session) et réinitialise la
@@ -551,12 +598,50 @@ impl AppState {
     /// Remonte dans le transcript de `n` lignes, clampé à la borne calculée au
     /// dernier rendu (`scroll_max`) — pas de sur-scroll au-delà du début.
     pub fn scroll_up(&mut self, n: u16) {
+        // Quitter le bas repart d'un compteur vierge : tout `unseen` résiduel (ex. un
+        // bloc poussé pendant qu'on était déjà collé en bas) est écarté ; on ne
+        // comptera que le contenu arrivant APRÈS ce scroll (US-046).
+        if self.scroll == 0 {
+            self.unseen = 0;
+        }
         self.scroll = self.scroll.saturating_add(n).min(self.scroll_max.get());
     }
 
     /// Redescend de `n` lignes (0 = collé en bas, suit le live).
     pub fn scroll_down(&mut self, n: u16) {
         self.scroll = self.scroll.saturating_sub(n);
+        // Retour au bas → l'auto-follow reprend, plus de « nouveaux messages » (US-046).
+        if self.scroll == 0 {
+            self.unseen = 0;
+        }
+    }
+
+    /// Nombre de blocs reconstruits au dernier rendu (instrumentation US-041) : 0 =
+    /// tout servi depuis le cache. Exposé pour les tests de performance du cache.
+    pub fn render_rebuilds(&self) -> usize {
+        self.render_cache.borrow().rebuilds()
+    }
+
+    /// Démarre le suivi de progression d'un tour (front montant de `running` côté
+    /// boucle, US-044/045) : remet à zéro spinner, durée et compteur de tokens.
+    pub fn begin_turn(&mut self) {
+        self.spinner_tick = 0;
+        self.turn_elapsed = None;
+        self.turn_chars = 0;
+    }
+
+    /// Avance l'animation et met à jour la durée écoulée (appelé par le tick de la
+    /// boucle tant qu'un tour est actif, US-044/045). `render` reste pur : il ne lit
+    /// jamais l'horloge, il consomme ces valeurs.
+    pub fn tick_progress(&mut self, elapsed: Duration) {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
+        self.turn_elapsed = Some(elapsed);
+    }
+
+    /// Fin de tour (front descendant de `running`) : les indicateurs disparaissent
+    /// proprement, sans compteur qui continue (US-045).
+    pub fn end_turn(&mut self) {
+        self.turn_elapsed = None;
     }
 
     /// Quel sous-menu la saisie ouvre-t-elle ? (fil d'Ariane dans l'input :
@@ -994,26 +1079,6 @@ impl AppState {
     }
 }
 
-/// Résumé court d'un input d'outil pour l'affichage (bash → la commande, etc.).
-fn summarize(input: &serde_json::Value) -> String {
-    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-        return cmd.to_string();
-    }
-    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-        return path.to_string();
-    }
-    if let Some(pat) = input.get("pattern").and_then(|v| v.as_str()) {
-        return pat.to_string();
-    }
-    let s = input.to_string();
-    // Troncature char-aware : jamais au milieu d'un char multi-octet (sinon panic).
-    if s.chars().count() > 80 {
-        format!("{}…", s.chars().take(80).collect::<String>())
-    } else {
-        s
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,8 +1131,9 @@ mod tests {
         assert_eq!(
             s.blocks[1],
             Block::ToolCall {
+                id: "c1".into(),
                 name: "bash".into(),
-                summary: "ls -la".into()
+                input: serde_json::json!({ "command": "ls -la" }),
             }
         );
     }
@@ -1084,6 +1150,7 @@ mod tests {
         assert_eq!(
             s.blocks[0],
             Block::ToolResult {
+                call_id: "c1".into(),
                 content: "oops".into(),
                 untrusted: true,
                 is_error: true
@@ -1449,7 +1516,7 @@ mod tests {
         let mut s = AppState::new("gpt-5", false);
         s.on_key(key('/'));
         s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → /models
-                                                                    // Entrée sur une commande à argument OUVRE le sous-menu (n'exécute pas).
+        // Entrée sur une commande à argument OUVRE le sous-menu (n'exécute pas).
         assert_eq!(
             s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::None
@@ -1481,7 +1548,7 @@ mod tests {
         s.pending = Some(PermissionPrompt {
             title: "bash".into(),
             reason: "sensible".into(),
-            detail: vec![],
+            preview: crate::diff::Diff::default(),
         });
         // une frappe normale ne tape PAS dans l'input pendant la confirmation
         assert_eq!(s.on_key(key('x')), InputAction::None);
@@ -1497,5 +1564,67 @@ mod tests {
         let action = s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(action, InputAction::Quit);
         assert!(s.should_quit);
+    }
+
+    // US-044/045 : cycle de vie de la progression d'un tour.
+    #[test]
+    fn turn_progress_lifecycle() {
+        let mut s = AppState::new("gpt-5", true);
+        s.begin_turn();
+        assert_eq!(s.turn_chars, 0);
+        assert!(s.turn_elapsed.is_none());
+        s.apply(&AgentEvent::Text("abcd".into()));
+        assert_eq!(s.turn_chars, 4, "chars cumulés pour l'estimation de tokens");
+        s.tick_progress(std::time::Duration::from_secs(5));
+        assert_eq!(s.turn_elapsed, Some(std::time::Duration::from_secs(5)));
+        assert_eq!(s.spinner_tick, 1, "le tick avance l'animation");
+        s.end_turn();
+        assert!(
+            s.turn_elapsed.is_none(),
+            "indicateurs disparus en fin de tour"
+        );
+    }
+
+    // US-046 : `unseen` ne compte que les blocs arrivés en scroll haut, et se remet
+    // à zéro au retour en bas (auto-follow).
+    #[test]
+    fn unseen_tracks_scrolled_up_content() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::Text("a".into()));
+        s.apply(&AgentEvent::EndTurn);
+        assert_eq!(s.unseen, 0, "collé en bas : rien d'unseen");
+        s.scroll = 2; // l'utilisateur a remonté
+        s.apply(&AgentEvent::Text("b".into())); // nouveau bloc → +1
+        assert_eq!(s.unseen, 1);
+        s.scroll_down(5); // retour au bas
+        assert_eq!(s.scroll, 0);
+        assert_eq!(s.unseen, 0, "auto-follow → reset");
+    }
+
+    // US-046 (robustesse) : quitter le bas écarte un `unseen` périmé (ex. laissé par
+    // un `scroll = 0` direct du chemin commande, qui ne passe pas par scroll_down).
+    #[test]
+    fn scroll_up_clears_stale_unseen() {
+        let mut s = AppState::new("gpt-5", true);
+        s.scroll_max.set(50); // du contenu scrollable
+        s.unseen = 3; // périmé, alors qu'on est collé en bas
+        s.scroll_up(5); // on quitte le bas → compteur vierge
+        assert!(s.scroll > 0);
+        assert_eq!(s.unseen, 0, "compteur périmé écarté en quittant le bas");
+    }
+
+    // US-046 : un stream qui APPEND au dernier bloc Assistant (sans créer de nouveau
+    // bloc) signale quand même du contenu si l'utilisateur a remonté le transcript.
+    #[test]
+    fn unseen_floors_on_pure_stream_append() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::Text("début ".into())); // crée le bloc Assistant streaming
+        s.scroll = 2; // l'utilisateur remonte PENDANT le stream
+        s.apply(&AgentEvent::Text("suite".into())); // APPEND (pas de nouveau bloc)
+        assert_eq!(s.blocks.len(), 1, "un seul bloc Assistant (append)");
+        assert_eq!(
+            s.unseen, 1,
+            "le stream signale du contenu même sans nouveau bloc"
+        );
     }
 }

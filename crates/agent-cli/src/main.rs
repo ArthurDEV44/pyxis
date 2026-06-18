@@ -258,8 +258,10 @@ async fn run(
     // 6. Dispatch headless (-p) vs interactif.
     if let Some(prompt) = args.prompt {
         // Headless one-shot : slug fixe (`args.model`) → template sélectionné une fois.
-        let base =
-            interactive::with_tool_guidelines(prompt::select_system_prompt(&args.model), &tool_guidelines);
+        let base = interactive::with_tool_guidelines(
+            prompt::select_system_prompt(&args.model),
+            &tool_guidelines,
+        );
         let ctx = AgentContext {
             model: args.model,
             system: Some(interactive::compose_system(&base, goal.as_deref())),
@@ -297,6 +299,9 @@ async fn run(
             run_config: RunConfig::default(),
             tool_specs,
             truecolor: agent_tui::supports_truecolor(),
+            // Reduced-motion : spinner dégradé en point pulsé (US-044).
+            reduced_motion: std::env::var_os("NO_COLOR").is_some()
+                || std::env::var_os("NUMEN_REDUCED_MOTION").is_some(),
             // credential chargée plus haut (sinon on a bail) → connecté.
             connected: true,
             skills,

@@ -6,82 +6,16 @@
 //! `render` est PUR → testable via `TestBackend`. La dégradation sans truecolor
 //! (AC4) remplace l'accent par du gras ; la mise en page est inchangée.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Boundary, BorderType, Borders, Paragraph, Wrap};
-use ratatui::Frame;
 
-use crate::state::{AppState, Block, DiffKind, MenuItem, PermissionPrompt, Status, COMMANDS};
-
-/// Palette : grayscale + un accent (teal) + un ton d'erreur (rouge muté). En
-/// l'absence de truecolor, tout passe en gras/dim 16 couleurs (AC4).
-pub struct Theme {
-    truecolor: bool,
-}
-
-impl Theme {
-    pub fn new(truecolor: bool) -> Self {
-        Self { truecolor }
-    }
-
-    pub fn fg(&self) -> Style {
-        if self.truecolor {
-            Style::default().fg(Color::Rgb(0xe4, 0xe4, 0xe4))
-        } else {
-            Style::default()
-        }
-    }
-    pub fn dim(&self) -> Style {
-        if self.truecolor {
-            Style::default().fg(Color::Rgb(0x8a, 0x8a, 0x8a))
-        } else {
-            Style::default().add_modifier(Modifier::DIM)
-        }
-    }
-    pub fn faint(&self) -> Style {
-        if self.truecolor {
-            Style::default().fg(Color::Rgb(0x4e, 0x4e, 0x4e))
-        } else {
-            Style::default().add_modifier(Modifier::DIM)
-        }
-    }
-    pub fn accent(&self) -> Style {
-        if self.truecolor {
-            Style::default().fg(Color::Rgb(0x6f, 0xd0, 0xc8))
-        } else {
-            Style::default().add_modifier(Modifier::BOLD)
-        }
-    }
-    pub fn error(&self) -> Style {
-        if self.truecolor {
-            Style::default().fg(Color::Rgb(0xd0, 0x6a, 0x6a))
-        } else {
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-        }
-    }
-    /// Fond de la ligne sélectionnée (menu de commandes) : un voile teal sombre
-    /// en truecolor, vidéo inverse en dégradé 16 couleurs.
-    pub fn selection(&self) -> Style {
-        if self.truecolor {
-            Style::default().bg(Color::Rgb(0x1c, 0x2e, 0x2c))
-        } else {
-            Style::default().add_modifier(Modifier::REVERSED)
-        }
-    }
-    /// Surbrillance d'un `/skill` inséré dans l'input : pastille teal sur fond
-    /// sombre (vidéo inverse + gras en 16 couleurs).
-    pub fn skill_chip(&self) -> Style {
-        if self.truecolor {
-            Style::default()
-                .fg(Color::Rgb(0x6f, 0xd0, 0xc8))
-                .bg(Color::Rgb(0x1c, 0x2e, 0x2c))
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        }
-    }
-}
+use crate::cache::fingerprint;
+use crate::state::{AppState, Block, COMMANDS, MenuItem, PermissionPrompt, Status};
+use crate::theme::Theme;
+use crate::tool;
 
 const INDENT: &str = "  ";
 /// Zone de saisie : box bordée (3 lignes) + ligne de statut (1).
@@ -218,7 +152,7 @@ fn logo_lines(theme: &Theme) -> Vec<Line<'static>> {
             let ch = char::from_u32(0x2800 + bits as u32)
                 .unwrap_or(' ')
                 .to_string();
-            let style = if theme.truecolor {
+            let style = if theme.truecolor() {
                 // Gris dans une bande médiane (ni trop sombre, ni blanc pur).
                 let v = (0x6a as f32 + peak.clamp(0.0, 1.0) * (0xde - 0x6a) as f32) as u8;
                 Style::default().fg(Color::Rgb(v, v, v))
@@ -447,27 +381,82 @@ fn fit(s: &str, width: usize) -> String {
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let mut lines: Vec<Line> = Vec::new();
+    let width = area.width as usize;
+    // Index des appels d'outils par id : apparie un ToolResult à son ToolCall
+    // (US-033) pour dériver le résumé `⎿` depuis l'input du call.
+    let mut calls: std::collections::HashMap<&str, (&str, &serde_json::Value)> =
+        std::collections::HashMap::new();
+    for block in &state.blocks {
+        if let Block::ToolCall { id, name, input } = block {
+            calls.insert(id.as_str(), (name.as_str(), input));
+        }
+    }
+
+    // Cache des lignes stylées par bloc (US-041) : on ne reconstruit (parse markdown
+    // + coloration) que les blocs dont l'empreinte a changé — typiquement le seul
+    // bloc en cours de stream. Les autres sont servis depuis le cache. `render` reste
+    // pur : le cache vit en interior mutability sur `AppState`.
     let last = state.blocks.len().saturating_sub(1);
+    let mut cache = state.render_cache.borrow_mut();
+    cache.begin(width, state.truecolor, state.blocks.len());
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let mut prev: Option<&Block> = None;
     for (i, block) in state.blocks.iter().enumerate() {
+        let is_last = i == last;
+        let fp = fingerprint(block, is_last, &calls);
+        let blk = cache.block_lines(i, fp, || {
+            let mut v = Vec::new();
+            push_block(&mut v, block, theme, is_last, width, &calls);
+            v
+        });
+        // Un tour assistant vide (avant le 1er token, ou texte purement blanc) rend
+        // zéro ligne → pas de puce orpheline (US-034) et `prev` reste inchangé.
+        if blk.is_empty() {
+            continue;
+        }
         if leading_blank(prev, block) {
             lines.push(Line::default());
         }
-        push_block(&mut lines, block, theme, i == last);
+        lines.extend(blk.iter().cloned());
         prev = Some(block);
     }
+    drop(cache);
 
-    // Auto-follow : collé au bas (scroll 0), décalé par le scroll utilisateur. La
-    // borne se calcule sur les lignes APRÈS wrap (`line_count`), sinon on ne peut
-    // pas remonter tout en haut dès qu'une ligne wrappe. On publie la borne dans
-    // `scroll_max` pour que l'entrée clampe le scroll sans recalculer le wrap.
+    // Le wrap manuel ci-dessus pose la gouttière suspendue (puce + indent 2 col) pour
+    // le cas courant (largeur comptée en `char`). On garde `Wrap` comme FILET : une
+    // ligne qui dépasserait la largeur en COLONNES (wide chars CJK/emoji, que le
+    // compte en `char` ne voit pas) est re-wrappée par ratatui plutôt que TRONQUÉE
+    // (aucune perte). La borne de scroll se calcule donc sur les lignes APRÈS wrap.
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     let max_off = (para.line_count(area.width) as u16).saturating_sub(area.height);
     state.scroll_max.set(max_off);
     let offset = max_off - state.scroll.min(max_off);
-
     frame.render_widget(para.scroll((offset, 0)), area);
+    render_scroll_pill(frame, area, state, theme);
+}
+
+/// Pill discrète « nouveaux messages » (US-046) : en bas du transcript quand
+/// l'utilisateur a remonté le fil ET que du contenu est arrivé en dessous.
+/// Right-alignée, bornée à la largeur (ne déborde pas, ne masque pas l'input qui
+/// vit dans une zone séparée). `⇟` = raccourci pour redescendre.
+fn render_scroll_pill(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if state.scroll == 0 || state.unseen == 0 || area.height == 0 {
+        return;
+    }
+    let plural = if state.unseen > 1 { "x" } else { "" };
+    let label = format!(" ↓ {} nouveau{plural} · ⇟ ", state.unseen);
+    let w = (label.chars().count() as u16).min(area.width);
+    let pill = Rect {
+        x: area.x + area.width.saturating_sub(w),
+        y: area.y + area.height - 1,
+        width: w,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, theme.accent()))).style(theme.selection()),
+        pill,
+    );
 }
 
 /// Faut-il une ligne vide AVANT ce bloc ? On groupe les outils (call/result
@@ -483,32 +472,35 @@ fn leading_blank(prev: Option<&Block>, cur: &Block) -> bool {
     }
 }
 
-/// Verbe d'action compact pour l'affichage d'un outil (façon Grok).
-fn tool_verb(name: &str) -> String {
-    match name {
-        "read" => "Read",
-        "write" => "Write",
-        "edit" => "Edit",
-        "glob" => "List",
-        "grep" => "Search",
-        "bash" => "Run",
-        other => other,
-    }
-    .to_string()
-}
-
-fn push_block(lines: &mut Vec<Line>, block: &Block, theme: &Theme, is_last: bool) {
+fn push_block<'a>(
+    lines: &mut Vec<Line<'static>>,
+    block: &'a Block,
+    theme: &Theme,
+    is_last: bool,
+    width: usize,
+    calls: &std::collections::HashMap<&'a str, (&'a str, &'a serde_json::Value)>,
+) {
     match block {
         Block::User(text) => {
-            lines.push(Line::from(vec![
+            push_wrapped(
+                lines,
+                vec![Span::styled(
+                    text.clone(),
+                    theme.fg().add_modifier(Modifier::BOLD),
+                )],
                 Span::styled("› ", theme.dim()),
-                Span::styled(text.clone(), theme.fg().add_modifier(Modifier::BOLD)),
-            ]));
+                Span::raw(INDENT),
+                width,
+            );
         }
         Block::Assistant { text, .. } => {
-            // Markdown rendu, aligné nu (pas de gouttière par-ligne : elle se
-            // briserait sur les continuations wrappées). Wrap propre via ratatui.
-            lines.extend(crate::markdown::render_markdown(&sanitize(text), theme));
+            // Markdown rendu, ANCRÉ par une puce teal ; corps aligné à 2 colonnes
+            // (gouttière suspendue : puce sur la 1re sous-ligne, reste indenté). La
+            // largeur de CONTENU (hors gouttière) sert à dimensionner les tables
+            // markdown (US-043) — même valeur que le wrap d'`emit_block`.
+            let avail = width.saturating_sub(INDENT.len());
+            let md = crate::markdown::render_markdown(&sanitize(text), theme, avail);
+            emit_block(lines, &md, Span::styled("● ", theme.accent()), width);
         }
         Block::Reasoning(text) => {
             // Replié en un libellé discret ; en cours (dernier bloc), un court
@@ -518,78 +510,479 @@ fn push_block(lines: &mut Vec<Line>, block: &Block, theme: &Theme, is_last: bool
                 Span::styled("réflexion", theme.faint().add_modifier(Modifier::ITALIC)),
             ]));
             if is_last {
+                let preview_st = theme.faint().add_modifier(Modifier::ITALIC);
+                let cont = Span::styled(format!("{INDENT}  "), theme.faint());
                 for raw in preview_tail(&sanitize(text), 2) {
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{INDENT}  "), theme.faint()),
-                        Span::styled(raw, theme.faint().add_modifier(Modifier::ITALIC)),
-                    ]));
+                    // Via `push_wrapped` (comme tout autre bloc) : la gouttière
+                    // suspendue à 4 colonnes survit au wrap sur terminal étroit
+                    // (sinon la 2e sous-ligne revient en colonne 0, US-034).
+                    push_wrapped(
+                        lines,
+                        vec![Span::styled(raw, preview_st)],
+                        cont.clone(),
+                        cont.clone(),
+                        width,
+                    );
                 }
             }
         }
-        Block::ToolCall { name, summary } => {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{INDENT}◆ "), theme.faint()),
-                Span::styled(tool_verb(name), theme.fg().add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
-                Span::styled(truncate(summary, 80), theme.dim()),
-            ]));
+        Block::ToolCall { name, input, .. } => {
+            // Puce grise + label structuré `Verb(cible)` (US-035).
+            let label = tool::label(name, input);
+            let mut content = vec![Span::styled(
+                label.verb,
+                theme.fg().add_modifier(Modifier::BOLD),
+            )];
+            if let Some(t) = label.target {
+                content.push(Span::styled(format!("({t})"), theme.dim()));
+            }
+            push_wrapped(
+                lines,
+                content,
+                Span::styled("● ", theme.faint()),
+                Span::raw(INDENT),
+                width,
+            );
         }
         Block::ToolResult {
-            content, is_error, ..
+            call_id,
+            content,
+            is_error,
+            ..
         } => {
-            // Résultat masqué par défaut (transcript clean) ; seules les erreurs
-            // remontent, en une ligne.
             if *is_error {
-                let clean = sanitize(content);
-                let first = clean.lines().next().unwrap_or_default();
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{INDENT}✗ "), theme.error()),
-                    Span::styled(truncate(first, 120), theme.error()),
-                ]));
+                if tool::is_user_rejection(content) {
+                    // Rejet volontaire (permission refusée) : ton atténué, pas
+                    // rouge : ce n'est pas une erreur système (US-036).
+                    push_wrapped(
+                        lines,
+                        vec![Span::styled(tool::reject_summary(content), theme.dim())],
+                        Span::styled(format!("{INDENT}⎿ "), theme.dim()),
+                        Span::styled(format!("{INDENT}  "), theme.dim()),
+                        width,
+                    );
+                } else {
+                    // Erreur d'outil : connecteur + message rouge, borné à 1 ligne
+                    // + indicateur du reste (US-036).
+                    push_wrapped(
+                        lines,
+                        vec![Span::styled(tool::error_summary(content), theme.error())],
+                        Span::styled(format!("{INDENT}⎿ "), theme.error()),
+                        Span::styled(format!("{INDENT}  "), theme.error()),
+                        width,
+                    );
+                    let extra = tool::extra_lines(content);
+                    if extra > 0 {
+                        push_wrapped(
+                            lines,
+                            vec![Span::styled(format!("… +{extra} lignes"), theme.faint())],
+                            Span::styled(format!("{INDENT}  "), theme.faint()),
+                            Span::styled(format!("{INDENT}  "), theme.faint()),
+                            width,
+                        );
+                    }
+                }
+            } else {
+                let call = calls.get(call_id.as_str()).copied();
+                // Résumé secondaire `⎿` (nombres mis en évidence) apparié au call.
+                push_wrapped(
+                    lines,
+                    tool::result_summary(call, content, theme),
+                    Span::styled(format!("{INDENT}⎿ "), theme.faint()),
+                    Span::styled(format!("{INDENT}  "), theme.faint()),
+                    width,
+                );
+                // Diff inline (US-038) : edit/write réussi → diff dérivé de l'input
+                // du call (rien pour les lectures ni les outils non mutants).
+                if let Some((name, input)) = call
+                    && let Some(d) = crate::diff::from_tool(name, input)
+                {
+                    // Coloration syntaxique du diff (US-042) : langage déduit de
+                    // l'extension du chemin édité.
+                    let lang = input
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::highlight::lang_from_path);
+                    push_diff(lines, &d, theme, width, lang.as_deref());
+                }
             }
         }
         Block::Notice(text) => {
-            lines.push(Line::from(Span::styled(
-                format!("{INDENT}· {text}"),
-                theme.dim(),
-            )));
+            push_wrapped(
+                lines,
+                vec![Span::styled(text.clone(), theme.dim())],
+                Span::styled(format!("{INDENT}· "), theme.dim()),
+                Span::styled(format!("{INDENT}  "), theme.dim()),
+                width,
+            );
         }
         Block::Error(text) => {
-            lines.push(Line::from(vec![
+            push_wrapped(
+                lines,
+                vec![Span::styled(text.clone(), theme.error())],
                 Span::styled(format!("{INDENT}✗ "), theme.error()),
-                Span::styled(text.clone(), theme.error()),
-            ]));
+                Span::styled(format!("{INDENT}  "), theme.error()),
+                width,
+            );
         }
     }
 }
 
+/// Émet un bloc markdown (plusieurs lignes logiques) ancré par `bullet` sur la
+/// toute première sous-ligne ; les autres sont indentées à 2 colonnes (gouttière
+/// suspendue qui survit au wrap). Bloc vide → rien (pas de puce orpheline, US-034).
+fn emit_block(
+    lines: &mut Vec<Line<'static>>,
+    md: &[Line<'static>],
+    bullet: Span<'static>,
+    width: usize,
+) {
+    let cont = Span::raw(INDENT);
+    let avail = width.saturating_sub(INDENT.len()).max(1);
+    let mut first = true;
+    for logical in md {
+        for sub in wrap_content(&logical.spans, avail) {
+            let lead = if first { bullet.clone() } else { cont.clone() };
+            let mut spans = vec![lead];
+            spans.extend(sub);
+            lines.push(Line::from(spans));
+            first = false;
+        }
+    }
+}
+
+/// Pousse une ligne logique `content` wrappée à `width`, `first` en tête de la 1re
+/// sous-ligne et `cont` des suivantes (préfixes de même largeur → alignement
+/// propre). Préserve les styles ; coupe les mots trop longs.
+fn push_wrapped(
+    lines: &mut Vec<Line<'static>>,
+    content: Vec<Span<'static>>,
+    first: Span<'static>,
+    cont: Span<'static>,
+    width: usize,
+) {
+    let prefix_w = first
+        .content
+        .chars()
+        .count()
+        .max(cont.content.chars().count());
+    let avail = width.saturating_sub(prefix_w).max(1);
+    for (i, sub) in wrap_content(&content, avail).into_iter().enumerate() {
+        let lead = if i == 0 { first.clone() } else { cont.clone() };
+        let mut spans = vec![lead];
+        spans.extend(sub);
+        lines.push(Line::from(spans));
+    }
+}
+
+/// Word-wrap d'une suite de spans à `width` colonnes (comptées en chars), styles
+/// préservés. Coupe au dernier espace ; à défaut (mot plus long que `width`),
+/// coupe dur. Retourne au moins une sous-ligne (éventuellement vide).
+fn wrap_content(spans: &[Span], width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    for s in spans {
+        for c in s.content.chars() {
+            chars.push((c, s.style));
+        }
+    }
+    if width == 0 || chars.is_empty() {
+        return vec![rebuild(&chars)];
+    }
+    let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut line: Vec<(char, Style)> = Vec::new();
+    let mut last_space: Option<usize> = None;
+    for (c, st) in chars {
+        line.push((c, st));
+        if c == ' ' {
+            last_space = Some(line.len() - 1);
+        }
+        if line.len() > width {
+            if let Some(sp) = last_space {
+                let rest = line.split_off(sp + 1);
+                line.pop(); // retire l'espace de coupure
+                out.push(rebuild(&line));
+                line = rest;
+            } else {
+                let overflow = line.pop();
+                out.push(rebuild(&line));
+                line.clear();
+                if let Some(lc) = overflow {
+                    line.push(lc);
+                }
+            }
+            last_space = None;
+        }
+    }
+    out.push(rebuild(&line));
+    out
+}
+
+/// Recompose une suite `(char, style)` en spans, en fusionnant les runs de même style.
+fn rebuild(chars: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for (c, st) in chars {
+        if cur != Some(*st) {
+            if let Some(prev) = cur {
+                spans.push(Span::styled(std::mem::take(&mut buf), prev));
+            }
+            cur = Some(*st);
+        }
+        buf.push(*c);
+    }
+    if let Some(prev) = cur {
+        spans.push(Span::styled(buf, prev));
+    }
+    spans
+}
+
 /// Nettoie un texte modèle : retire CR, séquences ANSI (CSI) et contrôles C0 —
 /// les résidus qui « fuyaient » à droite — et convertit les tabs en espaces.
-fn sanitize(s: &str) -> String {
+/// Rend un diff structuré (US-038) sous le résumé `⎿` : gouttière de numéros
+/// (relatifs), signe `+`/`-`, fonds vert/rouge en truecolor (ou signe + gras/dim en
+/// 16 couleurs), emphase mot-à-mot saturée. Les lignes trop larges sont tronquées
+/// sans corrompre la gouttière (qui reste en tête de ligne).
+fn push_diff(
+    lines: &mut Vec<Line<'static>>,
+    diff: &crate::diff::Diff,
+    theme: &Theme,
+    width: usize,
+    lang: Option<&str>,
+) {
+    use crate::diff::Row;
+    let gw = diff
+        .rows
+        .iter()
+        .filter_map(Row::lineno)
+        .max()
+        .unwrap_or(0)
+        .to_string()
+        .chars()
+        .count()
+        .max(2);
+    for row in &diff.rows {
+        match row {
+            Row::Add { lineno, segs } => {
+                let colors = line_colors_for(segs, lang, theme);
+                let mut spans = vec![
+                    gutter(*lineno, gw, theme),
+                    Span::styled("+ ", theme.diff_add()),
+                ];
+                spans.extend(diff_segs_spans(
+                    segs,
+                    colors.as_deref(),
+                    theme.diff_add(),
+                    theme.diff_add_word(),
+                ));
+                lines.push(fill(spans, theme.diff_add(), width));
+            }
+            Row::Remove { lineno, segs } => {
+                let colors = line_colors_for(segs, lang, theme);
+                let mut spans = vec![
+                    gutter(*lineno, gw, theme),
+                    Span::styled("- ", theme.diff_remove()),
+                ];
+                spans.extend(diff_segs_spans(
+                    segs,
+                    colors.as_deref(),
+                    theme.diff_remove(),
+                    theme.diff_remove_word(),
+                ));
+                lines.push(fill(spans, theme.diff_remove(), width));
+            }
+            Row::Context { lineno, text } => {
+                let colors = lang.and_then(|l| crate::highlight::line_colors(text, l, theme));
+                let seg = [crate::diff::Seg {
+                    text: text.clone(),
+                    emphasized: false,
+                }];
+                let mut spans = vec![
+                    gutter(*lineno, gw, theme),
+                    Span::styled("  ", theme.faint()),
+                ];
+                spans.extend(diff_segs_spans(
+                    &seg,
+                    colors.as_deref(),
+                    theme.dim(),
+                    theme.dim(),
+                ));
+                lines.push(clip(spans, width));
+            }
+            Row::Gap => {
+                let pad = " ".repeat(gw);
+                lines.push(Line::from(Span::styled(
+                    format!("{INDENT}{pad} ⋮"),
+                    theme.faint(),
+                )));
+            }
+            Row::Truncated(n) => {
+                lines.push(Line::from(Span::styled(
+                    format!("{INDENT}… +{n} lignes"),
+                    theme.faint(),
+                )));
+            }
+        }
+    }
+}
+
+/// Couleurs de syntaxe (une par caractère) d'une ligne de diff reconstruite depuis
+/// ses segments. `None` si pas de langage, pas de truecolor, ou langage non couvert.
+fn line_colors_for(
+    segs: &[crate::diff::Seg],
+    lang: Option<&str>,
+    theme: &Theme,
+) -> Option<Vec<Color>> {
+    let lang = lang?;
+    let line: String = segs.iter().map(|s| s.text.as_str()).collect();
+    crate::highlight::line_colors(&line, lang, theme)
+}
+
+/// Spans colorés du contenu d'une ligne de diff (US-042). Les segments emphasés
+/// (word-diff) gardent leur style saturé `word` ; les autres reçoivent la teinte de
+/// syntaxe `colors[ci]` sur le fond `base` (le signe `+`/`-` et le fond ajout/
+/// suppression, posés par l'appelant, ne sont jamais masqués). `colors = None` →
+/// tout en `base` (rendu historique). Les runs de même style sont fusionnés.
+fn diff_segs_spans(
+    segs: &[crate::diff::Seg],
+    colors: Option<&[Color]>,
+    base: Style,
+    word: Style,
+) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    let mut ci = 0usize;
+    for seg in segs {
+        for ch in seg.text.chars() {
+            let style = if seg.emphasized {
+                word
+            } else {
+                match colors.and_then(|c| c.get(ci)) {
+                    Some(col) => base.fg(*col),
+                    None => base,
+                }
+            };
+            if cur != Some(style) {
+                if let Some(prev) = cur.take() {
+                    out.push(Span::styled(std::mem::take(&mut buf), prev));
+                }
+                cur = Some(style);
+            }
+            buf.push(ch);
+            ci += 1;
+        }
+    }
+    if let Some(prev) = cur {
+        out.push(Span::styled(buf, prev));
+    }
+    out
+}
+
+/// Gouttière de numéro de ligne (faint), `lineno` aligné à droite sur `gw`,
+/// précédée de l'indentation du bloc. `None` → colonne vide.
+fn gutter(lineno: Option<usize>, gw: usize, theme: &Theme) -> Span<'static> {
+    let n = lineno.map(|n| n.to_string()).unwrap_or_default();
+    Span::styled(format!("{INDENT}{n:>gw$} "), theme.faint())
+}
+
+/// Compose une ligne de diff colorée : si elle dépasse `width`, tronque (gouttière
+/// en tête, donc préservée) ; sinon remplit la fin avec `bg` (bande de couleur en
+/// truecolor ; sans effet visible en 16 couleurs).
+fn fill(spans: Vec<Span<'static>>, bg: Style, width: usize) -> Line<'static> {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total >= width {
+        let first = wrap_content(&spans, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Line::from(first)
+    } else {
+        let mut spans = spans;
+        spans.push(Span::styled(" ".repeat(width - total), bg));
+        Line::from(spans)
+    }
+}
+
+/// Tronque une ligne (sans fond) à `width` colonnes, gouttière conservée.
+fn clip(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
+    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if total > width {
+        let first = wrap_content(&spans, width)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        Line::from(first)
+    } else {
+        Line::from(spans)
+    }
+}
+
+pub(crate) fn sanitize(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '\x1b' => {
-                // séquence `ESC [ … <final>` → on saute jusqu'à l'octet final.
-                if chars.peek() == Some(&'[') {
+            // Toutes les familles d'échappement, pas seulement CSI : une sortie
+            // d'outil/modèle adverse peut porter de l'OSC (titre de fenêtre,
+            // hyperlink OSC 8, clipboard OSC 52) ou du DCS, qui ré-arment le
+            // terminal si on ne neutralise que `ESC [`.
+            '\x1b' => match chars.peek().copied() {
+                // CSI `ESC [ … <final 0x40..=0x7E>`.
+                Some('[') => {
                     chars.next();
-                    while let Some(&n) = chars.peek() {
-                        chars.next();
-                        if ('@'..='~').contains(&n) {
-                            break;
-                        }
-                    }
+                    drain_csi(&mut chars);
                 }
-            }
+                // OSC `ESC ] … <BEL | ST>`, et DCS/SOS/PM/APC `ESC P|X|^|_ … ST`.
+                Some(']') | Some('P') | Some('X') | Some('^') | Some('_') => {
+                    chars.next();
+                    drain_to_st(&mut chars);
+                }
+                // ESC à 2 octets (`ESC c` reset, `ESC ( B`…) ou ESC isolé : on jette
+                // l'ESC et l'octet intermédiaire éventuel (jamais de séquence émise).
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            // Introducteurs C1 8 bits : neutralisés AVEC leur corps (sinon les
+            // paramètres « 31m » fuient en texte). CSI=0x9B, OSC=0x9D, DCS/PM/APC.
+            '\u{9b}' => drain_csi(&mut chars),
+            '\u{9d}' | '\u{90}' | '\u{9e}' | '\u{9f}' => drain_to_st(&mut chars),
             '\r' => {}
             '\n' => out.push('\n'),
             '\t' => out.push_str("    "),
-            c if (c as u32) < 0x20 => {}
+            // C0 (hors \n,\t,\r), DEL (0x7F) et C1 8-bit isolés restants : retirés.
+            c if (c as u32) < 0x20 || c == '\u{7f}' || ('\u{80}'..='\u{9f}').contains(&c) => {}
             c => out.push(c),
         }
     }
     out
+}
+
+/// Draine une séquence CSI jusqu'à son octet final (`0x40..=0x7E`), terminateur inclus.
+fn drain_csi<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
+    for n in chars.by_ref() {
+        if ('@'..='~').contains(&n) {
+            break;
+        }
+    }
+}
+
+/// Draine jusqu'au String Terminator (`ESC \`) ou BEL (`\x07`) — fin d'une séquence
+/// OSC/DCS. Consomme le terminateur ; s'arrête aussi sur un ESC nu (séquence malformée).
+fn drain_to_st<I: Iterator<Item = char>>(chars: &mut std::iter::Peekable<I>) {
+    while let Some(n) = chars.next() {
+        if n == '\u{07}' {
+            break;
+        }
+        if n == '\x1b' {
+            if chars.peek() == Some(&'\\') {
+                chars.next();
+            }
+            break;
+        }
+    }
 }
 
 /// Dernières `n` lignes non vides, markdown allégé et tronquées — pour l'aperçu
@@ -695,23 +1088,58 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         left.push(Span::styled(format!(" {pct}% contexte"), theme.dim()));
     }
 
-    let (word, word_style) = match state.status {
-        Status::Thinking => ("● réfléchit", theme.accent()),
-        Status::Idle => ("○ prêt", theme.faint()),
+    // À droite : pendant un tour, spinner animé + verbe + durée + tokens (US-044/045) ;
+    // au repos, l'état « prêt ». En spans pour une largeur dynamique.
+    let mut right: Vec<Span> = match state.status {
+        Status::Thinking => progress_spans(state, theme, area.width as usize),
+        Status::Idle => vec![Span::styled("○ prêt", theme.faint())],
     };
-    // Réserve à droite la largeur du mot d'état + une marge symétrique à l'INDENT.
-    let right_w = word.chars().count() as u16 + INDENT.len() as u16;
+    // Clampé à `area.width - 1` : sur terminal étroit, le segment droit est tronqué
+    // plutôt que d'évincer la colonne gauche (workspace/modèle).
+    let right_w = (right
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>() as u16
+        + INDENT.len() as u16)
+        .min(area.width.saturating_sub(1));
     let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(right_w)]).split(area);
 
     frame.render_widget(Paragraph::new(Line::from(left)), cols[0]);
+    right.push(Span::raw(INDENT));
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(word, word_style),
-            Span::raw(INDENT),
-        ]))
-        .alignment(Alignment::Right),
+        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
         cols[1],
     );
+}
+
+/// Spans de progression (status line, pendant un tour) : spinner animé + verbe, et —
+/// si la status line est assez large — durée écoulée (au-delà d'un seuil) + estimation
+/// de tokens (US-044/045). Terminal étroit → seuls spinner + verbe sont gardés.
+fn progress_spans(state: &AppState, theme: &Theme, width: usize) -> Vec<Span<'static>> {
+    let (glyph, gstyle) = crate::spinner::frame(state.spinner_tick, state.reduced_motion, theme);
+    let verb = crate::spinner::verb(state.spinner_tick);
+    let mut spans = vec![
+        Span::styled(glyph, gstyle),
+        Span::styled(format!(" {verb}"), theme.dim()),
+    ];
+    if width >= 56 {
+        if let Some(d) = state.turn_elapsed
+            && d >= crate::spinner::DURATION_MIN
+        {
+            spans.push(Span::styled(
+                format!("  {}", crate::spinner::fmt_duration(d)),
+                theme.faint(),
+            ));
+        }
+        let toks = state.turn_chars / 4;
+        if toks > 0 {
+            spans.push(Span::styled(
+                format!("  ~{}", crate::spinner::fmt_tokens(toks)),
+                theme.faint(),
+            ));
+        }
+    }
+    spans
 }
 
 /// Jauge de contexte compacte en 8 cellules (`▰` plein / `▱` vide), arrondie.
@@ -721,29 +1149,39 @@ fn context_gauge(pct: u8) -> String {
 }
 
 fn render_permission(frame: &mut Frame, area: Rect, prompt: &PermissionPrompt, theme: &Theme) {
-    let mut lines: Vec<Line> = Vec::new();
-    // Titre : un accent net, sans boîte.
-    lines.push(Line::from(vec![
-        Span::styled("⟐ ", theme.accent()),
-        Span::styled(
-            prompt.title.clone(),
-            theme.fg().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  — {}", prompt.reason), theme.dim()),
-    ]));
+    let width = area.width as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    // Titre : accent net, sans boîte. Clippé à UNE ligne (hauteur déterministe).
+    // Assaini ICI (point de rendu) : le titre porte un `path`/nom d'outil
+    // model-controlled qui ne passe PAS par le moteur de diff — sans ça, un `path`
+    // contenant de l'OSC/CSI injecterait le terminal (le diff, lui, est déjà assaini).
+    lines.push(clip(
+        vec![
+            Span::styled("⟐ ", theme.accent()),
+            Span::styled(
+                sanitize(&prompt.title),
+                theme.fg().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("  - {}", sanitize(&prompt.reason)), theme.dim()),
+        ],
+        width,
+    ));
 
-    // Détail / diff : gouttière non sélectionnable (numéro de ligne faint).
-    for (i, dl) in prompt.detail.iter().enumerate() {
-        let (sign, sign_style, text_style) = match dl.kind {
-            DiffKind::Add => ("+", theme.accent(), theme.fg()),
-            DiffKind::Remove => ("-", theme.dim(), theme.dim()),
-            DiffKind::Context => (" ", theme.faint(), theme.dim()),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:>3} ", i + 1), theme.faint()), // gouttière n°
-            Span::styled(format!("{sign} "), sign_style),
-            Span::styled(truncate(&dl.text, 140), text_style),
-        ]));
+    // Aperçu : MÊME moteur/rendu que le diff inline (US-039). Borné à la place
+    // restante (titre + actions réservés) pour que [o]/[n] restent TOUJOURS visibles.
+    let mut preview: Vec<Line<'static>> = Vec::new();
+    push_diff(&mut preview, &prompt.preview, theme, width, None);
+    let room = (area.height as usize).saturating_sub(2);
+    if preview.len() <= room {
+        lines.extend(preview);
+    } else {
+        let keep = room.saturating_sub(1);
+        let hidden = preview.len() - keep;
+        lines.extend(preview.into_iter().take(keep));
+        lines.push(Line::from(Span::styled(
+            format!("{INDENT}… +{hidden} lignes"),
+            theme.faint(),
+        )));
     }
 
     lines.push(Line::from(vec![
@@ -753,13 +1191,14 @@ fn render_permission(frame: &mut Frame, area: Rect, prompt: &PermissionPrompt, t
         Span::styled(" refuser", theme.dim()),
     ]));
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    // Lignes déjà clippées à la largeur → pas de `Wrap` (hauteur exacte).
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Hauteur nécessaire au dialog de permission (titre + détail + actions).
+/// Hauteur nécessaire au dialog de permission (titre + aperçu borné + actions).
 fn permission_height(prompt: &PermissionPrompt, _width: u16) -> u16 {
-    let detail = prompt.detail.len().min(12) as u16;
-    (2 + detail).clamp(2, 16)
+    let preview = prompt.preview.rows.len().min(12) as u16;
+    (2 + preview).clamp(2, 16)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -774,11 +1213,10 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::DiffLine;
     use agent_core::AgentEvent;
+    use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::Terminal;
 
     fn dump(buf: &Buffer) -> String {
         let area = buf.area();
@@ -866,19 +1304,17 @@ mod tests {
     #[test]
     fn permission_dialog_renders_diff_gutter() {
         let mut s = AppState::new("gpt-5", true);
+        let preview = crate::diff::from_tool(
+            "edit",
+            &serde_json::json!({
+                "path": "src/main.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"
+            }),
+        )
+        .unwrap();
         s.pending = Some(PermissionPrompt {
             title: "edit src/main.rs".into(),
             reason: "mutation".into(),
-            detail: vec![
-                DiffLine {
-                    kind: DiffKind::Remove,
-                    text: "let x = 1;".into(),
-                },
-                DiffLine {
-                    kind: DiffKind::Add,
-                    text: "let x = 2;".into(),
-                },
-            ],
+            preview,
         });
         let out = draw(&s, 50, 14);
         assert!(
@@ -886,14 +1322,27 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.contains("- let x = 1;"),
+            out.contains("let x = 1;"),
             "ligne supprimée absente:\n{out}"
         );
-        assert!(
-            out.contains("+ let x = 2;"),
-            "ligne ajoutée absente:\n{out}"
-        );
+        assert!(out.contains("let x = 2;"), "ligne ajoutée absente:\n{out}");
         assert!(out.contains("edit src/main.rs"));
+    }
+
+    // Sécurité (US-039) : le titre du dialog (path/nom d'outil model-controlled) est
+    // assaini au rendu — un `path` portant de l'OSC/CSI ne fuit pas vers le terminal.
+    #[test]
+    fn permission_title_is_sanitized() {
+        let mut s = AppState::new("gpt-5", true);
+        s.pending = Some(PermissionPrompt {
+            title: "edit \x1b]0;pwned\x07evil.rs".into(),
+            reason: "motif\x1b[31m".into(),
+            preview: crate::diff::Diff::default(),
+        });
+        let out = draw(&s, 50, 8);
+        assert!(!out.contains('\u{1b}'), "ESC résiduel dans le dialog:\n{out}");
+        assert!(out.contains("evil.rs"), "titre assaini préservé:\n{out}");
+        assert!(out.contains("autoriser"), "actions présentes:\n{out}");
     }
 
     // US-019 AC4 : dégradation sans truecolor — pas de panic, layout intact.
@@ -952,10 +1401,410 @@ mod tests {
         s.pending = Some(PermissionPrompt {
             title: "bash".into(),
             reason: "sensible".into(),
-            detail: vec![],
+            preview: crate::diff::Diff::default(),
         });
         let action = s.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_eq!(action, crate::state::InputAction::Permission(false));
         assert!(s.pending.is_none());
+    }
+
+    // US-034 : un tour assistant est ancré par une puce ●.
+    #[test]
+    fn assistant_turn_has_bullet_anchor() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::Text("Bonjour".into()));
+        s.apply(&AgentEvent::EndTurn);
+        let out = draw(&s, 40, 8);
+        assert!(out.contains('●'), "puce d'ancrage absente:\n{out}");
+        assert!(out.contains("Bonjour"));
+    }
+
+    // US-034 : un tour assistant VIDE ne laisse pas de puce orpheline.
+    #[test]
+    fn empty_assistant_has_no_orphan_bullet() {
+        let mut s = AppState::new("gpt-5", true);
+        s.push_user("salut");
+        s.apply(&AgentEvent::Text(String::new()));
+        s.apply(&AgentEvent::EndTurn);
+        let out = draw(&s, 40, 8);
+        assert!(out.contains("salut"));
+        assert!(!out.contains('●'), "puce orpheline sur tour vide:\n{out}");
+    }
+
+    // US-035 : un edit affiche le label Update(path) + résumé ⎿ Added/removed.
+    #[test]
+    fn edit_tool_shows_label_and_summary() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::ToolCall(agent_core::event::ToolCallView {
+            id: "c1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({
+                "path": "src/main.rs", "old_string": "a\nb", "new_string": "x\ny\nz"
+            }),
+        }));
+        s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
+            id: "c1".into(),
+            content: "Édité : src/main.rs (niveau 1 : exact)".into(),
+            is_error: false,
+            untrusted: false,
+        }));
+        let out = draw(&s, 60, 16);
+        assert!(out.contains("Update("), "label Update absent:\n{out}");
+        assert!(out.contains("src/main.rs"));
+        assert!(out.contains('⎿'), "connecteur ⎿ absent:\n{out}");
+        assert!(
+            out.contains("Added") && out.contains("removed"),
+            "résumé diff absent:\n{out}"
+        );
+    }
+
+    // US-035 : une lecture affiche un résumé condensé ⎿ Read N lines.
+    #[test]
+    fn read_tool_shows_line_count() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::ToolCall(agent_core::event::ToolCallView {
+            id: "r1".into(),
+            name: "read".into(),
+            input: serde_json::json!({ "path": "a.rs" }),
+        }));
+        s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
+            id: "r1".into(),
+            content: "     1\tfn main() {\n     2\t}\n".into(),
+            is_error: false,
+            untrusted: true,
+        }));
+        let out = draw(&s, 50, 10);
+        assert!(out.contains("Read"), "verbe Read absent:\n{out}");
+        assert!(out.contains("lines"), "compte de lignes absent:\n{out}");
+    }
+
+    // US-036 : une erreur d'outil est rendue avec le préfixe Error:.
+    #[test]
+    fn tool_error_uses_error_grammar() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
+            id: "x1".into(),
+            content: "ancre introuvable dans src/x.rs".into(),
+            is_error: true,
+            untrusted: true,
+        }));
+        let out = draw(&s, 60, 8);
+        assert!(out.contains("Error:"), "grammaire d'erreur absente:\n{out}");
+        assert!(out.contains("ancre introuvable"));
+    }
+
+    // US-036 : un rejet utilisateur est distinct d'une erreur (pas de « Error: »).
+    #[test]
+    fn user_rejection_is_not_an_error() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
+            id: "x2".into(),
+            content: "action « edit » refusée par l'utilisateur".into(),
+            is_error: true,
+            untrusted: false,
+        }));
+        let out = draw(&s, 64, 8);
+        assert!(out.contains("refusée"), "libellé de rejet absent:\n{out}");
+        assert!(
+            !out.contains("Error:"),
+            "le rejet ne doit pas être rendu comme une erreur:\n{out}"
+        );
+    }
+
+    // Sécurité (US-036 / FR-10) : `sanitize` neutralise TOUTES les familles
+    // d'échappement, pas seulement CSI — OSC (titre/hyperlink/clipboard), DCS, C1
+    // 8 bits et DEL — sur une sortie d'outil/modèle adverse.
+    #[test]
+    fn sanitize_strips_all_escape_families() {
+        // CSI (déjà couvert) + OSC terminé par BEL.
+        assert_eq!(sanitize("a\x1b[31mb\x1b]0;titre\x07c"), "abc");
+        // OSC 8 (hyperlink) terminé par ST (ESC \).
+        assert_eq!(sanitize("x\x1b]8;;http://evil\x1b\\y"), "xy");
+        // DCS terminé par ST.
+        assert_eq!(sanitize("p\x1bPq…data\x1b\\r"), "pr");
+        // C1 8 bits (CSI/OSC 0x9B/0x9D) et DEL retirés.
+        assert_eq!(sanitize("u\u{9b}31mv\u{7f}w"), "uvw");
+        // ESC nu en fin de chaîne : pas de panic, simplement avalé.
+        assert_eq!(sanitize("fin\x1b"), "fin");
+        // Aucun ESC résiduel quel que soit le payload.
+        let dirty = "\x1b]0;\x07\x1b[1m\u{9d}\x7f\x1bc texte";
+        assert!(!sanitize(dirty).contains('\u{1b}'), "résidu ESC");
+    }
+
+    // US-038 : un edit réussi affiche le diff coloré (lignes +/-) sous le résumé.
+    #[test]
+    fn inline_diff_shows_after_successful_edit() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::ToolCall(agent_core::event::ToolCallView {
+            id: "c1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({
+                "path": "a.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"
+            }),
+        }));
+        s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
+            id: "c1".into(),
+            content: "Édité : a.rs (niveau 1)".into(),
+            is_error: false,
+            untrusted: false,
+        }));
+        let out = draw(&s, 60, 12);
+        assert!(
+            out.contains("let x = 1;"),
+            "ligne supprimée absente:\n{out}"
+        );
+        assert!(out.contains("let x = 2;"), "ligne ajoutée absente:\n{out}");
+        assert!(
+            out.contains('+') && out.contains('-'),
+            "signes de diff absents:\n{out}"
+        );
+    }
+
+    // US-038 : un edit ÉCHOUÉ n'affiche aucun diff (seulement l'erreur).
+    #[test]
+    fn failed_edit_shows_no_diff() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::ToolCall(agent_core::event::ToolCallView {
+            id: "c1".into(),
+            name: "edit".into(),
+            input: serde_json::json!({ "path": "a.rs", "old_string": "ZZZ", "new_string": "YYY" }),
+        }));
+        s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
+            id: "c1".into(),
+            content: "ancre introuvable dans a.rs".into(),
+            is_error: true,
+            untrusted: true,
+        }));
+        let out = draw(&s, 60, 10);
+        assert!(out.contains("Error:"), "erreur absente:\n{out}");
+        assert!(
+            !out.contains("YYY"),
+            "aucun diff ne doit s'afficher sur un edit échoué:\n{out}"
+        );
+    }
+
+    // US-039 : un diff de permission très long est tronqué SANS masquer [o]/[n].
+    #[test]
+    fn permission_dialog_keeps_actions_visible_on_long_diff() {
+        let mut s = AppState::new("gpt-5", true);
+        let content = (0..40)
+            .map(|i| format!("ligne {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = crate::diff::from_tool(
+            "write",
+            &serde_json::json!({ "path": "big.rs", "content": content }),
+        )
+        .unwrap();
+        s.pending = Some(PermissionPrompt {
+            title: "write big.rs".into(),
+            reason: "création".into(),
+            preview,
+        });
+        let out = draw(&s, 50, 20);
+        assert!(
+            out.contains("autoriser") && out.contains("refuser"),
+            "actions masquées par un diff long:\n{out}"
+        );
+        assert!(
+            out.contains("lignes"),
+            "marqueur de troncature absent:\n{out}"
+        );
+    }
+
+    // US-041 : le cache ne reconstruit que le bloc qui change ; un resize invalide
+    // tout. (Le compteur `render_rebuilds` instrumente la passe précédente.)
+    #[test]
+    fn cache_rebuilds_only_changed_blocks() {
+        let mut s = AppState::new("gpt-5", true);
+        s.apply(&AgentEvent::Text("Bonjour".into()));
+        s.apply(&AgentEvent::EndTurn);
+        s.push_user("question");
+        s.apply(&AgentEvent::Text("Réponse en **gras**".into()));
+
+        // Frame 1 : cache froid → les 3 blocs sont construits.
+        let _ = draw(&s, 60, 20);
+        assert_eq!(s.render_rebuilds(), 3, "1re frame : tout construit");
+
+        // Frame 2 : transcript inchangé → 100 % cache hit.
+        let _ = draw(&s, 60, 20);
+        assert_eq!(s.render_rebuilds(), 0, "blocs baked servis depuis le cache");
+
+        // Un token arrive sur le dernier bloc (stream) → une seule reconstruction.
+        s.apply(&AgentEvent::Text(" et suite".into()));
+        let _ = draw(&s, 60, 20);
+        assert_eq!(
+            s.render_rebuilds(),
+            1,
+            "seul le bloc en stream est reconstruit"
+        );
+
+        // Resize (reflow) → cache invalidé → tout reconstruit.
+        let _ = draw(&s, 40, 20);
+        assert_eq!(s.render_rebuilds(), 3, "le resize invalide tout le cache");
+    }
+
+    // US-043 : une table markdown est rendue alignée dans le transcript (la largeur
+    // de contenu est correctement transmise à `render_markdown`).
+    #[test]
+    fn markdown_table_renders_in_transcript() {
+        let mut s = AppState::new("gpt-5", true);
+        s.push_user("?");
+        s.apply(&AgentEvent::Text(
+            "| Col A | Col B |\n|---|---|\n| 1 | 2 |\n".into(),
+        ));
+        s.apply(&AgentEvent::EndTurn);
+        let out = draw(&s, 60, 20);
+        assert!(
+            out.contains("Col A") && out.contains("Col B"),
+            "en-tête de table absente:\n{out}"
+        );
+        assert!(out.contains('│'), "séparateur de colonnes absent:\n{out}");
+    }
+
+    // US-042 : la coloration du diff préserve l'emphase word-diff et applique la
+    // teinte de syntaxe aux segments non emphasés, sans masquer le fond.
+    #[test]
+    fn diff_segs_spans_preserves_emphasis_and_applies_syntax() {
+        let theme = Theme::new(true);
+        let segs = vec![
+            crate::diff::Seg {
+                text: "let ".into(),
+                emphasized: false,
+            },
+            crate::diff::Seg {
+                text: "x".into(),
+                emphasized: true,
+            },
+        ];
+        // Sans coloration : texte intact, l'emphase porte le style saturé `word`.
+        let spans = diff_segs_spans(&segs, None, theme.diff_add(), theme.diff_add_word());
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "let x");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content.as_ref() == "x" && s.style == theme.diff_add_word()),
+            "le segment emphasé doit garder le style word-diff"
+        );
+
+        // Avec une couleur par caractère : les non-emphasés prennent la teinte fournie
+        // (fg) tout en gardant le fond `base` ; l'emphasé reste `word`.
+        let colors = vec![Color::Rgb(1, 2, 3); joined.chars().count()];
+        let spans2 = diff_segs_spans(
+            &segs,
+            Some(&colors),
+            theme.diff_add(),
+            theme.diff_add_word(),
+        );
+        assert!(
+            spans2
+                .iter()
+                .any(|s| s.style.fg == Some(Color::Rgb(1, 2, 3))),
+            "la teinte de syntaxe doit s'appliquer aux segments non emphasés"
+        );
+        assert!(
+            spans2
+                .iter()
+                .any(|s| s.content.as_ref() == "x" && s.style == theme.diff_add_word()),
+            "l'emphase word-diff prime sur la coloration"
+        );
+    }
+
+    // US-042 (robustesse) : l'alignement couleur↔caractère du diff tient en
+    // multi-octets (sinon la teinte se désaligne après le 1er char accentué).
+    #[test]
+    fn diff_segs_spans_aligns_colors_with_multibyte() {
+        let theme = Theme::new(true);
+        let segs = [crate::diff::Seg {
+            text: "let café = 1; // ☕".into(),
+            emphasized: false,
+        }];
+        let line: String = segs.iter().map(|s| s.text.as_str()).collect();
+        let colors = vec![Color::Rgb(9, 9, 9); line.chars().count()];
+        let spans = diff_segs_spans(
+            &segs,
+            Some(&colors),
+            theme.diff_add(),
+            theme.diff_add_word(),
+        );
+        // Texte reconstruit intact ET chaque caractère tinté (aucun retour à `base`
+        // faute d'alignement multi-octet).
+        let rebuilt: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(rebuilt, line);
+        assert!(
+            spans
+                .iter()
+                .all(|s| s.style.fg == Some(Color::Rgb(9, 9, 9))),
+            "tint complet : pas de désalignement sur les caractères multi-octets"
+        );
+    }
+
+    // US-044/045 : pendant un tour, la status line montre spinner + verbe, la durée
+    // (au-delà du seuil) et une estimation de tokens.
+    #[test]
+    fn progress_shows_verb_duration_tokens_while_thinking() {
+        let mut s = AppState::new("gpt-5", true);
+        s.push_user("?");
+        s.apply(&AgentEvent::Text(
+            "réponse assez longue pour estimer des tokens".into(),
+        ));
+        s.tick_progress(std::time::Duration::from_secs(3));
+        let out = draw(&s, 80, 12);
+        assert!(
+            out.contains("réfléchit"),
+            "verbe de progression absent:\n{out}"
+        );
+        assert!(out.contains("3s"), "durée absente:\n{out}");
+        assert!(out.contains('~'), "estimation de tokens absente:\n{out}");
+    }
+
+    // US-045 : à la fin du tour, les indicateurs disparaissent (état « prêt »).
+    #[test]
+    fn idle_shows_ready_state() {
+        let mut s = AppState::new("gpt-5", true);
+        s.push_user("?");
+        s.apply(&AgentEvent::Text("réponse".into()));
+        s.apply(&AgentEvent::EndTurn);
+        let out = draw(&s, 80, 12);
+        assert!(out.contains("prêt"), "état repos attendu:\n{out}");
+    }
+
+    // US-046 : la pill « nouveaux messages » n'apparaît QUE remonté ET contenu arrivé.
+    #[test]
+    fn scroll_pill_only_when_scrolled_up_with_unseen() {
+        let mut s = AppState::new("gpt-5", true);
+        for i in 0..30 {
+            s.push_user(format!("q{i}"));
+            s.apply(&AgentEvent::Text(format!("réponse {i}")));
+            s.apply(&AgentEvent::EndTurn);
+        }
+        // Collé en bas (scroll == 0) : pas de pill.
+        let bottom = draw(&s, 60, 10);
+        assert!(
+            !bottom.contains("nouveau"),
+            "pas de pill collé en bas:\n{bottom}"
+        );
+        // L'utilisateur remonte (scroll_max posé par le draw précédent), du contenu arrive.
+        s.scroll_up(3);
+        s.apply(&AgentEvent::Text("contenu frais hors de la vue".into()));
+        let up = draw(&s, 60, 10);
+        assert!(
+            up.contains("nouveau"),
+            "pill attendue après scroll + contenu:\n{up}"
+        );
+    }
+
+    // US-044 (robustesse) : la status line en cours de tour ne panique pas et
+    // n'évince pas tout sur un terminal très étroit (right_w clampé).
+    #[test]
+    fn progress_status_line_survives_narrow_terminal() {
+        let mut s = AppState::new("gpt-5", true);
+        s.push_user("?");
+        s.apply(&AgentEvent::Text("réponse".into()));
+        s.tick_progress(std::time::Duration::from_secs(3));
+        // Largeur 8 : le draw doit aboutir (pas de panic, pas de corruption).
+        let out = draw(&s, 8, 6);
+        assert!(!out.is_empty());
     }
 }
