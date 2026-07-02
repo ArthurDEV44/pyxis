@@ -1,4 +1,4 @@
-# Roadmap Numen
+# Roadmap Pyxis
 
 **Principe directeur : le dur et le risque en premier.** On n'écrit pas une ligne d'architecture confortable avant d'avoir tué les inconnues qui peuvent invalider le projet. Chaque phase descend d'un cran dans le risque résiduel. La Phase 0 n'est pas un sprint de fondation : c'est une série de spikes jetables dont la seule fonction est de produire un verdict go/no-go.
 
@@ -12,7 +12,7 @@ Le risque d'exécution N1 est connu et assumé : Rust en solo = vélocité plus 
 
 Deux divergences de nommage sont **actées explicitement** ici pour éviter toute ambiguïté dans la suite du document et avec les autres docs.
 
-**Crates.** Le nom **`numen`** est réservé et libre sur crates.io (atout décisif, cf. ADR-5) ; il désigne le **crate racine publié** et le **binaire** (commande `numen`). Les crates internes du workspace conservent le préfixe `agent-*` (`agent-core`, `agent-cli`, `agent-tui`, …) tel que défini dans le BRIEF et `docs/ARCHITECTURE.md`. Autrement dit : la façade publique est `numen` (binaire + crate racine = `agent-cli` republié sous ce nom), l'intérieur du workspace reste `agent-*`. Les réservations `numen-cli` / `numen-core` sont gardées en réserve défensive, sans usage interne. Cette convention est la version autoritative : si un doc nomme encore un crate de travail `numen-core`, c'est `agent-core` qui fait foi.
+**Crates.** Le nom **`pyxis`** désigne le **crate racine publié** et le **binaire** cible (commande `pyxis`). Sa disponibilité crates.io/GitHub reste à vérifier avant publication. Les crates internes du workspace conservent le préfixe `agent-*` (`agent-core`, `agent-cli`, `agent-tui`, …) tel que défini dans le BRIEF et `docs/ARCHITECTURE.md`. Autrement dit : la façade publique est `pyxis` (binaire + crate racine = `agent-cli` republié sous ce nom), l'intérieur du workspace reste `agent-*`. Les réservations `pyxis-cli` / `pyxis-core` sont à vérifier puis garder en réserve défensive, sans usage interne. Cette convention est la version autoritative : si un doc nomme encore un crate de travail `pyxis-core`, c'est `agent-core` qui fait foi.
 
 **Erreurs.** Le type canonique de classification est **`ErrorClass`** (jamais `ErrClass`). Sa taxonomie de référence détaillée vit dans `docs/PROVIDERS.md` ; ce document n'en reprend que ce qui conditionne la roadmap.
 
@@ -89,13 +89,13 @@ Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) ;
 | Sessions JSONL + resume | Sous-agents / teams |
 | — | Mémoire vectorielle, protocole d'enrichissement Paneflow |
 
-**Plateforme et distribution.** Linux uniquement. macOS et cross-compile sont en Phase 3. **La distribution publique (`cargo binstall` + `curl | pipe`) n'arrive qu'en Phase 3** : au MVP, on s'installe par `cargo build`/`cargo install` local. Le README montre la commande cible `numen` (et `numen -p`) : c'est l'**interface visée**, pas l'état de distribution — aucun canal de release n'existe avant la Phase 3.
+**Plateforme et distribution.** Linux uniquement. macOS et cross-compile sont en Phase 3. **La distribution publique (`cargo binstall` + `curl | pipe`) n'arrive qu'en Phase 3** : au MVP, on s'installe par `cargo build`/`cargo install` local. Le README montre la commande cible `pyxis` (et `pyxis -p`) : c'est l'**interface visée**, pas l'état de distribution — aucun canal de release n'existe avant la Phase 3.
 
 ---
 
 ## Phase 2 — v1
 
-**Objectif.** Couvrir l'ensemble des providers frontier et faire de Numen un agent complet, avec la première amorce de l'intégration profonde Paneflow.
+**Objectif.** Couvrir l'ensemble des providers frontier et faire de Pyxis un agent complet, avec la première amorce de l'intégration profonde Paneflow.
 
 **Livrables.**
 - **Tous les providers** :
@@ -117,7 +117,7 @@ Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) ;
 
 ## Phase 3 — Durcissement & distribution
 
-**Objectif.** Rendre Numen distribuable, multi-plateforme et tenable dans la durée sans SDK officiel.
+**Objectif.** Rendre Pyxis distribuable, multi-plateforme et tenable dans la durée sans SDK officiel.
 
 **Livrables.**
 - **macOS Seatbelt** : équivalent de la sandbox Landlock côté macOS.
@@ -137,6 +137,6 @@ Le risque N1 produit du projet est externe et hors de notre contrôle : depuis j
 **Conséquence opérationnelle stricte : on répond à la question auth provider avant d'écrire une ligne d'architecture.** Le spike auth Anthropic est le `[P0 ABSOLU]` de la Phase 0 — la première chose qu'on fait, en 1 jour, dans `agent-auth`. Son verdict conditionne tout le reste :
 
 - **Si Anthropic est exploitable (token au minimum)** → il entre dans le provider set MVP en mode conditionnel ; on garde le cache-hit, les betas gated `kind == Anthropic`, et l'OAuth single-provider + refresh associé.
-- **Si Anthropic est inexploitable** → le MVP est conçu **non bloqué par design**. Ollama (local) + OpenAI (au token) suffisent à livrer un agent fonctionnel, et le positionnement reste **model-agnostic**. Numen ne dépend d'aucun provider unique pour exister.
+- **Si Anthropic est inexploitable** → le MVP est conçu **non bloqué par design**. Ollama (local) + OpenAI (au token) suffisent à livrer un agent fonctionnel, et le positionnement reste **model-agnostic**. Pyxis ne dépend d'aucun provider unique pour exister.
 
 La mitigation est structurelle, pas réactive : le différenciateur (**full Rust natif ultra-perf + multi-provider first-class + cœur partagé avec Paneflow**) tient indépendamment du sort d'Anthropic. Le spike auth ne décide pas si le projet vit — il décide seulement quels providers sont dans le MVP. Mais il se tranche **en premier**, avant tout engagement d'architecture.

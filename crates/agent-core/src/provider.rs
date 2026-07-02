@@ -31,16 +31,35 @@ pub enum ProviderKind {
 /// `ToolCallDelta.args_json` d'un même id DOIT être un JSON valide.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
-    TextDelta { text: String },
-    ReasoningDelta { text: String },
-    ToolCallStart { id: ToolCallId, name: String },
-    ToolCallDelta { id: ToolCallId, args_json: String },
-    ToolCallEnd { id: ToolCallId },
-    Usage { usage: TokenUsage },
-    Done { stop: StopReason },
+    TextDelta {
+        text: String,
+    },
+    ReasoningDelta {
+        text: String,
+    },
+    ToolCallStart {
+        id: ToolCallId,
+        name: String,
+    },
+    ToolCallDelta {
+        id: ToolCallId,
+        args_json: String,
+    },
+    ToolCallEnd {
+        id: ToolCallId,
+    },
+    Usage {
+        usage: TokenUsage,
+    },
+    Done {
+        stop: StopReason,
+    },
     /// Reasoning item chiffré (US-031, replay isolé) : émis par l'adapter UNIQUEMENT
     /// si `reasoning_replay` est actif. Capturé par l'`Accumulator`.
-    EncryptedReasoning { id: String, encrypted_content: String },
+    EncryptedReasoning {
+        id: String,
+        encrypted_content: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -1,15 +1,15 @@
 [PRD]
-# PRD: Numen : Refonte du rendu des réponses du modèle (TUI)
+# PRD: Pyxis : Refonte du rendu des réponses du modèle (TUI)
 
 ## Changelog
 
 | Version | Date | Author | Summary |
 |---------|------|--------|---------|
-| 1.0 | 2026-06-17 | Arthur Jean | Initial draft, issu de l'audit comparatif Numen vs Claude Code + dissection Codex CLI (Rust). Direction validée : « Structure Claude Code, ADN Numen ». |
+| 1.0 | 2026-06-17 | Arthur Jean | Initial draft, issu de l'audit comparatif Pyxis vs Claude Code + dissection Codex CLI (Rust). Direction validée : « Structure Claude Code, ADN Pyxis ». |
 
 ## Problem Statement
 
-Le MVP de Numen a livré un frontend TUI minimal (`prd-numen.md`, US-019) : streaming token-par-token, diff brut dans le dialog de permission, dégradation monochrome. C'était volontairement le strict nécessaire : le PRD MVP a **explicitement différé** « le TUI riche (sélection souris, tables markdown, virtual scroll, syntax highlight incrémental) » à une phase ultérieure (`prd-numen.md`, Non-Goals). Cette phase, c'est ce PRD. Aujourd'hui le rendu est le maillon faible visible face à Claude Code et Codex App, et c'est précisément ce qui fait basculer le dogfooder sur un autre outil. L'audit a isolé des écarts concrets, dont la cause racine est le **modèle de données**, pas le style de rendu :
+Le MVP de Pyxis a livré un frontend TUI minimal (`prd-pyxis.md`, US-019) : streaming token-par-token, diff brut dans le dialog de permission, dégradation monochrome. C'était volontairement le strict nécessaire : le PRD MVP a **explicitement différé** « le TUI riche (sélection souris, tables markdown, virtual scroll, syntax highlight incrémental) » à une phase ultérieure (`prd-pyxis.md`, Non-Goals). Cette phase, c'est ce PRD. Aujourd'hui le rendu est le maillon faible visible face à Claude Code et Codex App, et c'est précisément ce qui fait basculer le dogfooder sur un autre outil. L'audit a isolé des écarts concrets, dont la cause racine est le **modèle de données**, pas le style de rendu :
 
 1. **L'information structurée des outils est jetée à l'arrivée.** `AppState::apply` aplatit le `ToolCallView.input` (qui contient path, old_string, new_string, content) en `summary: String` via `summarize()` (`crates/agent-tui/src/state.rs:447,998`). Impossible ensuite de produire `Update(path)`, `Added N lines, removed M`, ou un diff : la donnée n'existe plus.
 2. **Les résultats d'outils sont masqués et non corrélés.** `render.rs:537-550` n'affiche un `ToolResult` que s'il est en erreur ; les deux blocs `ToolCall`/`ToolResult` ne partagent pas d'`id`, donc aucune hiérarchie call→result (le connecteur `⎿` de Claude Code), aucun résumé de succès.
@@ -17,11 +17,11 @@ Le MVP de Numen a livré un frontend TUI minimal (`prd-numen.md`, US-019) : stre
 4. **Pas de coloration syntaxique ni de tables.** Les code-blocks markdown sont rendus en gris uni (`crates/agent-tui/src/markdown.rs:147-157`) ; les tables markdown sont silencieusement perdues (option `ENABLE_TABLES` active mais aucun handler `Tag::Table`).
 5. **Aucune progression vivante.** Pas de spinner animé, pas de durée écoulée, pas de compteur de tokens : juste un `● réfléchit` statique dans la status line (`render.rs:698-701`).
 
-**Why now:** Le cœur est durci (`prd-codex-orchestration.md`, EP-006→009 livrés) et l'édition est fiable (US-025). Le rendu est désormais le seul écran qui sépare Numen de la qualité Codex App. L'audit comparatif (Claude Code source + Codex CLI Rust) est terminé et a produit une grammaire visuelle précise ; la direction esthétique est tranchée (« Structure Claude Code, ADN Numen »). La stack de référence (Codex CLI : ratatui 0.29, similar 2.7, syntect 5) est connue et transposable. C'est la fenêtre pour faire de Numen un harness dont le rendu n'est plus une raison de basculer ailleurs.
+**Why now:** Le cœur est durci (`prd-codex-orchestration.md`, EP-006→009 livrés) et l'édition est fiable (US-025). Le rendu est désormais le seul écran qui sépare Pyxis de la qualité Codex App. L'audit comparatif (Claude Code source + Codex CLI Rust) est terminé et a produit une grammaire visuelle précise ; la direction esthétique est tranchée (« Structure Claude Code, ADN Pyxis »). La stack de référence (Codex CLI : ratatui 0.29, similar 2.7, syntect 5) est connue et transposable. C'est la fenêtre pour faire de Pyxis un harness dont le rendu n'est plus une raison de basculer ailleurs.
 
 ## Overview
 
-Ce PRD refond le rendu des **réponses du modèle** : texte markdown assistant, raisonnement, invocations d'outils, résultats, diffs, erreurs, et indicateurs de progression. La direction validée est « **Structure Claude Code, ADN Numen** » : on importe la structure qui fait la qualité de Claude Code (puce d'ancrage `●`, hiérarchie call→result via `⎿`, diffs inline lisibles, résumés d'outils structurés, coloration syntaxique, progression vivante) tout en préservant l'esthétique signature de Numen (monochrome + un accent teal). La couleur est **réservée au fonctionnel** : vert/rouge pour les diffs, coloration sobre pour le code ; le reste reste monochrome, la hiérarchie passant par le poids et la teinte. La règle de teinte : puce teal = parole de l'agent, puce grise = action outil, rouge = erreur.
+Ce PRD refond le rendu des **réponses du modèle** : texte markdown assistant, raisonnement, invocations d'outils, résultats, diffs, erreurs, et indicateurs de progression. La direction validée est « **Structure Claude Code, ADN Pyxis** » : on importe la structure qui fait la qualité de Claude Code (puce d'ancrage `●`, hiérarchie call→result via `⎿`, diffs inline lisibles, résumés d'outils structurés, coloration syntaxique, progression vivante) tout en préservant l'esthétique signature de Pyxis (monochrome + un accent teal). La couleur est **réservée au fonctionnel** : vert/rouge pour les diffs, coloration sobre pour le code ; le reste reste monochrome, la hiérarchie passant par le poids et la teinte. La règle de teinte : puce teal = parole de l'agent, puce grise = action outil, rouge = erreur.
 
 La refonte est **confinée au crate `agent-tui`**, plus un enrichissement du type `Block` (`state.rs`) et un seul ajout dans la boucle (`agent-cli/src/interactive.rs` : un tick timer pour animer le spinner). Décision clé issue de l'audit : les contrats `agent-core` (`AgentEvent`) et `agent-tools` (`ToolOutput`) restent **intacts** : le `ToolCallView` porte déjà l'`input` complet, donc les diffs et les résumés se dérivent côté frontend, sans toucher le cœur ni les outils. Autre décision structurante : on **conserve le modèle viewport + scroll interne** actuel (alt-screen) plutôt que de migrer vers le pattern `insert_before` de Codex (scrollback natif), qui serait une refonte d'architecture hors-scope ; la contrepartie perf (re-render intégral à chaque frame) est neutralisée par un **cache des lignes stylées « baked »**, obligatoire avant d'introduire la coloration syntaxique.
 
@@ -39,14 +39,14 @@ La solution s'organise en quatre épics livrables incrémentalement : (EP-010) l
 ## Target Users
 
 ### Arthur Jean, créateur & dogfooder principal
-- **Role:** Solo indie maker ; orchestre Codex via Numen au quotidien, dans Paneflow.
+- **Role:** Solo indie maker ; orchestre Codex via Pyxis au quotidien, dans Paneflow.
 - **Behaviors:** Sessions longues (refactors, audits) avec beaucoup d'éditions et de lectures de fichiers ; lit attentivement les diffs et la sortie des outils ; Fedora/Wayland, terminal truecolor.
 - **Pain points:** Le rendu actuel est plat : pas de diff après édition, code non coloré, résultats d'outils masqués, aucun feedback de progression. Difficile de suivre ce que fait l'agent d'un coup d'œil.
-- **Current workaround:** Bascule sur Codex App / Claude Code pour les tâches où le rendu compte ; Numen reste un prototype.
-- **Success looks like:** Le rendu de Numen n'est plus jamais une raison de quitter l'outil ; les diffs et la progression sont aussi lisibles que dans Claude Code, avec la sobriété en plus.
+- **Current workaround:** Bascule sur Codex App / Claude Code pour les tâches où le rendu compte ; Pyxis reste un prototype.
+- **Success looks like:** Le rendu de Pyxis n'est plus jamais une raison de quitter l'outil ; les diffs et la progression sont aussi lisibles que dans Claude Code, avec la sobriété en plus.
 
 ### Développeur Rust / systèmes, early adopter OSS
-- **Role:** Dev qui teste Numen depuis le repo GPL-3.0.
+- **Role:** Dev qui teste Pyxis depuis le repo GPL-3.0.
 - **Behaviors:** Juge un harness sur la première session ; attend un rendu propre des diffs et du code de son propre repo.
 - **Pain points:** Un TUI qui rend le code en gris uni et masque les diffs paraît inachevé face au Codex CLI officiel.
 - **Current workaround:** Retourne au Codex CLI ou à Claude Code.
@@ -64,7 +64,7 @@ La solution s'organise en quatre épics livrables incrémentalement : (EP-010) l
 Key findings que ce PRD applique :
 
 ### Competitive Context
-- **Claude Code (React/Ink, Node)** : la cible de finition. Puce `●` d'ancrage par étape, hiérarchie call→result via le connecteur `⎿`, `StructuredDiff` (dual-frame caching + ANSI slicing) pour les diffs colorés, `/diff` par tour, spinner à verbes. Coût : 200-400 Mo de RAM (Ink). Numen vise la même finition en Rust natif à ~1/10 de la RAM.
+- **Claude Code (React/Ink, Node)** : la cible de finition. Puce `●` d'ancrage par étape, hiérarchie call→result via le connecteur `⎿`, `StructuredDiff` (dual-frame caching + ANSI slicing) pour les diffs colorés, `/diff` par tour, spinner à verbes. Coût : 200-400 Mo de RAM (Ink). Pyxis vise la même finition en Rust natif à ~1/10 de la RAM.
 - **Codex CLI (openai/codex, Rust+ratatui)** : la référence directe et transposable. Stack confirmée : ratatui 0.29, `similar` 2.7 (diff lignes + intra-ligne), `syntect` 5, `ansi-to-tui` 7, `textwrap` 0.16, `unicode-width` 0.2. Pattern d'archi `insert_before()` (scrollback natif), qu'on **écarte** ici (voir Technical Considerations). Tables markdown longtemps mauvaises (leçon : les soigner), `ansi` rendu en RGB qui casse les thèmes (leçon : ne pas hardcoder RGB hors truecolor).
 - **opencode** : contre-modèle perf documenté (issue #811 : 25-30 % CPU idle, re-render sur timer). Leçon directe : rendre event-driven, cacher tout ce qui est « baked ».
 - **Gemini CLI** : bugs markdown chroniques (listes tronquées, tables illisibles) car parsing incrémental d'un stream qui coupe les structures au milieu. Leçon : parser tolérant à l'incomplet (pulldown-cmark ferme implicitement, déjà acquis) + prévoir un toggle rendu/brut.
@@ -73,7 +73,7 @@ Key findings que ce PRD applique :
 ### Best Practices Applied
 - **Cacher les lignes stylées « baked »** et ne reconstruire que la ligne en cours de stream ; n'invalider que sur resize (reflow) ou édition de contenu. La coloration syntaxique ne tourne **jamais** par frame.
 - **`similar` pour le diff** : `grouped_ops(context)` pour les hunks, `iter_inline_changes` pour l'emphase mot-à-mot ; word-diff calculé en lazy uniquement sur les lignes des hunks modifiés.
-- **Ne jamais hardcoder de RGB** sans détection truecolor ; dégrader proprement (Numen le fait déjà via `COLORTERM`).
+- **Ne jamais hardcoder de RGB** sans détection truecolor ; dégrader proprement (Pyxis le fait déjà via `COLORTERM`).
 - **Largeur unicode** via `unicode-width` / itération par graphème (amélioration vs `chars().count()` actuel).
 
 *Sources complètes : transcripts d'audit de cette session (rendu Claude Code source + dissection Codex CLI), Cargo.toml de openai/codex, docs ratatui.*
@@ -432,6 +432,6 @@ Questions pour l'engineering (recommandations, pas mandats) :
 
 - Faut-il rendre la sortie complète des outils de lecture expansible (façon ctrl-o) ou le résumé `⎿` suffit-il ? Arthur, à trancher à l'usage ; impacte un éventuel besoin de `ansi-to-tui`.
 - Les numéros de ligne absolus sont-ils nécessaires à la parité visuelle, ou le relatif est-il acceptable ? À valider en dogfood après EP-011 ; conditionne un enrichissement du retour `Edit`.
-- Un toggle markdown rendu/brut (alt+m) apporte-t-il de la valeur pour Numen ? À évaluer après EP-012 (filet de sécurité observé sur Gemini CLI).
+- Un toggle markdown rendu/brut (alt+m) apporte-t-il de la valeur pour Pyxis ? À évaluer après EP-012 (filet de sécurité observé sur Gemini CLI).
 - Quel seuil exact de durée avant d'afficher les indicateurs de progression (US-045) pour éviter le clignotement sur tours courts ? À calibrer en dogfood.
 [/PRD]

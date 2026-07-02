@@ -1,4 +1,4 @@
-# Numen
+# Pyxis
 
 <p align="center">
   <img alt="Status" src="https://img.shields.io/badge/status-early%20development-orange">
@@ -8,11 +8,11 @@
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue"></a>
 </p>
 
-**A native, model-agnostic AI coding agent that lives in your terminal.** `numen` opens straight in your shell, streams a model, runs real tools (read, grep, edit, bash), and loops until the work is done, all from a single Rust binary with no Node runtime underneath.
+**A native, model-agnostic AI coding agent that lives in your terminal.** `pyxis` opens straight in your shell, streams a model, runs real tools (read, grep, edit, bash), and loops until the work is done, all from a single Rust binary with no Node runtime underneath.
 
-Numen is built around a **headless core** (`agent-core`) that emits only structured events, never ANSI. The terminal UI is just one client. That same core is meant to be embedded in-process by [Paneflow](https://paneflow.dev) (Zed's GPUI) for GPU-accelerated diffs and plan trees later, without forking any agent logic. The provider layer is multi-provider by design (a clean `Provider` trait + an Anthropic-shaped canonical format), so new model backends drop in as isolated adapters.
+Pyxis is built around a **headless core** (`agent-core`) that emits only structured events, never ANSI. The terminal UI is just one client. That same core is meant to be embedded in-process by [Paneflow](https://paneflow.dev) (Zed's GPUI) for GPU-accelerated diffs and plan trees later, without forking any agent logic. The provider layer is multi-provider by design (a clean `Provider` trait + an Anthropic-shaped canonical format), so new model backends drop in as isolated adapters.
 
-> *Numen* (Latin): the animating will, the guiding presence. It keeps the soul of *daimon*, a guide-spirit for your codebase.
+> *Pyxis* is the compass. A small instrument for keeping direction while the agent navigates a large codebase, chooses files, edits precisely, and returns with a diff you can trust.
 
 <p align="center">
   <a href="#status">Status</a> ·
@@ -25,15 +25,15 @@ Numen is built around a **headless core** (`agent-core`) that emits only structu
 </p>
 
 <p align="center">
-  <img src="assets/images/welcome.png" alt="Numen's welcome screen: a monochrome terminal card with a braille Dyson-sphere logo, running on a ChatGPT subscription (codex, gpt-5.5)" width="100%" />
+  <img src="assets/images/welcome.png" alt="Pyxis's welcome screen: a monochrome terminal card with a braille Dyson-sphere logo, running on a ChatGPT subscription (codex, gpt-5.5)" width="100%" />
 </p>
 <p align="center">
   <sub>The welcome screen: a native terminal agent on your ChatGPT subscription (gpt-5.5 via codex), monochrome, no window.</sub>
 </p>
 
 ```console
-$ numen
-  numen · gpt-5.5 · ~/dev/myproject
+$ pyxis
+  pyxis · gpt-5.5 · ~/dev/myproject
 
 › refactor the auth module to drop unwrap() in prod paths
 
@@ -44,7 +44,7 @@ $ numen
   Replaced 4 unwrap() with ? / ok_or(...). Diff above.
 
 # headless, scriptable, no TUI
-$ numen -p "summarize the changes in the last commit"
+$ pyxis -p "summarize the changes in the last commit"
 ```
 
 ## Status
@@ -62,32 +62,32 @@ You need a Rust toolchain (1.95+) and a Linux desktop session with a Secret Serv
 
 ```bash
 # 1. Build from source
-git clone https://github.com/ArthurDEV44/numen.git
-cd numen
-cargo build --release          # produces target/release/numen
+git clone https://github.com/ArthurDEV44/pyxis.git
+cd pyxis
+cargo build --release          # produces target/release/pyxis
 
 # 2. Authenticate with your ChatGPT subscription (OAuth, opens a browser)
 cargo run -p agent-auth --example login
 
 # 3. Run it in any project directory
 cd ~/dev/myproject
-/path/to/numen/target/release/numen
+/path/to/pyxis/target/release/pyxis
 ```
 
-Drop `target/release/numen` on your `PATH` (or `cargo install --path crates/agent-cli`) to call `numen` from anywhere.
+Drop `target/release/pyxis` on your `PATH` (or `cargo install --path crates/agent-cli`) to call `pyxis` from anywhere.
 
 ## Where it fits
 
-Numen overlaps with every terminal coding agent, but the design center is specific: **a native, model-agnostic agent whose core is built to be embedded in a GPU terminal workspace.**
+Pyxis overlaps with every terminal coding agent, but the design center is specific: **a native, model-agnostic agent whose core is built to be embedded in a GPU terminal workspace.**
 
-| Tool | Strength | Numen's angle |
+| Tool | Strength | Pyxis's angle |
 |---|---|---|
 | Claude Code | Polished Anthropic-native agent, large ecosystem | Model-agnostic core by design; one native Rust binary, no Node runtime |
 | Codex CLI | OpenAI-native, strong sandboxing | Reuses the ChatGPT-subscription channel, but ships a headless core meant to embed in Paneflow |
 | aider / opencode | Mature multi-model OSS agents | Rust-native, kernel-level FS sandbox (Landlock), shared core with a GPU terminal workspace |
-| Paneflow | Runs CLI agents in parallel GPU panes | Numen is the agent; Paneflow is the surface. The plan is to embed `agent-core` in-process, no IPC |
+| Paneflow | Runs CLI agents in parallel GPU panes | Pyxis is the agent; Paneflow is the surface. The plan is to embed `agent-core` in-process, no IPC |
 
-The honest caveat: most rows describe a *direction*. Today Numen ships one provider and one frontend. The bet is in the architecture (headless core + provider trait), not in a checklist.
+The honest caveat: most rows describe a *direction*. Today Pyxis ships one provider and one frontend. The bet is in the architecture (headless core + provider trait), not in a checklist.
 
 ## Features
 
@@ -97,12 +97,12 @@ Shipped today:
 - **Built-in tool suite**: `read`, `glob`, `grep`, `write`, `edit`, `bash`. Concurrency-safe reads run in parallel; mutations run serially.
 - **Fail-closed permissions + taint**: every tool is dangerous until proven otherwise. Tool output is untrusted by default (OWASP LLM01); a destructive or network action in a turn that just read untrusted content is forced to ask, regardless of mode.
 - **Execution sandbox**: Landlock confines all writes to the workspace (the agent *and* its `bash` subprocesses); a fail-closed local proxy gates outbound network from tool subprocesses via `--allow <host>`.
-- **Persistent sessions**: one append-only JSONL file per conversation under `.numen/sessions/`, with `/resume` to reopen a past session and a workspace-wide prompt history.
-- **`/goal` completion loop**: set a session objective and Numen re-runs the agentic loop until it emits a done marker (capped at 25 iterations), persisted in a `.numen/goal` sidecar so it survives restarts.
+- **Persistent sessions**: one append-only JSONL file per conversation under `.pyxis/sessions/`, with `/resume` to reopen a past session and a workspace-wide prompt history.
+- **`/goal` completion loop**: set a session objective and Pyxis re-runs the agentic loop until it emits a done marker (capped at 25 iterations), persisted in a `.pyxis/goal` sidecar so it survives restarts.
 - **MCP (stdio)**: connect to Model Context Protocol servers from `.mcp.json` or your existing `~/.claude.json`, managed from the `/mcp` submenu.
 - **Markdown rendering**: assistant replies are rendered to styled spans (CommonMark + GFM).
 - **Monochrome Ratatui UI**: clean, modern, Rauch/Vercel-flavored, with a braille Dyson-sphere logo and a welcome screen, not a double-bordered retro TUI.
-- **Headless mode**: `numen -p "..."` runs without the TUI, so the core is scriptable and testable without a terminal or a live API.
+- **Headless mode**: `pyxis -p "..."` runs without the TUI, so the core is scriptable and testable without a terminal or a live API.
 - **ChatGPT subscription auth**: OAuth PKCE, refresh-token rotation, credentials in the OS keyring (never in plaintext).
 
 Architecture-ready, not yet built:
@@ -113,7 +113,7 @@ Architecture-ready, not yet built:
 
 ## How it works
 
-Numen is a Cargo workspace. The crates are named `agent-*` internally; the published binary and command are `numen` (see [`docs/DECISIONS.md`](docs/DECISIONS.md), ADR-8).
+Pyxis is a Cargo workspace. The crates are named `agent-*` internally; the published binary and command are `pyxis` (see [`docs/DECISIONS.md`](docs/DECISIONS.md), ADR-8).
 
 ```
                          ┌──────────────────────────────┐
@@ -145,13 +145,13 @@ The founding invariant: **`agent-core` depends on neither the TUI nor the provid
 | `agent-sandbox` | Landlock FS confinement + local network allow-list proxy |
 | `agent-auth` | Credential storage (keyring), OAuth PKCE, token refresh |
 | `agent-tokenizer` | Local token counting (fallback when a provider omits stream usage) |
-| `agent-cli` | The `numen` binary, the only crate that wires everything together |
+| `agent-cli` | The `pyxis` binary, the only crate that wires everything together |
 
 Full detail in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Authentication
 
-Numen authenticates with your **ChatGPT subscription** (Plus / Pro), not a metered API key. The flow:
+Pyxis authenticates with your **ChatGPT subscription** (Plus / Pro), not a metered API key. The flow:
 
 ```bash
 cargo run -p agent-auth --example login
@@ -159,13 +159,13 @@ cargo run -p agent-auth --example login
 
 This runs OAuth PKCE against `auth.openai.com`, then talks to the ChatGPT backend's Responses API (`chatgpt.com/backend-api/codex/responses`) in stateless SSE mode, so the full transcript is sent each turn and compaction / resume / replay stay intact. Tokens are stored in the OS keyring and refreshed automatically.
 
-**Read this before you rely on it.** The login reuses the OAuth client of the open-source Codex CLI, which effectively impersonates Codex. That is ToS-grey and **revocable**: OpenAI could disable this client at any time, exactly as Anthropic blocked third-party tools from using Pro/Max subscriptions in 2026. Numen treats the subscription as a disposable convenience layer, not a foundation. The day it breaks, adding a BYOK adapter (Chat Completions, Anthropic, ...) is an isolated module, not a rewrite. The model-agnostic architecture is the insurance policy. See [`docs/DECISIONS.md`](docs/DECISIONS.md) (ADR-10, ADR-11) and [`docs/openai-subscription-auth.md`](docs/openai-subscription-auth.md).
+**Read this before you rely on it.** The login reuses the OAuth client of the open-source Codex CLI, which effectively impersonates Codex. That is ToS-grey and **revocable**: OpenAI could disable this client at any time, exactly as Anthropic blocked third-party tools from using Pro/Max subscriptions in 2026. Pyxis treats the subscription as a disposable convenience layer, not a foundation. The day it breaks, adding a BYOK adapter (Chat Completions, Anthropic, ...) is an isolated module, not a rewrite. The model-agnostic architecture is the insurance policy. See [`docs/DECISIONS.md`](docs/DECISIONS.md) (ADR-10, ADR-11) and [`docs/openai-subscription-auth.md`](docs/openai-subscription-auth.md).
 
 ## Build from source
 
 ### Rust toolchain
 
-Numen uses Rust **1.95+** (edition 2024). Install via [rustup](https://rustup.rs/):
+Pyxis uses Rust **1.95+** (edition 2024). Install via [rustup](https://rustup.rs/):
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -188,18 +188,18 @@ sudo apt install build-essential pkg-config libsecret-1-dev
 ### Build and test
 
 ```bash
-cargo build --release          # binary at target/release/numen
+cargo build --release          # binary at target/release/pyxis
 cargo test --workspace         # headless core is fully testable without a live API
 ```
 
-The filesystem sandbox needs a Linux kernel with Landlock (5.13+, ABI improvements through 6.x). Without it, Numen warns and runs unconfined rather than failing closed.
+The filesystem sandbox needs a Linux kernel with Landlock (5.13+, ABI improvements through 6.x). Without it, Pyxis warns and runs unconfined rather than failing closed.
 
 ## Usage
 
 ```bash
-numen                          # interactive TUI in the current directory
-numen -p "<prompt>"            # headless one-shot, prints the answer and exits
-numen "<prompt>"               # bare prompt is treated as -p
+pyxis                          # interactive TUI in the current directory
+pyxis -p "<prompt>"            # headless one-shot, prints the answer and exits
+pyxis "<prompt>"               # bare prompt is treated as -p
 ```
 
 ### Flags
@@ -233,12 +233,12 @@ The Codex backend accepts a whitelist of versioned slugs it rotates. The generic
 
 ## Files and configuration
 
-Numen reads and writes a few well-known paths:
+Pyxis reads and writes a few well-known paths:
 
 | Path | Purpose |
 |------|---------|
-| `<workspace>/.numen/sessions/*.jsonl` | One append-only transcript per conversation; backs `/resume` |
-| `<workspace>/.numen/goal` | Persistent `/goal` objective (survives restarts) |
+| `<workspace>/.pyxis/sessions/*.jsonl` | One append-only transcript per conversation; backs `/resume` |
+| `<workspace>/.pyxis/goal` | Persistent `/goal` objective (survives restarts) |
 | `<workspace>/.mcp.json` | Workspace MCP servers (highest priority) |
 | `~/.claude.json` | Reused `mcpServers` from Claude Code, merged underneath |
 | `~/.agents/skills/<name>/` | Skills surfaced by `/skills` (one directory per skill) |
@@ -255,7 +255,7 @@ These paths outside the workspace (skills, MCP config, keyring) are read **befor
 
 ## Roadmap
 
-The MVP target was deliberately narrow: **make Numen excellent with one model channel (the ChatGPT subscription) and dogfood it daily**, rather than ship six empty provider columns. The multi-provider architecture is the invariant; adapters land incrementally.
+The MVP target was deliberately narrow: **make Pyxis excellent with one model channel (the ChatGPT subscription) and dogfood it daily**, rather than ship six empty provider columns. The multi-provider architecture is the invariant; adapters land incrementally.
 
 - **Now (shipped)**: agentic loop, tool suite + sandbox, sessions + resume, `/goal`, MCP stdio, monochrome TUI, ChatGPT subscription provider.
 - **Next**: more provider adapters behind the existing `Provider` trait, MCP tools wired into the model loop, Paneflow in-process embedding (GPU diffs, plan trees, hunk review).
@@ -285,7 +285,7 @@ Sequencing, not abandonment. The author orchestrates agents all day and wanted *
 The subscription login reuses the open-source Codex CLI's OAuth client, which is unofficial and ToS-grey. It works for personal use and is revocable. If that risk is unacceptable to you, wait for the BYOK adapters.
 
 **Can I use my Anthropic Max subscription?**
-No. Anthropic blocks third-party tools from authenticating with Pro/Max subscriptions. That is precisely why Numen is model-agnostic by design and does not depend on any single subscription channel.
+No. Anthropic blocks third-party tools from authenticating with Pro/Max subscriptions. That is precisely why Pyxis is model-agnostic by design and does not depend on any single subscription channel.
 
 **Is this a Claude Code wrapper?**
 No. It is an independent Rust implementation inspired by Claude Code's internal architecture (headless loop, transcript-before-response, compaction cascade, fail-closed tools), not a shell over it.
@@ -294,11 +294,11 @@ No. It is an independent Rust implementation inspired by Claude Code's internal 
 It is dogfooded daily by its author on Linux, but it is early: one provider, no releases, Linux-first, and a revocable auth channel. Build from source and expect rough edges.
 
 **Why GPL-3.0?**
-Numen is free and open source by design, and copyleft keeps it that way: improvements to the agent stay in the commons, and the shared core cannot be forked into a closed product.
+Pyxis is free and open source by design, and copyleft keeps it that way: improvements to the agent stay in the commons, and the shared core cannot be forked into a closed product.
 
 **How does it relate to Paneflow?**
-Paneflow runs CLI agents in parallel GPU panes; Numen is one such agent. The deeper plan is for Paneflow to embed `agent-core` in-process and render its events natively (GPU diffs, plan trees). That embedding is future work; the decoupling that makes it possible exists today.
+Paneflow runs CLI agents in parallel GPU panes; Pyxis is one such agent. The deeper plan is for Paneflow to embed `agent-core` in-process and render its events natively (GPU diffs, plan trees). That embedding is future work; the decoupling that makes it possible exists today.
 
 ## License
 
-[GPL-3.0-or-later](LICENSE). Numen is free and open source by design, and copyleft keeps it that way: improvements stay in the commons.
+[GPL-3.0-or-later](LICENSE). Pyxis is free and open source by design, and copyleft keeps it that way: improvements stay in the commons.

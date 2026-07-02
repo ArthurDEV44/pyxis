@@ -1,4 +1,4 @@
-//! `numen` — binaire CLI. SEUL crate qui câble tout (ARCHITECTURE §2) : cœur +
+//! `pyxis` — binaire CLI. SEUL crate qui câble tout (ARCHITECTURE §2) : cœur +
 //! provider abonnement ChatGPT + outils + session + sandbox + frontend TUI.
 //!
 //! Ordre critique : le **sandbox FS (Landlock) est appliqué sur le thread
@@ -177,7 +177,7 @@ async fn run(
     );
     // US-022 : idle timeout SSE configurable par session (défaut 60 s). Une valeur
     // env invalide/0 est ignorée → garde le défaut (watchdog jamais désactivé).
-    if let Some(secs) = std::env::var("NUMEN_IDLE_TIMEOUT_SECS")
+    if let Some(secs) = std::env::var("PYXIS_IDLE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|s| *s > 0)
@@ -193,8 +193,8 @@ async fn run(
         Arc::new(move |cmd: &mut tokio::process::Command| set_proxy_env(cmd, &proxy_addr));
 
     // 3. Session persistante : un fichier JSONL par conversation (horodaté) sous
-    // <workspace>/.numen/sessions/, listable/reprenable via `/resume`.
-    let sessions_dir = workspace.join(".numen").join("sessions");
+    // <workspace>/.pyxis/sessions/, listable/reprenable via `/resume`.
+    let sessions_dir = workspace.join(".pyxis").join("sessions");
     std::fs::create_dir_all(&sessions_dir)?;
     let session_millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -205,9 +205,9 @@ async fn run(
         .map_err(|e| anyhow::anyhow!("session : {e}"))?;
     let (shared_session, conversation) = SharedSession::new(jsonl);
 
-    // Objectif de session persistant (`/goal`) : chargé du sidecar `.numen/goal`
+    // Objectif de session persistant (`/goal`) : chargé du sidecar `.pyxis/goal`
     // (survit au redémarrage), composé dans le system prompt à chaque tour.
-    let goal = std::fs::read_to_string(workspace.join(".numen").join("goal"))
+    let goal = std::fs::read_to_string(workspace.join(".pyxis").join("goal"))
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
@@ -301,7 +301,7 @@ async fn run(
             truecolor: agent_tui::supports_truecolor(),
             // Reduced-motion : spinner dégradé en point pulsé (US-044).
             reduced_motion: std::env::var_os("NO_COLOR").is_some()
-                || std::env::var_os("NUMEN_REDUCED_MOTION").is_some(),
+                || std::env::var_os("PYXIS_REDUCED_MOTION").is_some(),
             // credential chargée plus haut (sinon on a bail) → connecté.
             connected: true,
             skills,

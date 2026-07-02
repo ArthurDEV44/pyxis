@@ -61,7 +61,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Idle timeout per-event par défaut (US-022). Un stream SSE OUVERT qui n'émet
 /// plus aucun event (backend silencieux, queue) est annulé après ce délai →
 /// `Stream("idle timeout")` (Retryable). Configurable par session (`with_idle_timeout`,
-/// env `NUMEN_IDLE_TIMEOUT_SECS`). Pi : 20 s (header) ; Codex CLI : 300 s/event.
+/// env `PYXIS_IDLE_TIMEOUT_SECS`). Pi : 20 s (header) ; Codex CLI : 300 s/event.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct OpenAiChatGptProvider {
@@ -89,7 +89,21 @@ fn new_session_id() -> String {
     b[8] = (b[8] & 0x3F) | 0x80; // variant RFC 4122
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14],
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
         b[15]
     )
 }
@@ -543,7 +557,10 @@ mod tests {
             "billing: out of budget",
         ] {
             assert!(
-                matches!(p.classify_error(&terminal(body)), ErrorClass::InvalidRequest),
+                matches!(
+                    p.classify_error(&terminal(body)),
+                    ErrorClass::InvalidRequest
+                ),
                 "429 terminal attendu pour: {body}"
             );
         }
@@ -555,7 +572,9 @@ mod tests {
         // régression : un 429 transitoire mentionnant « billing » NE doit PAS être
         // classé terminal (sous-chaîne nue écartée — biais faux-négatif sûr).
         assert!(matches!(
-            p.classify_error(&terminal("rate limited; see your billing dashboard for limits")),
+            p.classify_error(&terminal(
+                "rate limited; see your billing dashboard for limits"
+            )),
             ErrorClass::RateLimited
         ));
     }
@@ -620,8 +639,7 @@ mod tests {
     // sans gel. Timeout court (réel) → test rapide et déterministe.
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_stream() {
-        let silent =
-            futures_util::stream::pending::<Result<StreamEvent, ProviderError>>().boxed();
+        let silent = futures_util::stream::pending::<Result<StreamEvent, ProviderError>>().boxed();
         let guarded = idle_guarded(silent, Duration::from_millis(40));
         futures_util::pin_mut!(guarded);
         let first = guarded.next().await;
@@ -685,7 +703,9 @@ mod tests {
         let inner = futures_util::stream::iter(vec![
             Ok(StreamEvent::TextDelta { text: "x".into() }),
             Err(ProviderError::Stream("boom".into())),
-            Ok(StreamEvent::TextDelta { text: "jamais".into() }),
+            Ok(StreamEvent::TextDelta {
+                text: "jamais".into(),
+            }),
         ])
         .boxed();
         let guarded = idle_guarded(inner, Duration::from_secs(5));

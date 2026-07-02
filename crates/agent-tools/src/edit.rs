@@ -335,7 +335,14 @@ mod tests {
         let content = "let s = \u{201C}h\u{00A0}\u{2014}llo\u{201D};\nx\n";
         let r = locate(content, "let s = \"h -llo\";");
         assert!(
-            matches!(r, Ok(Anchor::Lines { level: MatchLevel::Unicode, start: 0, len: 1 })),
+            matches!(
+                r,
+                Ok(Anchor::Lines {
+                    level: MatchLevel::Unicode,
+                    start: 0,
+                    len: 1
+                })
+            ),
             "la passe Unicode doit absorber NBSP/dash/quotes"
         );
     }

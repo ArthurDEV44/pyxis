@@ -1,6 +1,6 @@
-# Contributing to Numen
+# Contributing to Pyxis
 
-Numen is early and moving fast. Issues, bug reports, and focused pull requests are all welcome.
+Pyxis is early and moving fast. Issues, bug reports, and focused pull requests are all welcome.
 
 ## Before you start
 
@@ -19,10 +19,10 @@ Numen is early and moving fast. Issues, bug reports, and focused pull requests a
 
 ## Licensing of contributions
 
-Numen is licensed under **GPL-3.0-or-later** (see [`LICENSE`](LICENSE)) and is also offered by StriveX under separate commercial terms. To keep both possible, contributions are accepted under the following terms:
+Pyxis is licensed under **GPL-3.0-or-later** (see [`LICENSE`](LICENSE)) and is also offered by StriveX under separate commercial terms. To keep both possible, contributions are accepted under the following terms:
 
 - You license your contribution under **GPL-3.0-or-later**, the project's open-source license.
-- You also grant **StriveX (Arthur Jean)** a perpetual, worldwide, non-exclusive, royalty-free right to use, reproduce, modify, and **relicense your contribution, including under commercial license terms**, as part of Numen.
+- You also grant **StriveX (Arthur Jean)** a perpetual, worldwide, non-exclusive, royalty-free right to use, reproduce, modify, and **relicense your contribution, including under commercial license terms**, as part of Pyxis.
 - You keep the copyright to your contribution. This is a license grant, not an assignment.
 
 If you would rather not grant the commercial-relicensing right, say so in your PR: small fixes can still be merged under plain GPL-3.0-or-later on a case-by-case basis.

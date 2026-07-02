@@ -433,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn loop_runs_tool_then_ends() {
         let provider = ScriptedProvider::new(vec![
-            bash_turn("call_1", "echo bonjour-numen"),
+            bash_turn("call_1", "echo bonjour-pyxis"),
             text_turn("Voilà, c'est fait."),
         ]);
         let out = run_agent(&provider, None, "fais un echo", 5, Duration::from_secs(5)).await;
@@ -444,7 +444,7 @@ mod tests {
             "fin propre attendue"
         );
         assert_eq!(out.invocations.len(), 1);
-        assert_eq!(out.invocations[0].output, "bonjour-numen");
+        assert_eq!(out.invocations[0].output, "bonjour-pyxis");
         assert!(
             out.invocations[0].untrusted,
             "sortie outil = untrusted par défaut"

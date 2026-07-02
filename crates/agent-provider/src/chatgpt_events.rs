@@ -427,10 +427,12 @@ mod tests {
         // reasoning sans contenu chiffré → ignoré même en ON (non réinjectable).
         let empty =
             r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_2"}}"#;
-        assert!(CodexEventMapper::with_replay(true)
-            .ingest(empty)
-            .unwrap()
-            .is_empty());
+        assert!(
+            CodexEventMapper::with_replay(true)
+                .ingest(empty)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

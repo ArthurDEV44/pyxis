@@ -69,7 +69,7 @@ async fn handle_conn(mut client: TcpStream, cfg: Arc<ProxyConfig>) -> Result<()>
             cfg.allow
         );
         client
-            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nblocked by numen allow-list")
+            .write_all(b"HTTP/1.1 403 Forbidden\r\n\r\nblocked by pyxis allow-list")
             .await?;
         return Ok(());
     }

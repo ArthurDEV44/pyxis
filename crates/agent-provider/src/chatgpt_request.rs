@@ -16,7 +16,7 @@
 
 use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::provider::{CanonicalRequest, ToolSpec};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
@@ -233,10 +233,10 @@ mod tests {
     #[test]
     fn system_goes_to_instructions_not_input() {
         let body = build_responses_body(
-            &req(vec![Message::user("hi")], vec![], Some("Tu es Numen.")),
+            &req(vec![Message::user("hi")], vec![], Some("Tu es Pyxis.")),
             None,
         );
-        assert_eq!(body["instructions"], "Tu es Numen.");
+        assert_eq!(body["instructions"], "Tu es Pyxis.");
         // aucun item role:system dans input
         let input = body["input"].as_array().unwrap();
         assert!(input.iter().all(|i| i["role"] != "system"));

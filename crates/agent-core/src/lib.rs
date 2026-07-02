@@ -1,4 +1,4 @@
-//! `agent-core` — le cœur headless de Numen : boucle d'agent en state machine,
+//! `agent-core` — le cœur headless de Pyxis : boucle d'agent en state machine,
 //! types canoniques, budget de contexte, compaction. Émet UNIQUEMENT des
 //! `AgentEvent` (jamais d'ANSI). Testable sans API/terminal/disque réels
 //! (deps injectables). Invariants : ARCHITECTURE.md « Invariants à ne jamais
@@ -362,7 +362,10 @@ mod loop_tests {
                 "tour {i} : le contexte doit préfixer la requête"
             );
             assert!(
-                msgs.iter().filter(|m| m.text().contains("CTX_AGENTS")).count() == 1,
+                msgs.iter()
+                    .filter(|m| m.text().contains("CTX_AGENTS"))
+                    .count()
+                    == 1,
                 "tour {i} : pas d'accumulation du contexte (une seule occurrence)"
             );
         }
@@ -370,8 +373,9 @@ mod loop_tests {
         // 2. Le transcript persistant NE contient PAS les messages de contexte.
         let synced = h.boundaries.synced.lock().unwrap();
         assert!(
-            !synced.iter().any(|m| m.text().contains("CTX_AGENTS")
-                || m.text().contains("CTX_ENV")),
+            !synced
+                .iter()
+                .any(|m| m.text().contains("CTX_AGENTS") || m.text().contains("CTX_ENV")),
             "le contexte éphémère ne doit jamais être persisté: {synced:?}"
         );
     }

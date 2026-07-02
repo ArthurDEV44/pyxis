@@ -15,7 +15,7 @@ const ACCOUNT: &str = "oauth:openai_chatgpt";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    println!("Autorisation de Numen via ton abonnement ChatGPT…");
+    println!("Autorisation de Pyxis via ton abonnement ChatGPT…");
     let cred = openai_chatgpt::login_browser(&client).await?;
     store::save(ACCOUNT, &Credential::Oauth(cred))?;
     println!("Connecté. Credential stockée dans le keyring ({ACCOUNT}).");

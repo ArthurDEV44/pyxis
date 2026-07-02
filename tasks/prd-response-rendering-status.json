@@ -1,7 +1,7 @@
 {
   "prd": {
     "file": "tasks/prd-response-rendering.md",
-    "title": "Numen : Refonte du rendu des réponses du modèle (TUI)",
+    "title": "Pyxis : Refonte du rendu des réponses du modèle (TUI)",
     "created_at": "2026-06-17",
     "status": "DONE"
   },

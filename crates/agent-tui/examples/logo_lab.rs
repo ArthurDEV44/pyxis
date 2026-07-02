@@ -1,4 +1,4 @@
-//! Banc d'essai de logos cosmiques pour Numen : rend plusieurs concepts en ANSI
+//! Banc d'essai de logos cosmiques pour Pyxis : rend plusieurs concepts en ANSI
 //! truecolor pour choisir sur pièce. `cargo run -p agent-tui --example logo_lab`.
 //! Aucun n'est encore câblé dans la TUI — c'est exploratoire. Le gagnant sera
 //! porté dans `render.rs` (générateur géométrique → demi-blocs bi-color).
@@ -347,7 +347,10 @@ fn dyson_min() -> Grid {
     let mut g = blank();
     let c = (N as f32 - 1.0) / 2.0;
     // (inclinaison, ratio petit axe, début de brèche, fin de brèche) en radians.
-    let rings = [(0.50_f32, 0.30_f32, 1.1_f32, 2.3_f32), (-0.62, 0.26, 4.0, 5.0)];
+    let rings = [
+        (0.50_f32, 0.30_f32, 1.1_f32, 2.3_f32),
+        (-0.62, 0.26, 4.0, 5.0),
+    ];
     for (y, row) in g.iter_mut().enumerate() {
         for (x, cell) in row.iter_mut().enumerate() {
             let dx = x as f32 - c;
@@ -378,7 +381,10 @@ fn dyson_min() -> Grid {
 fn dyson_min_at(nx: f32, ny: f32, line_w: f32, core_w: f32) -> f32 {
     let rn = (nx * nx + ny * ny).sqrt();
     let core = (-(rn / core_w).powi(2)).exp();
-    let rings = [(0.50_f32, 0.30_f32, 1.1_f32, 2.3_f32), (-0.62, 0.26, 4.0, 5.0)];
+    let rings = [
+        (0.50_f32, 0.30_f32, 1.1_f32, 2.3_f32),
+        (-0.62, 0.26, 4.0, 5.0),
+    ];
     let mut ring = 0.0_f32;
     for (tilt, br, gap_start, gap_end) in rings {
         let (ct, st) = (tilt.cos(), tilt.sin());
@@ -544,7 +550,7 @@ fn render_grid(name: &str, g: &Grid) {
 }
 
 fn main() {
-    println!("\n=== Banc d'essai logos Numen (cosmique / abstrait) ===");
+    println!("\n=== Banc d'essai logos Pyxis (cosmique / abstrait) ===");
     render_grid("1. Galaxie spirale", &galaxy());
     render_grid("2. Pulsar (deux faisceaux)", &pulsar());
     render_grid("3. Supernova", &supernova());
@@ -559,11 +565,21 @@ fn main() {
     render_braille("11c. Dyson 30x15 (reference)", 30, 15, 1.05, 1.0, |x, y| {
         dyson_min_at(x, y, 0.075, 0.12)
     });
-    render_braille("11d. Dyson 30x15 (+ epais / + dense)", 30, 15, 1.05, 0.7, |x, y| {
-        dyson_min_at(x, y, 0.11, 0.15)
-    });
-    render_braille("11e. Dyson 30x15 (max epais / dense)", 30, 15, 1.05, 0.5, |x, y| {
-        dyson_min_at(x, y, 0.15, 0.18)
-    });
+    render_braille(
+        "11d. Dyson 30x15 (+ epais / + dense)",
+        30,
+        15,
+        1.05,
+        0.7,
+        |x, y| dyson_min_at(x, y, 0.11, 0.15),
+    );
+    render_braille(
+        "11e. Dyson 30x15 (max epais / dense)",
+        30,
+        15,
+        1.05,
+        0.5,
+        |x, y| dyson_min_at(x, y, 0.15, 0.18),
+    );
     println!();
 }

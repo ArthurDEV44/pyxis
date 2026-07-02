@@ -1,5 +1,5 @@
 [PRD]
-# PRD: Numen — Orchestration des modèles Codex (post-MVP)
+# PRD: Pyxis — Orchestration des modèles Codex (post-MVP)
 
 ## Changelog
 
@@ -9,7 +9,7 @@
 
 ## Problem Statement
 
-Le MVP de Numen (PRD `prd-numen.md`, EP-001→EP-005) livre un agent de code fonctionnel : la boucle, la compaction en cascade, les garde-fous, le sandbox et le wire Responses API (backend ChatGPT/Codex, SSE stateless) tournent et ont été validés en live le 2026-06-17. Mais Numen **sous-exploite GPT-5.5 par rapport à Codex App et Codex CLI**, et c'est exactement le pain point que le projet vise (orchestrer Codex mieux que les autres harness). Un audit en deux passes (Claude Code comme référence de qualité, puis dissection de Pi et du Codex CLI officiel comme références Codex) a isolé des écarts concrets :
+Le MVP de Pyxis (PRD `prd-pyxis.md`, EP-001→EP-005) livre un agent de code fonctionnel : la boucle, la compaction en cascade, les garde-fous, le sandbox et le wire Responses API (backend ChatGPT/Codex, SSE stateless) tournent et ont été validés en live le 2026-06-17. Mais Pyxis **sous-exploite GPT-5.5 par rapport à Codex App et Codex CLI**, et c'est exactement le pain point que le projet vise (orchestrer Codex mieux que les autres harness). Un audit en deux passes (Claude Code comme référence de qualité, puis dissection de Pi et du Codex CLI officiel comme références Codex) a isolé des écarts concrets :
 
 1. **Le wire n'est pas durci.** Aucun timeout sur le stream SSE (`agent-provider/src/chatgpt.rs:65,145`) : un backend silencieux (proxy, queue) gèle la boucle indéfiniment, sans erreur ni signal à la TUI. Les 429 « quota épuisé » (`GoUsageLimitError`/`FreeUsageLimitError`) sont retryés comme transitoires. Le header `Retry-After` est ignoré.
 2. **L'édition échoue sur des divergences triviales.** `Edit` fait un match exact byte-pour-byte (`agent-tools/src/edit.rs:79`). Or GPT-5.x génère ses patches depuis sa mémoire de conversation, pas une lecture fraîche : un NBSP, un tiret typographique ou un guillemet auto-corrigé dans l'ancre fait échouer l'edit, et l'agent boucle (retry + relecture). Pi et Codex CLI absorbent ces cas via une normalisation Unicode à 4 passes.
@@ -38,18 +38,18 @@ Décisions structurantes prises pendant l'audit : le transport reste **SSE state
 ## Target Users
 
 ### Arthur Jean — créateur & dogfooder principal
-- **Role:** Solo indie maker, orchestre Codex via Numen dans Paneflow au quotidien.
+- **Role:** Solo indie maker, orchestre Codex via Pyxis dans Paneflow au quotidien.
 - **Behaviors:** Sessions longues d'orchestration de code (refactors, audits), abonnement ChatGPT/Codex, Fedora/Wayland, full Rust.
-- **Pain points:** Numen « marche » mais reste en deçà de Codex App : édition qui boucle sur des divergences d'encodage, modèle qui ne connaît pas le repo, pas de feedback de gel.
-- **Current workaround:** Bascule sur Codex App/CLI pour les tâches sérieuses ; Numen reste un prototype perso.
-- **Success looks like:** Numen devient son harness Codex par défaut, plus fluide et contrôlable que les alternatives.
+- **Pain points:** Pyxis « marche » mais reste en deçà de Codex App : édition qui boucle sur des divergences d'encodage, modèle qui ne connaît pas le repo, pas de feedback de gel.
+- **Current workaround:** Bascule sur Codex App/CLI pour les tâches sérieuses ; Pyxis reste un prototype perso.
+- **Success looks like:** Pyxis devient son harness Codex par défaut, plus fluide et contrôlable que les alternatives.
 
 ### Développeur Rust / systèmes — early adopter OSS
-- **Role:** Dev qui essaie Numen depuis le repo GPL-3.0.
+- **Role:** Dev qui essaie Pyxis depuis le repo GPL-3.0.
 - **Behaviors:** Lit le code, attend une archive propre et des invariants clairs ; teste sur ses propres repos avec AGENTS.md.
 - **Pain points:** Un harness Codex tiers qui dégrade GPT-5.5 (edits ratés, pas de contexte) est inutilisable ; il retourne au Codex CLI officiel.
 - **Current workaround:** Codex CLI officiel.
-- **Success looks like:** Numen tient la comparaison avec le CLI officiel sur l'édition et le contexte, avec un cœur Rust plus rigoureux.
+- **Success looks like:** Pyxis tient la comparaison avec le CLI officiel sur l'édition et le contexte, avec un cœur Rust plus rigoureux.
 
 ### Utilisateur Paneflow — intégration native (futur proche)
 - **Role:** Utilisateur de Paneflow qui embarquera `agent-core` in-process.
@@ -64,8 +64,8 @@ Key findings that informed this PRD:
 
 ### Competitive Context
 - **Codex CLI officiel (openai/codex, Rust)** : référence directe. SSE-only (pas de WS), system prompts versionnés par slug (`core/gpt_5_2_prompt.md` ~300 lignes pour génériques, `*_codex_prompt.md` ~69 lignes pour fine-tunés), `apply_patch` avec localisation à 4 passes (`seek_sketch`/`seek_sequence`), AGENTS.md injecté comme message `user` rechargé par tour, `EnvironmentContext` XML par tour, compaction native (`/responses/compact`, `CompactionTrigger`, `AutoCompactWindow`, `SUMMARY_PREFIX`). On diffère par un cœur Rust à state machine typée et des garde-fous déterministes.
-- **Pi (TS, `/home/arthur/dev/pi`)** : source du wire Numen. Envoie `prompt_cache_key` (clamp 64 code-points), edit fuzzy (même table Unicode que Codex CLI), troncation tail/head avec hint de continuation, compaction 7-sections (car summarizer Anthropic généraliste), file de mutations par `realpath`, distinction des 429 terminaux. On diffère par le keyring (vs `auth.json` clair) et l'absence de WebSocket.
-- **Market gap:** GPT-5.5 Codex est excellent dans Codex App mais dégradé dans les harness tiers (Codex CLI, OpenCode, Pi) sur l'ergonomie et le contrôle. Numen vise le cœur Rust le plus rigoureux **avec** la fidélité Codex de l'officiel.
+- **Pi (TS, `/home/arthur/dev/pi`)** : source du wire Pyxis. Envoie `prompt_cache_key` (clamp 64 code-points), edit fuzzy (même table Unicode que Codex CLI), troncation tail/head avec hint de continuation, compaction 7-sections (car summarizer Anthropic généraliste), file de mutations par `realpath`, distinction des 429 terminaux. On diffère par le keyring (vs `auth.json` clair) et l'absence de WebSocket.
+- **Market gap:** GPT-5.5 Codex est excellent dans Codex App mais dégradé dans les harness tiers (Codex CLI, OpenCode, Pi) sur l'ergonomie et le contrôle. Pyxis vise le cœur Rust le plus rigoureux **avec** la fidélité Codex de l'officiel.
 
 ### Best Practices Applied
 - Édition fuzzy 4 passes (exact → trim_end → trim → normalisation Unicode) — partagée par Pi et Codex CLI, motivée par le fait que le modèle patche de mémoire.
@@ -73,12 +73,12 @@ Key findings that informed this PRD:
 - Wire : `connect_timeout` + idle timeout per-event, `prompt_cache_key`, distinction 429 terminaux, `Retry-After` honoré, sérialisation du body une seule fois.
 - Compaction : `SUMMARY_PREFIX` guard, baseline post-compaction ancrée sur l'`usage` réel, drop des reasoning items (contrainte protocole).
 
-*Full research sources available in `docs/openai-subscription-auth.md`, `docs/PROVIDERS.md`, et les transcripts d'audit (workflows Claude-Code-vs-Numen et Codex-harness-dissection).*
+*Full research sources available in `docs/openai-subscription-auth.md`, `docs/PROVIDERS.md`, et les transcripts d'audit (workflows Claude-Code-vs-Pyxis et Codex-harness-dissection).*
 
 ## Assumptions & Constraints
 
 ### Assumptions (to validate)
-- **Le backend Codex accepte `originator: numen`** — à valider en US-021 (spike live). Évidence : Pi utilise `pi`, le Codex CLI `codex`/`codex_cli_rs` ; le backend *peut* valider contre une liste. Fallback documenté : emprunter `codex_cli_rs`.
+- **Le backend Codex accepte `originator: pyxis`** — à valider en US-021 (spike live). Évidence : Pi utilise `pi`, le Codex CLI `codex`/`codex_cli_rs` ; le backend *peut* valider contre une liste. Fallback documenté : emprunter `codex_cli_rs`.
 - **`gpt-5.5` se comporte comme un modèle GPT-5.x générique (non fine-tuné Codex)** et bénéficie du prompt long type `gpt_5_2` — le slug n'a pas le suffixe `-codex`. À confirmer empiriquement (US-027) ; défaut sûr = prompt long.
 - **La table de normalisation Unicode de Codex CLI/Pi couvre 99 %+ des divergences observées** — reprise verbatim (dashes U+2010-2015/2212, quotes typographiques, NBSP).
 - **`prompt_cache_key` est honoré par le backend ChatGPT pour l'abonnement** (Pi l'envoie systématiquement). Mesurable via l'`usage.input_tokens` sur tours répétés.
@@ -98,7 +98,7 @@ These commands must pass for every user story:
 - `cargo clippy --workspace --all-targets` - lints (hook déterministe : `panic`/`unimplemented`/`dbg_macro` bloquants)
 - `cargo test --workspace` - suite de tests (chaque story ajoute ses tests unitaires ; `agent-core` testable headless via doubles injectés)
 
-Pour US-021 (spike live) : vérification manuelle d'un run réel `numen -p "<prompt forçant un tool>" --yes` contre le backend Codex, plus inspection du transcript JSONL produit.
+Pour US-021 (spike live) : vérification manuelle d'un run réel `pyxis -p "<prompt forçant un tool>" --yes` contre le backend Codex, plus inspection du transcript JSONL produit.
 
 ## Epics & User Stories
 
@@ -109,15 +109,15 @@ Durcir le canal Responses API et la persistance pour qu'une session Codex tienne
 **Definition of Done:** Aucun gel silencieux du stream ; les 429 terminaux ne sont jamais retryés ; `Retry-After` honoré ; le tour assistant final est persisté ; le comportement du header `originator` est tranché en live.
 
 #### US-021: Spike — valider le comportement wire en live (originator + cycle reasoning/tool)
-**Description:** As a dogfooder, I want valider en live le comportement du backend Codex sur `originator=numen` et sur un cycle multi-tour avec outil, so that les décisions wire reposent sur des faits et non des hypothèses.
+**Description:** As a dogfooder, I want valider en live le comportement du backend Codex sur `originator=pyxis` et sur un cycle multi-tour avec outil, so that les décisions wire reposent sur des faits et non des hypothèses.
 
 **Priority:** P0
 **Size:** S (2 pts)
 **Dependencies:** None
 
 **Acceptance Criteria:**
-- [ ] Given un run `numen -p` forçant au moins 2 tours modèle avec un outil entre, when il s'exécute, then le cycle se termine sans 400 et le transcript contient `user → assistant(tool_use) → tool(tool_result)`.
-- [ ] Given `originator=numen`, when une requête est envoyée, then on consigne si le backend l'accepte ou le rejette ; en cas de rejet (unhappy path), le fallback `codex_cli_rs` est documenté et testé.
+- [ ] Given un run `pyxis -p` forçant au moins 2 tours modèle avec un outil entre, when il s'exécute, then le cycle se termine sans 400 et le transcript contient `user → assistant(tool_use) → tool(tool_result)`.
+- [ ] Given `originator=pyxis`, when une requête est envoyée, then on consigne si le backend l'accepte ou le rejette ; en cas de rejet (unhappy path), le fallback `codex_cli_rs` est documenté et testé.
 - [ ] Given le run, when l'`usage.input_tokens` réel revient, then on consigne l'écart avec l'estimation locale `HeuristicCounter` pour calibrer la marge de compaction.
 - [ ] Le verdict (originator OK/KO, écart tokenizer) est écrit dans `docs/` ou en commentaire d'ADR.
 
@@ -135,7 +135,7 @@ Durcir le canal Responses API et la persistance pour qu'une session Codex tienne
 - [ ] Test : un mock de stream qui se bloque déclenche l'idle timeout en `< idle_timeout + marge`.
 
 #### US-023: Taxonomie 429 terminaux + Retry-After honoré
-**Description:** As a user, I want que Numen distingue un quota épuisé d'une surcharge transitoire et respecte le délai serveur, so that une session ne grille pas ses tentatives ni ne harcèle un compte bloqué.
+**Description:** As a user, I want que Pyxis distingue un quota épuisé d'une surcharge transitoire et respecte le délai serveur, so that une session ne grille pas ses tentatives ni ne harcèle un compte bloqué.
 
 **Priority:** P1
 **Size:** M (3 pts)
@@ -313,7 +313,7 @@ Activer le prompt cache du backend et fiabiliser la compaction pour les sessions
 | 3 | Ancre Unicode divergente | `old_string` avec NBSP/tiret typo | Résolu via passe 4, edit appliqué sur offsets originaux | — |
 | 4 | Ancre introuvable/ambiguë | 0 ou ≥ 2 occurrences après 4 passes | Rejet sans mutation, demande de contexte | "Ancre ambiguë/introuvable : précise davantage." |
 | 5 | AGENTS.md absent | Repo sans fichier | Aucune injection, aucune erreur ; fallback CLAUDE.md toléré | — |
-| 6 | originator rejeté | Backend refuse `numen` | Spike détecte, fallback `codex_cli_rs` documenté | (consigné en audit) |
+| 6 | originator rejeté | Backend refuse `pyxis` | Spike détecte, fallback `codex_cli_rs` documenté | (consigné en audit) |
 | 7 | Sortie bash volumineuse | Compilation avec 400 warnings + 3 erreurs | Tail conservé (erreurs visibles) + hint | "[sortie tronquée, début omis]" |
 | 8 | Recompaction | 2ᵉ cycle de compaction | Ancien résumé exclu via SUMMARY_PREFIX guard | — |
 | 9 | Reasoning orphelin | Tour avorté, reasoning sans function_call | Reasoning sauté (pas de 400) | — |
@@ -323,7 +323,7 @@ Activer le prompt cache du backend et fiabiliser la compaction pour les sessions
 
 | # | Risk | Probability | Impact | Mitigation |
 |---|------|------------|--------|------------|
-| 1 | `originator=numen` rejeté par le backend | Med | High | Spike US-021 en premier ; fallback `codex_cli_rs` prêt |
+| 1 | `originator=pyxis` rejeté par le backend | Med | High | Spike US-021 en premier ; fallback `codex_cli_rs` prêt |
 | 2 | `gpt-5.5` est en réalité fine-tuné Codex → prompt long contre-productif | Low | Med | Défaut sûr = prompt long ; confirmer empiriquement, dispatcher trivial à ajuster |
 | 3 | Table Unicode incomplète → edits encore rejetés | Low | Med | Reprise verbatim de Pi/Codex CLI (validée en prod) ; niveau de passe consigné pour diagnostic |
 | 4 | `prompt_cache_key` non honoré par le canal abonnement | Med | Low | Mesure en US-029 ; bénéfice nul mais aucun coût/risque si ignoré |
@@ -334,10 +334,10 @@ Activer le prompt cache du backend et fiabiliser la compaction pour les sessions
 
 Explicit boundaries — what this version does NOT include:
 
-- **Multi-provider** (Anthropic, Gemini, OpenAI au token, OpenRouter) — hors scope ; le scope est strictement Codex/GPT-5.5 tant que Numen n'est pas parfait dessus.
+- **Multi-provider** (Anthropic, Gemini, OpenAI au token, OpenRouter) — hors scope ; le scope est strictement Codex/GPT-5.5 tant que Pyxis n'est pas parfait dessus.
 - **Sous-agents / orchestration multi-agent** — déféré (Phase 2 roadmap) ; le pari est l'excellence single-agent sur Codex d'abord.
 - **WebSocket + `previous_response_id`** — explicitement abandonné (le Codex CLI officiel est SSE-only ; casserait compaction/resume).
-- **apply_patch format shell-heredoc** — Numen garde son `Edit` par ancre (rendu fuzzy) ; le format diff multi-op est une optimisation future, pas un prérequis.
+- **apply_patch format shell-heredoc** — Pyxis garde son `Edit` par ancre (rendu fuzzy) ; le format diff multi-op est une optimisation future, pas un prérequis.
 - **Compaction native `/responses/compact` + `CompactionTrigger`** — primitive backend avancée, déférée ; la compaction LLM ordinaire suffit au scope.
 - **Reasoning replay activé par défaut** — disponible (US-031) mais P2, derrière un flag, jamais le chemin par défaut.
 - **MCP tools branchés dans la boucle modèle** — hors scope de ce PRD.

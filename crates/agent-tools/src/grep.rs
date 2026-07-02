@@ -203,6 +203,9 @@ mod tests {
         assert!(line.len() > MAX_LINE_BYTES && !line.is_char_boundary(MAX_LINE_BYTES));
         let cut = truncate_line(&line, MAX_LINE_BYTES);
         assert!(cut.len() <= MAX_LINE_BYTES, "borné");
-        assert!(line.starts_with(cut), "préfixe valide, aucune coupe mid-codepoint");
+        assert!(
+            line.starts_with(cut),
+            "préfixe valide, aucune coupe mid-codepoint"
+        );
     }
 }

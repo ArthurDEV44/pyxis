@@ -307,7 +307,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 // Sonde d'observabilité (US-021 AC3 / US-029) : compare
                                 // l'usage backend réel à l'estimation locale. Env-gated,
                                 // défaut OFF → chemin et sortie inchangés en prod.
-                                if std::env::var_os("NUMEN_DEBUG_USAGE").is_some() {
+                                if std::env::var_os("PYXIS_DEBUG_USAGE").is_some() {
                                     let est_in = estimate_input(&messages, deps.tokenizer.as_ref())
                                         .saturating_add(context_tokens);
                                     eprintln!(
@@ -565,7 +565,7 @@ pub struct HeadlessResult {
 }
 
 /// Consomme la boucle en mode headless : agrège le texte, AUCUN Ratatui (AC3).
-/// C'est ce que `numen -p` câblera (agent-cli) ; ici, testable sans terminal.
+/// C'est ce que `pyxis -p` câblera (agent-cli) ; ici, testable sans terminal.
 pub async fn run_headless(ctx: AgentContext, deps: Deps) -> HeadlessResult {
     let stream = run_agent(ctx, deps);
     futures_util::pin_mut!(stream);

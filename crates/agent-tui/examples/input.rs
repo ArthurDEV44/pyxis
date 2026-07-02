@@ -5,9 +5,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use agent_core::AgentEvent;
-use agent_tui::{render, AppState, Block};
-use ratatui::backend::TestBackend;
+use agent_tui::{AppState, Block, render};
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 fn dump(state: &AppState, w: u16, h: u16, label: &str) {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -28,7 +28,7 @@ fn dump(state: &AppState, w: u16, h: u16, label: &str) {
 
 fn base() -> AppState {
     let mut s = AppState::new("gpt-5", true);
-    s.workspace = "numen".into();
+    s.workspace = "pyxis".into();
     s.provider_connected = true;
     s.skills = vec![
         "frontend-design".into(),
@@ -45,7 +45,7 @@ fn main() {
     // 1. Au repos, prompt vide (état de démarrage).
     let mut a = base();
     a.blocks.push(Block::Notice(
-        "Numen — tape ta demande, ⌃C pour quitter".into(),
+        "Pyxis — tape ta demande, ⌃C pour quitter".into(),
     ));
     a.context_pct = Some(15);
     dump(&a, w, 8, "repos · prompt vide");

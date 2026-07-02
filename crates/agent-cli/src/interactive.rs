@@ -55,7 +55,7 @@ pub struct InteractiveConfig {
     pub run_config: RunConfig,
     pub tool_specs: Vec<ToolSpec>,
     pub truecolor: bool,
-    /// Reduced-motion (`NO_COLOR` / `NUMEN_REDUCED_MOTION`) : spinner dégradé en
+    /// Reduced-motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`) : spinner dégradé en
     /// point pulsé plutôt qu'animé (US-044).
     pub reduced_motion: bool,
     /// Credential du fournisseur présente (badge connecté + sous-menu providers).
@@ -63,7 +63,7 @@ pub struct InteractiveConfig {
     /// Skills disponibles (lus avant le sandbox), sous-menu `/skills`.
     pub skills: Vec<String>,
     /// Objectif de session persistant (`/goal`), composé dans le system à chaque
-    /// tour. Chargé du sidecar `.numen/goal` au démarrage (survit au redémarrage).
+    /// tour. Chargé du sidecar `.pyxis/goal` au démarrage (survit au redémarrage).
     pub goal: Option<String>,
 }
 
@@ -223,7 +223,7 @@ async fn event_loop(
     state.skills = std::mem::take(&mut cfg.skills);
     state.sessions = load_sessions(&sessions_dir, &current_session);
     state.mcp_servers = mcp_metas(&mcp);
-    // Sidecar de l'objectif persistant (`<workspace>/.numen/goal`).
+    // Sidecar de l'objectif persistant (`<workspace>/.pyxis/goal`).
     let goal_path = sessions_dir.parent().map(|p| p.join("goal"));
     // Historique des prompts de TOUT le dossier (toutes les conversations).
     state.load_history(agent_session::workspace_prompts(
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn compose_system_pins_completion_directive() {
-        let base = "Tu es Numen.";
+        let base = "Tu es Pyxis.";
         assert_eq!(compose_system(base, None), base);
         assert_eq!(
             compose_system(base, Some("   ")),

@@ -85,8 +85,8 @@ streame → exécute un `Bash` → réinjecte → reboucle jusqu'à `end_turn`, 
   - `tool_timeout_does_not_freeze_loop` : un outil `sleep 5` sous timeout 200 ms est **signalé
     timeout, la boucle reprend la main et se ferme** (AC2, `kill_on_drop` tue l'orphelin).
   - `decide_transition_is_exhaustive_and_pure` : fonction pure, `match` exhaustif.
-- **Live devstral** : la boucle a fait émettre un `tool_use bash{cmd:"echo bonjour depuis numen"}`,
-  exécuté, réinjecté `bonjour depuis numen`, le modèle a conclu, **`EndTurn` propre en 2 tours**.
+- **Live devstral** : la boucle a fait émettre un `tool_use bash{cmd:"echo bonjour depuis pyxis"}`,
+  exécuté, réinjecté `bonjour depuis pyxis`, le modèle a conclu, **`EndTurn` propre en 2 tours**.
 
 **Verdict.** La state machine se ferme proprement, les transitions sont exhaustives (vérifié
 compilation). **Go.** Note : `Transition::Compact`/`Recover` (withholding, compaction) sont

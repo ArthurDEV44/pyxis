@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     };
 
     let user = std::env::args().nth(1).unwrap_or_else(|| {
-        "Utilise l'outil bash pour exécuter exactement `echo bonjour depuis numen`, \
+        "Utilise l'outil bash pour exécuter exactement `echo bonjour depuis pyxis`, \
          puis dis-moi la sortie."
             .to_string()
     });

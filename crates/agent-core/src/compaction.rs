@@ -39,9 +39,10 @@ const SUMMARY_COMBINED_MAX: usize = 32_000;
 /// Vrai si `msg` est un message-résumé (produit par une compaction précédente).
 pub fn is_summary_message(msg: &Message) -> bool {
     msg.role == Role::User
-        && msg.content.iter().any(
-            |b| matches!(b, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX)),
-        )
+        && msg
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX)))
 }
 
 const SUMMARY_SYSTEM: &str = "Tu résumes une conversation entre un utilisateur et un agent de codage. \
@@ -345,7 +346,10 @@ mod tests {
         let before = messages.clone();
         let res = full_compact(&mut messages, "m", &provider).await;
         assert!(res.is_err(), "résumé vide doit échouer");
-        assert_eq!(messages, before, "transcript ET images préservés en cas d'échec");
+        assert_eq!(
+            messages, before,
+            "transcript ET images préservés en cas d'échec"
+        );
     }
 
     // #5 : rien à résumer (1 seul message user) → Err, pas d'appel destructeur.
@@ -449,7 +453,9 @@ mod tests {
                     media_type: "image/png".into(),
                     data: "AAAA".into(),
                 },
-                ContentBlock::Text { text: "réponse".into() },
+                ContentBlock::Text {
+                    text: "réponse".into(),
+                },
             ]),
             Message::user("courant"),
         ];

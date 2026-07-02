@@ -59,10 +59,10 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     }
 }
 
-/// Logo de Numen : une **sphère de Dyson** minimaliste. Le numen est la
-/// présence/volonté qui canalise une puissance brute pour la rendre utile : ici
-/// un cœur stellaire net cerné de deux anneaux de collecteurs (avec brèches,
-/// l'essaim en assemblage). Rendu en **points braille tramés** (stippling, façon
+/// Logo de Pyxis : une **sphère de Dyson** minimaliste. La boussole donne le cap
+/// dans un espace immense ; ici, un cœur stellaire net cerné de deux anneaux de
+/// collecteurs (avec brèches, l'essaim en assemblage). Rendu en **points braille
+/// tramés** (stippling, façon
 /// pixel-dust), monochrome ; l'accent teal reste réservé à l'UI. Champ continu
 /// (résolution-indépendant), pas un bitmap figé.
 const LOGO_COLS: usize = 20;
@@ -193,7 +193,7 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     // Colonne de droite : identité, méta (modèle/workspace/provider), raccourcis.
     let mut info: Vec<Line> = vec![
         Line::from(Span::styled(
-            "NUMEN",
+            "PYXIS",
             theme.accent().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -1051,7 +1051,7 @@ fn input_spans(input: &str, skills: &[String], theme: &Theme) -> Vec<Span<'stati
         if part.is_empty() {
             continue;
         }
-        // Surbrillance : un `/skill` reconnu (n'importe où) OU une commande Numen
+        // Surbrillance : un `/skill` reconnu (n'importe où) OU une commande Pyxis
         // en 1er token (ex `/goal`, `/models`).
         let is_skill = part
             .strip_prefix('/')
@@ -1240,11 +1240,11 @@ mod tests {
     #[test]
     fn streamed_text_renders() {
         let mut s = AppState::new("gpt-5", true);
-        for tok in ["Bonjour ", "depuis ", "Numen"] {
+        for tok in ["Bonjour ", "depuis ", "Pyxis"] {
             s.apply(&AgentEvent::Text(tok.into()));
         }
         let out = draw(&s, 40, 12);
-        assert!(out.contains("Bonjour depuis Numen"), "{out}");
+        assert!(out.contains("Bonjour depuis Pyxis"), "{out}");
         assert!(out.contains("›"), "prompt de saisie absent");
     }
 
@@ -1252,11 +1252,11 @@ mod tests {
     #[test]
     fn welcome_card_shows_logo_and_brand() {
         let mut s = AppState::new("gpt-5.5", true);
-        s.workspace = "numen".into();
+        s.workspace = "pyxis".into();
         s.provider_connected = true;
         assert!(s.is_welcome(), "transcript vide → accueil");
         let out = draw(&s, 80, 24);
-        assert!(out.contains("NUMEN"), "marque absente:\n{out}");
+        assert!(out.contains("PYXIS"), "marque absente:\n{out}");
         // Le logo est en points braille (U+2801..=U+28FF, hors blanc U+2800).
         assert!(
             out.chars().any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
@@ -1274,17 +1274,17 @@ mod tests {
         assert!(!s.is_welcome());
         let out = draw(&s, 80, 24);
         assert!(out.contains("salut"));
-        assert!(!out.contains("NUMEN"), "accueil doit s'effacer:\n{out}");
+        assert!(!out.contains("PYXIS"), "accueil doit s'effacer:\n{out}");
     }
 
     // Terminal trop étroit pour la carte → repli compact, sans panic, marque visible.
     #[test]
     fn welcome_falls_back_compact_on_small_terminal() {
         let mut s = AppState::new("gpt-5.5", true);
-        s.workspace = "numen".into();
+        s.workspace = "pyxis".into();
         let out = draw(&s, 30, 8);
         assert!(
-            out.contains("NUMEN"),
+            out.contains("PYXIS"),
             "repli compact doit garder la marque:\n{out}"
         );
     }
@@ -1340,7 +1340,10 @@ mod tests {
             preview: crate::diff::Diff::default(),
         });
         let out = draw(&s, 50, 8);
-        assert!(!out.contains('\u{1b}'), "ESC résiduel dans le dialog:\n{out}");
+        assert!(
+            !out.contains('\u{1b}'),
+            "ESC résiduel dans le dialog:\n{out}"
+        );
         assert!(out.contains("evil.rs"), "titre assaini préservé:\n{out}");
         assert!(out.contains("autoriser"), "actions présentes:\n{out}");
     }

@@ -1,5 +1,5 @@
 [PRD]
-# PRD: Numen — CLI agent IA de codage multi-provider (MVP)
+# PRD: Pyxis — CLI agent IA de codage multi-provider (MVP)
 
 ## Changelog
 
@@ -14,11 +14,11 @@
 3. **Les CLI agents existants partagent des modes d'échec coûteux non maîtrisés** : boucles d'outils infinies (« le #1 fléau de l'agentique 2026 »), perte de contexte sur gros repos, coûts runaway (cas documenté : « refactor this » → facture API de 500 $ et 4000 commits), prompt injection indirecte via repos/MCP malveillants.
 4. **Les CLI Node/TS paient une taxe de démarrage et de mémoire** (500 ms–2 s de startup, 200 Mo+ idle, runtime à embarquer) là où un binaire Rust natif démarre en <100 ms pour <50 Mo.
 
-**Why now:** Le ban Anthropic du 4 avril 2026 transforme le model-agnosticism d'un confort en **moat structurel** : opencode a fait de « pas de lock-in » son argument central post-ban et a bondi de plusieurs dizaines de milliers de stars. La fenêtre narrative est ouverte maintenant. En parallèle, Numen partage son cœur Rust avec Paneflow (GPUI), ce qui rend ce projet uniquement faisable pour Arthur à cet instant précis.
+**Why now:** Le ban Anthropic du 4 avril 2026 transforme le model-agnosticism d'un confort en **moat structurel** : opencode a fait de « pas de lock-in » son argument central post-ban et a bondi de plusieurs dizaines de milliers de stars. La fenêtre narrative est ouverte maintenant. En parallèle, Pyxis partage son cœur Rust avec Paneflow (GPUI), ce qui rend ce projet uniquement faisable pour Arthur à cet instant précis.
 
 ## Overview
 
-Numen est une CLI agent IA de codage en terminal, écrite en **Rust natif**, **multi-provider first-class** (BYOK : Anthropic, OpenAI, Gemini, Ollama/local, puis cloud), inspirée de l'architecture interne de Claude Code mais agnostique au modèle. La commande est `numen` ; elle s'ouvre dans le shell (frontend Ratatui monochrome), **pas** dans une fenêtre.
+Pyxis est une CLI agent IA de codage en terminal, écrite en **Rust natif**, **multi-provider first-class** (BYOK : Anthropic, OpenAI, Gemini, Ollama/local, puis cloud), inspirée de l'architecture interne de Claude Code mais agnostique au modèle. La commande est `pyxis` ; elle s'ouvre dans le shell (frontend Ratatui monochrome), **pas** dans une fenêtre.
 
 Le parti pris fondateur est un **cœur headless** (`agent-core`) qui n'émet que des événements structurés, jamais d'ANSI. Le frontend terminal n'est qu'un client. Conséquence stratégique : Paneflow (Rust/GPUI) peut embarquer `agent-core` **in-process** — pas d'IPC, types partagés — et rendre les events en GPU, sans casser le mode terminal par défaut. C'est l'intégration profonde qu'aucun concurrent ne peut offrir.
 
@@ -29,7 +29,7 @@ Ce PRD couvre le **MVP** : une **Phase 0** de dé-risquage (5 spikes, dont le go
 | Goal | Month-1 Target | Month-6 Target |
 |------|---------------|----------------|
 | Providers frontier fonctionnels (BYOK) | 3 (Ollama, OpenAI, Anthropic) | 6+ (+ Gemini, OpenRouter, 1 cloud) |
-| Latence de démarrage (`numen` → prompt prêt) | <100 ms (P95) | <100 ms maintenu, publié avec artefact |
+| Latence de démarrage (`pyxis` → prompt prêt) | <100 ms (P95) | <100 ms maintenu, publié avec artefact |
 | Adoption — GitHub stars (proxy de distribution) | 2 000–5 000 | 15 000–30 000 |
 | Substance — sessions dogfood/jour (Arthur, dans Paneflow) | ≥1/jour | intégration Paneflow GPUI live |
 | Contributeurs externes (PR mergées) | ≥1 | ≥10 |
@@ -41,7 +41,7 @@ Ce PRD couvre le **MVP** : une **Phase 0** de dé-risquage (5 spikes, dont le go
 - **Behaviors:** Orchestre des agents (Claude Code, Codex) toute la journée dans Paneflow ; code en Rust ; déteste npm/Node, préfère Bun et les binaires natifs.
 - **Pain points:** Aucun agent CLI ne s'intègre nativement à Paneflow ; les agents TS sont lents à démarrer ; le ban Anthropic l'a touché directement (Max 20×).
 - **Current workaround:** Utilise plusieurs CLI tierces côte à côte comme surfaces Paneflow, sans intégration profonde.
-- **Success looks like:** `numen` démarre instantanément, tourne in-process dans Paneflow, parle à n'importe quel modèle, et il l'utilise tous les jours sur ses propres projets.
+- **Success looks like:** `pyxis` démarre instantanément, tourne in-process dans Paneflow, parle à n'importe quel modèle, et il l'utilise tous les jours sur ses propres projets.
 
 ### Développeur Rust/systèmes — early adopter OSS
 - **Role:** Dev backend/systèmes qui vit dans le terminal.
@@ -55,16 +55,16 @@ Ce PRD couvre le **MVP** : une **Phase 0** de dé-risquage (5 spikes, dont le go
 - **Behaviors:** Veut un agent « maison » de première classe dans son environnement.
 - **Pain points:** Les agents tiers sont des panes opaques, sans rendu enrichi.
 - **Current workaround:** Lance des CLI tierces comme n'importe quel programme terminal.
-- **Success looks like:** Numen rendu richement par Paneflow (à terme GPUI), pilotable, observable.
+- **Success looks like:** Pyxis rendu richement par Paneflow (à terme GPUI), pilotable, observable.
 
 ## Research Findings
 
 Key findings that informed this PRD:
 
 ### Competitive Context
-- **opencode (~172k stars, ~6.5M MAU, MIT)** : standard OSS de facto, repositionné explicitement model-agnostic post-ban. Numen diffère par : Rust natif (perf mesurable), intégration in-process Paneflow, garde-fous de coût/boucle de première classe.
-- **Codex CLI (~90k, Rust, Apache-2.0)** : meilleur Terminal-Bench (83,4 %), prouve la viabilité Rust. Numen diffère par : multi-provider BYOK ouvert (Codex est OpenAI-centré) et le couplage Paneflow.
-- **Claude Code (~131k, propriétaire, TS)** : référence UX, mais Anthropic-only et lock-in subscription. Numen reprend ses patterns internes en les ouvrant à tous les providers.
+- **opencode (~172k stars, ~6.5M MAU, MIT)** : standard OSS de facto, repositionné explicitement model-agnostic post-ban. Pyxis diffère par : Rust natif (perf mesurable), intégration in-process Paneflow, garde-fous de coût/boucle de première classe.
+- **Codex CLI (~90k, Rust, Apache-2.0)** : meilleur Terminal-Bench (83,4 %), prouve la viabilité Rust. Pyxis diffère par : multi-provider BYOK ouvert (Codex est OpenAI-centré) et le couplage Paneflow.
+- **Claude Code (~131k, propriétaire, TS)** : référence UX, mais Anthropic-only et lock-in subscription. Pyxis reprend ses patterns internes en les ouvrant à tous les providers.
 - **Market gap:** un agent CLI **Rust + BYOK multi-provider + garde-fous de coût/boucle de première classe + intégration terminal-natif profonde**, qu'aucun acteur ne combine en juin 2026.
 
 ### Best Practices Applied
@@ -85,7 +85,7 @@ Key findings that informed this PRD:
 - **Arthur peut tenir la vélocité Rust en solo sur le scope MVP** — hypothèse de risque (voir Risks).
 
 ### Hard Constraints
-- **Full Rust**, workspace Cargo. Binaire publié = `numen` (crate interne `agent-cli`).
+- **Full Rust**, workspace Cargo. Binaire publié = `pyxis` (crate interne `agent-cli`).
 - **Pas de runtime Node/Bun embarqué** ; single static binary.
 - **Cœur `agent-core` sans dépendance TUI ni HTTP** (testable headless, embarquable in-process par Paneflow).
 - **Linux-first** pour le MVP (sandbox Landlock).
@@ -189,7 +189,7 @@ La boucle headless complète, le budget de contexte, la compaction et la persist
 **Acceptance Criteria:**
 - [ ] Given une conversation multi-tours, when elle progresse, then chaque transition (NextTurn, MaxTokensRecovery, etc.) est gérée exhaustivement (match compilé).
 - [ ] Given un message utilisateur, when il est soumis, then il est persisté (`sync_data`) AVANT l'appel API.
-- [ ] Given `numen -p "..."`, when invoqué, then l'agent répond sur stdout sans charger Ratatui.
+- [ ] Given `pyxis -p "..."`, when invoqué, then l'agent répond sur stdout sans charger Ratatui.
 - [ ] Given une erreur PromptTooLong, when elle survient, then le withholding retient l'erreur jusqu'à échec confirmé du recovery, sans terminer prématurément (unhappy path).
 
 #### US-007: ContextBudget + comptage de tokens local
@@ -226,7 +226,7 @@ La boucle headless complète, le budget de contexte, la compaction et la persist
 
 **Acceptance Criteria:**
 - [ ] Given une session active, when des entries sont écrites, then elles sont append-atomiques et discriminées (Message | CompactBoundary | FileHistorySnapshot).
-- [ ] Given `numen --resume` dans un dossier, when invoqué, then la dernière session est reconstruite depuis le log.
+- [ ] Given `pyxis --resume` dans un dossier, when invoqué, then la dernière session est reconstruite depuis le log.
 - [ ] Given un log tronqué par un crash en plein écrit, when le resume tourne, then la dernière entry partielle est ignorée et la session démarre depuis le dernier état valide (unhappy path).
 
 ---
@@ -303,7 +303,7 @@ Le trait Tool, le dispatch concurrent/série, les outils de base, le modèle de 
 
 Le trait Provider, le format canonique, les adapters non-bloqués (Ollama, OpenAI Chat, Anthropic de référence), le retry, et l'auth BYOK.
 
-**Definition of Done:** Numen parle à au moins Ollama et OpenAI via une interface unique, avec credentials stockées dans le keyring, retry robuste, et bascule de provider à la volée.
+**Definition of Done:** Pyxis parle à au moins Ollama et OpenAI via une interface unique, avec credentials stockées dans le keyring, retry robuste, et bascule de provider à la volée.
 
 #### US-015: Trait Provider + format canonique + retry
 **Description:** As a développeur, I want un trait Provider avec format canonique Anthropic-like et taxonomie d'erreurs/retry, so that tout provider se branche derrière une interface unique.
@@ -359,7 +359,7 @@ Le trait Provider, le format canonique, les adapters non-bloqués (Ollama, OpenA
 
 Le frontend Ratatui monochrome (client du cœur headless) et le sandbox d'exécution Landlock FS + proxy réseau.
 
-**Definition of Done:** `numen` offre une session interactive monochrome fluide (streaming, diff, dialogs de permission) ; toute écriture FS est confinée au workspace et le réseau est filtré par allow-list.
+**Definition of Done:** `pyxis` offre une session interactive monochrome fluide (streaming, diff, dialogs de permission) ; toute écriture FS est confinée au workspace et le réseau est filtré par allow-list.
 
 #### US-019: Frontend TUI Ratatui monochrome
 **Description:** As a utilisateur, I want une UI terminal épurée et moderne (streaming, diff, dialogs de permission), so that l'expérience rivalise avec Claude Code sans être un TUI à l'ancienne.
@@ -404,7 +404,7 @@ Le frontend Ratatui monochrome (client du cœur headless) et le sandbox d'exécu
 
 IMPORTANT: chiffres mesurables uniquement.
 
-- **Performance:** Démarrage `numen` → prompt prêt en <100 ms (P95) ; <200 ms acceptable. Premier token affiché <50 ms après réception réseau (streaming sans buffering). Empreinte mémoire idle <50 Mo RSS ; sous charge raisonnable <150 Mo.
+- **Performance:** Démarrage `pyxis` → prompt prêt en <100 ms (P95) ; <200 ms acceptable. Premier token affiché <50 ms après réception réseau (streaming sans buffering). Empreinte mémoire idle <50 Mo RSS ; sous charge raisonnable <150 Mo.
 - **Distribution:** Single static binary <30 Mo, installable sans runtime externe (`curl | sh` / `cargo binstall`).
 - **Security:** Permissions fail-closed par défaut. Sorties d'outils/MCP traitées comme untrusted (OWASP LLM01). Écritures FS confinées au workspace au niveau kernel (Landlock). Réseau filtré par allow-list. Credentials jamais persistées en clair (keyring uniquement).
 - **Reliability:** Retry automatique 3× sur erreurs transitoires (backoff exponentiel + jitter, plafond 32 s) ; backoff agressif distinct sur 529. Resume de session fonctionnel après kill -9 (transcript-before-response). Loop guardrail : arrêt après ≤3 répétitions identiques d'outil.

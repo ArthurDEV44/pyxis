@@ -3,10 +3,10 @@
 //! `TestBackend`, sans terminal réel — pour eyeball avant le live.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent_tui::{render, AppState};
+use agent_tui::{AppState, render};
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
-use ratatui::Terminal;
 
 fn dump(state: &AppState, w: u16, h: u16, label: &str) {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -62,7 +62,7 @@ fn dump_ansi(state: &AppState, w: u16, h: u16, label: &str) {
 
 fn main() {
     let mut s = AppState::new("gpt-5.5", true);
-    s.workspace = "numen".into();
+    s.workspace = "pyxis".into();
     s.provider_connected = true;
     s.context_pct = Some(0);
 

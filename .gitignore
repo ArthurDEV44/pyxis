@@ -3,7 +3,7 @@
 /spikes/target
 
 # Local agent runtime state (sessions, scratch) — never shared
-/.numen
+/.pyxis
 
 # Claude Code local tooling (machine-specific, paneflow-managed)
 /.claude/settings.local.json

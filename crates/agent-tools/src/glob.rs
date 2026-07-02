@@ -89,7 +89,7 @@ impl Tool for Glob {
                     .strip_prefix(&workspace)
                     .unwrap_or(entry.path());
                 if matcher.is_match(rel) {
-                    out.push(rel.to_string_lossy().into_owned());
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
                     if out.len() >= MAX_MATCHES {
                         break;
                     }

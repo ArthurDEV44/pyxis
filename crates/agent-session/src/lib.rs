@@ -322,7 +322,8 @@ pub fn workspace_prompts(dir: &Path, exclude: Option<&Path>, cap: usize) -> Vec<
         for m in &resumed.messages {
             if m.role == Role::User {
                 let text = m.text();
-                if !text.trim().is_empty() && out.last().map(String::as_str) != Some(text.as_str()) {
+                if !text.trim().is_empty() && out.last().map(String::as_str) != Some(text.as_str())
+                {
                     out.push(text);
                 }
             }
@@ -341,7 +342,7 @@ mod tests {
 
     /// Dossier temporaire isolé par test (pas de dépendance `rand`/`tempfile`).
     fn tmp(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("numen_sess_{}_{}", tag, std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pyxis_sess_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -490,7 +491,10 @@ mod tests {
 
         let prompts = workspace_prompts(&dir, Some(&dir.join("cur.jsonl")), 100);
         let pos = |x: &str| prompts.iter().position(|p| p == x);
-        assert!(pos("a1").unwrap() < pos("a2").unwrap(), "ordre intra-session");
+        assert!(
+            pos("a1").unwrap() < pos("a2").unwrap(),
+            "ordre intra-session"
+        );
         assert_eq!(prompts.iter().filter(|p| *p == "a2").count(), 1, "dédup");
         assert!(pos("b1").is_some(), "agrégé depuis une autre session");
         assert!(pos("courant").is_none(), "session courante exclue");

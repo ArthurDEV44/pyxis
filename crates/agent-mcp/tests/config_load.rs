@@ -9,7 +9,7 @@ use agent_mcp::McpConfigFile;
 /// Dossier temporaire unique pour un test (sans dépendance externe). Nettoyé en
 /// début ET fin de test.
 fn temp_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("numen-mcp-{}-{tag}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pyxis-mcp-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

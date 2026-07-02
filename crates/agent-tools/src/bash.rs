@@ -68,10 +68,22 @@ impl Tool for Bash {
     }
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut cmd = tokio::process::Command::new("powershell.exe");
+            cmd.arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(&input.command);
+            cmd
+        };
+        #[cfg(not(windows))]
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(&input.command)
-            .current_dir(&ctx.workspace)
+
+        #[cfg(not(windows))]
+        cmd.arg("-c").arg(&input.command);
+
+        cmd.current_dir(&ctx.workspace)
             .kill_on_drop(true)
             .stdin(std::process::Stdio::null());
 
@@ -134,7 +146,10 @@ fn truncate_tail(body: &str, max: usize) -> String {
     while cut < body.len() && !body.is_char_boundary(cut) {
         cut += 1;
     }
-    format!("[... sortie tronquée, {cut} octets, début omis]\n{}", &body[cut..])
+    format!(
+        "[... sortie tronquée, {cut} octets, début omis]\n{}",
+        &body[cut..]
+    )
 }
 
 #[cfg(test)]

@@ -40,7 +40,7 @@ fn run_landlock_entry() -> anyhow::Result<()> {
     // US-005 AC3 : dégradation explicite hors Linux.
     eprintln!(
         "[sandbox] Landlock indisponible hors Linux — sandbox FS DÉSACTIVÉ (avertissement). \
-         Numen est Linux-first ; macOS Seatbelt / Windows en Phase 3."
+         Pyxis est Linux-first ; macOS Seatbelt / Windows en Phase 3."
     );
     Ok(())
 }
@@ -78,7 +78,7 @@ mod sandbox_fs {
     }
 
     pub fn run() -> Result<()> {
-        let workdir: PathBuf = std::env::temp_dir().join("numen_spike_sandbox");
+        let workdir: PathBuf = std::env::temp_dir().join("pyxis_spike_sandbox");
         std::fs::create_dir_all(&workdir)?;
 
         let status = enforce(&workdir)?;
@@ -98,7 +98,7 @@ mod sandbox_fs {
         );
 
         // 2) Écriture HORS workspace → doit être refusée au kernel (EACCES).
-        let outside = Path::new("/tmp").join("numen_spike_OUTSIDE.txt");
+        let outside = Path::new("/tmp").join("pyxis_spike_OUTSIDE.txt");
         match std::fs::File::create(&outside).and_then(|mut f| f.write_all(b"escape")) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 println!(

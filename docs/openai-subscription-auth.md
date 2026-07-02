@@ -1,8 +1,8 @@
-# Auth abonnement ChatGPT — extraction Pi → implémentation Numen
+# Auth abonnement ChatGPT — extraction Pi → implémentation Pyxis
 
 > **Statut : référence d'implémentation + input de décision (pas une des 4 sources de vérité).** Ne contredit pas `ARCHITECTURE/PROVIDERS/DECISIONS/ROADMAP` ; il les complète sur un point que la préférence d'Arthur (« utiliser mon abonnement OpenAI plutôt que l'API ») impose.
 >
-> Source extraite : repo `pi` (TypeScript, `/home/arthur/dev/pi`), packages `ai` + `coding-agent`. **Constantes vérifiées adversarialement : 45/45 claims confirmés contre le code réel** (3 corrections de précision intégrées ci-dessous, marquées ⚠️). Toutes les valeurs sont littérales (recopiables verbatim en Rust). Croisé avec `docs/PROVIDERS.md` et `tasks/prd-numen.md` (US-015/016/017/018, EP-004).
+> Source extraite : repo `pi` (TypeScript, `/home/arthur/dev/pi`), packages `ai` + `coding-agent`. **Constantes vérifiées adversarialement : 45/45 claims confirmés contre le code réel** (3 corrections de précision intégrées ci-dessous, marquées ⚠️). Toutes les valeurs sont littérales (recopiables verbatim en Rust). Croisé avec `docs/PROVIDERS.md` et `tasks/prd-pyxis.md` (US-015/016/017/018, EP-004).
 >
 > **Décision induite à acter en ADR-10** : l'auth abonnement ChatGPT force la **Responses API sur le backend ChatGPT** (pas Chat Completions) → un `ProviderKind::OpenAiChatGpt` distinct, gated, SSE stateless. Voir §2.
 
@@ -48,7 +48,7 @@ Pi se fait passer pour le **Codex CLI officiel d'OpenAI** : il réutilise verbat
    state=<32_hex>
    id_token_add_organizations=true      # ← non-standard, à inclure verbatim
    codex_cli_simplified_flow=true       # ← non-standard, à inclure verbatim
-   originator=pi                        # ← Numen mettra "numen" (cf. §1.c + §4)
+   originator=pi                        # ← Pyxis mettra "pyxis" (cf. §1.c + §4)
    ```
 3. Serveur HTTP local sur `127.0.0.1:1455` (`:324,:374`). OpenAI redirige vers `…/auth/callback?code=…&state=…`. Le serveur valide `path==/auth/callback`, le `state`, extrait `code` (`:341-364`).
 4. Fallback si callback manqué : paste manuel d'URL/code (`onManualCodeInput`) ou `onPrompt` (`:478-544`).
@@ -81,7 +81,7 @@ La réponse token est `{access_token, refresh_token, expires_in}` (`:138-151`). 
 
 ### 1.c — Usage du token pour appeler le modèle
 
-**C'est ici que ça devient critique pour Numen.** L'inférence ne tape **pas** `api.openai.com/v1/chat/completions`, ni même `api.openai.com/v1/responses`. Elle tape le **backend ChatGPT** via la **Responses API** (`openai-codex-responses.ts`) :
+**C'est ici que ça devient critique pour Pyxis.** L'inférence ne tape **pas** `api.openai.com/v1/chat/completions`, ni même `api.openai.com/v1/responses`. Elle tape le **backend ChatGPT** via la **Responses API** (`openai-codex-responses.ts`) :
 
 | Constante | Valeur (`openai-codex-responses.ts`) |
 |---|---|
@@ -110,7 +110,7 @@ x-client-request-id: <sessionId>  (si présent)
 + model.headers / options.headers
 ```
 
-⚠️ **Correction load-bearing** : `originator` est **hardcodé** à `"pi"` côté provider (`:1448`), ce n'est PAS un knob runtime. L'adapter Numen hardcodera sa propre valeur (`"numen"`). **Risque ouvert** : le backend ChatGPT *peut* valider l'`originator` contre une liste connue (Codex utilise `codex_cli_rs`) — si un `originator` inconnu est rejeté, il faudra soit demander l'inscription, soit (zone grise totale) emprunter une valeur connue. À tester en live.
+⚠️ **Correction load-bearing** : `originator` est **hardcodé** à `"pi"` côté provider (`:1448`), ce n'est PAS un knob runtime. L'adapter Pyxis hardcodera sa propre valeur (`"pyxis"`). **Risque ouvert** : le backend ChatGPT *peut* valider l'`originator` contre une liste connue (Codex utilise `codex_cli_rs`) — si un `originator` inconnu est rejeté, il faudra soit demander l'inscription, soit (zone grise totale) emprunter une valeur connue. À tester en live.
 
 Body (forme) :
 ```json
@@ -158,7 +158,7 @@ Retourne un **nouveau** `{access_token, refresh_token, expires_in}` → **refres
 - Le body exige `store:false`, `input[]` (format Responses), `instructions` (pas `role:system`), `include:["reasoning.encrypted_content"]`.
 - Headers propriétaires obligatoires (`chatgpt-account-id`, `originator`) absents de toute API publique OpenAI.
 
-**Implication pour le canonique Numen.** Le canonique est **Anthropic-like, transcript client-side reconstruit à chaque tour** (`PROVIDERS.md §1.1`), indispensable à la compaction / resume JSONL / replay (`US-009`). Or :
+**Implication pour le canonique Pyxis.** Le canonique est **Anthropic-like, transcript client-side reconstruit à chaque tour** (`PROVIDERS.md §1.1`), indispensable à la compaction / resume JSONL / replay (`US-009`). Or :
 - En **SSE**, le backend Codex est **stateless** (pas de `previous_response_id`) → contexte complet dans `input[]` à chaque tour → **mappe proprement** sur le transcript client-side. Bonne nouvelle.
 - En **WebSocket** avec réutilisation de connexion, bascule sur `previous_response_id` (state server-side connection-scoped) = exactement le piège **`PROVIDERS.md §4.1`** (« OpenAI Responses API ne mappe pas sur le canonique »).
 
@@ -175,7 +175,7 @@ Introduire `ProviderKind::OpenAiChatGpt` (subscription), **et non** réutiliser 
 
 ---
 
-## 3. Design pour Numen : `agent-auth` + `agent-provider`
+## 3. Design pour Pyxis : `agent-auth` + `agent-provider`
 
 ### 3.a — Type de credential (enum)
 
@@ -228,7 +228,7 @@ async fn login_browser() -> Result<OAuthCredential> {
     let server = spawn_callback_server(CALLBACK_PORT, state.clone(), tx);
 
     let url = build_authorize_url(&pkce.challenge, &state); // + id_token_add_organizations=true,
-                                                            //   codex_cli_simplified_flow=true, originator=numen
+                                                            //   codex_cli_simplified_flow=true, originator=pyxis
     open::that(&url)?;  // crate `open`
 
     // Race : callback server vs paste manuel (réplique login-dialog)
@@ -273,10 +273,10 @@ fn extract_account_id(access_token: &str) -> Result<String> {
 
 ### 3.c — Stockage keyring (US-018)
 
-Pi stocke en **JSON clair 0o600**. **Numen DOIT faire mieux** : `US-018` impose le secret store OS (keyring), jamais en clair (`prd-numen.md:352`, NFR Security `:409`).
+Pi stocke en **JSON clair 0o600**. **Pyxis DOIT faire mieux** : `US-018` impose le secret store OS (keyring), jamais en clair (`prd-pyxis.md:352`, NFR Security `:409`).
 
 ```rust
-let entry = keyring::Entry::new("numen", &format!("oauth:{provider}"))?;
+let entry = keyring::Entry::new("pyxis", &format!("oauth:{provider}"))?;
 entry.set_password(&serde_json::to_string(&oauth_cred)?)?;  // blob JSON dans le keyring, PAS sur disque
 ```
 Le keyring stocke le **blob entier** (access+refresh+expires+account_id). Indisponibilité → erreur explicite + fallback documenté (`:354`). **Ne pas** répliquer l'`auth.json` clair de Pi.
@@ -302,7 +302,7 @@ Refresh tokens **rotatifs** : réécrire le refresh à chaque cycle. Mappe sur `
 | Base URL | `https://api.openai.com/v1` | `https://chatgpt.com/backend-api/codex` |
 | Endpoint | `/chat/completions` | `/responses` (SSE) |
 | Auth header | `Authorization: Bearer <key>` | `Authorization: Bearer <access_token>` |
-| Headers spéciaux | — | `chatgpt-account-id: <account_id>`, `originator: numen`, `OpenAI-Beta: responses=experimental` |
+| Headers spéciaux | — | `chatgpt-account-id: <account_id>`, `originator: pyxis`, `OpenAI-Beta: responses=experimental` |
 | Wire format | `messages[]`, `store` libre | `input[]`, `instructions`, `store:false` forcé, `include:["reasoning.encrypted_content"]` |
 | Mapping canonique | propre (client-side) | propre **en SSE stateless** ; éviter WS/`previous_response_id` |
 
@@ -336,9 +336,9 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 
 **Sur `oauth2` (la crate)** : **s'en passer.** Le flow est trivial (PKCE + un POST form), Pi lui-même n'utilise aucune lib OAuth (`fetch` nus). `oauth2` colle mal aux particularités (claim custom, `code_verifier` venu du serveur en device flow, `redirect_uri` divergente browser/device, params non-standard). ~150 lignes à la main = plus simple.
 
-**Mapping Pi → Numen** :
+**Mapping Pi → Pyxis** :
 
-| Pi | Numen |
+| Pi | Pyxis |
 |---|---|
 | `oauth/openai-codex.ts` | `agent-auth/src/oauth/openai_chatgpt.rs` |
 | `oauth/pkce.ts` | `agent-auth/src/oauth/pkce.rs` |
@@ -353,7 +353,7 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 
 **ToS-grey (réutilisation du `client_id` Codex).** `app_EMoamEEZ73f0CkXaXp7hrann` est le client OAuth du **Codex CLI officiel**. « Sign in with ChatGPT » est gaté à Codex + IDE partenaires, **aucun programme tiers ouvert** (issue `openai/codex#10974` fermée « not planned »). Réutiliser le client = techniquement possible (client OSS), **zone grise ToS, usage perso, révocable unilatéralement**.
 
-**Précédent Anthropic = preuve que le risque est réel.** Anthropic a coupé les abonnements Pro/Max aux outils tiers (janv→4 avril 2026, `prd-numen.md:13`). OpenAI peut faire **pareil** sur le `client_id` Codex du jour au lendemain. C'est le RISQUE N°1 PRODUIT (`PROVIDERS.md §6`) — toute la thèse de Numen est d'être **model-agnostic pour ne pas en dépendre**.
+**Précédent Anthropic = preuve que le risque est réel.** Anthropic a coupé les abonnements Pro/Max aux outils tiers (janv→4 avril 2026, `prd-pyxis.md:13`). OpenAI peut faire **pareil** sur le `client_id` Codex du jour au lendemain. C'est le RISQUE N°1 PRODUIT (`PROVIDERS.md §6`) — toute la thèse de Pyxis est d'être **model-agnostic pour ne pas en dépendre**.
 
 **Refresh / expiry.** Tokens rotatifs sliding : robuste tant que le `client_id` vit. Révocation du client → tous les refresh échouent en bloc → bascule forcée. Prévoir un équivalent `Auth(ThirdPartyBlocked)` côté OpenAI (à sonder en live, comme le leg Anthropic de US-001).
 
@@ -365,7 +365,7 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 
 1. **Arthur a rejeté Ollama comme défaut perso et veut son abonnement OpenAI.** Le verdict spike acte Ollama comme premier dogfood « officiel » (gratuit/local), mais l'abonnement ChatGPT couvre le confort quotidien réel qu'Arthur veut.
 2. **Le MVP ne doit pas en dépendre** (`FR-11`, verdict US-001). P0 = OpenAI Chat **au token** (US-017) + le provider non-bloqué. L'abonnement ChatGPT = **US séparée gated**, hors chemin critique.
-3. **Forme concrète** : `ProviderKind::OpenAiChatGpt`, derrière un flag/credential labellisé `# fragile: réutilise le client Codex, révocable par OpenAI`, en **SSE stateless uniquement** (mappe le canonique, évite le piège WS/`previous_response_id`). `originator=numen`.
+3. **Forme concrète** : `ProviderKind::OpenAiChatGpt`, derrière un flag/credential labellisé `# fragile: réutilise le client Codex, révocable par OpenAI`, en **SSE stateless uniquement** (mappe le canonique, évite le piège WS/`previous_response_id`). `originator=pyxis`.
 4. **Coût d'opportunité** : ~150-250 lignes (`openai_chatgpt.rs` + `pkce.rs`), réutilise l'infra `agent-auth`/keyring déjà nécessaire pour Anthropic OAuth. ROI dogfood élevé, blast radius nul (gated). Pire scénario (OpenAI révoque) déjà couvert par l'archi multi-provider.
 
 **À ne pas faire** : en faire le défaut, le mettre en AC P0, ou shipper WebSocket+`previous_response_id` (casserait compaction/resume). **À faire** : credential opt-in, SSE stateless, étiquette fragile, fallback (OpenAI-token) toujours présent.
@@ -375,6 +375,6 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 ## Données manquantes (non inventées)
 - La forme exacte du mapping `tools[]`/`input[]` canonique → Responses API n'est **pas** dans l'extraction (seul le squelette du body l'est). À dériver de la doc Responses API à l'implémentation.
 - Le wording exact d'un éventuel message de blocage côté OpenAI (équivalent du « only authorized for use with Claude Code ») est **inconnu** : Pi ne le capture pas. À sonder en live.
-- La validation `originator` côté backend ChatGPT (rejette-t-il un originator inconnu ?) est **non vérifiée** — à tester avec `"numen"` au premier run.
+- La validation `originator` côté backend ChatGPT (rejette-t-il un originator inconnu ?) est **non vérifiée** — à tester avec `"pyxis"` au premier run.
 
 > **ADR-10 à écrire** (input pour `docs/DECISIONS.md`) : « Auth abonnement ChatGPT via `ProviderKind::OpenAiChatGpt` (Responses API sur backend ChatGPT, SSE stateless, gated, fragile) — distinct de `OpenAiChat` (Chat Completions BYOK, P0) ». Acte aussi la clarification de scope US-017 (ne couvre pas l'abonnement).

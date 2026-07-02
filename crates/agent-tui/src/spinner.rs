@@ -6,7 +6,7 @@
 //! choisir glyphe/style/verbe pour un tick donné et formater durée/tokens — donc
 //! `render` reste testable via `TestBackend`.
 //!
-//! Dégradation reduced-motion (`NO_COLOR` / `NUMEN_REDUCED_MOTION`) : le spinner
+//! Dégradation reduced-motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`) : le spinner
 //! animé devient un point `●` pulsé lentement (pas d'animation rapide).
 
 use std::time::Duration;
@@ -15,11 +15,11 @@ use ratatui::style::Style;
 
 use crate::theme::Theme;
 
-/// Frames du spinner (rotation braille, cohérente avec l'identité braille de Numen),
+/// Frames du spinner (rotation braille, cohérente avec l'identité braille de Pyxis),
 /// jouées en **ping-pong** (aller-retour) plutôt qu'en boucle dure.
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Verbes d'activité, rotation lente (~2 s). Champ lexical Numen : canaliser une
+/// Verbes d'activité, rotation lente (~2 s). Champ lexical Pyxis : canaliser une
 /// puissance brute pour la façonner en résultat utile.
 const VERBS: [&str; 6] = [
     "réfléchit",

@@ -113,14 +113,14 @@ mod tests {
         let mut state = AppState::new(false);
 
         // Simule l'arrivée token-par-token, en redessinant à chaque token.
-        for tok in tokenize("Bonjour depuis Numen en streaming") {
+        for tok in tokenize("Bonjour depuis Pyxis en streaming") {
             state.apply(&AgentEvent::Text(tok));
             terminal.draw(|f| ui(f, &state)).unwrap();
         }
 
         let text = dump(terminal.backend().buffer(), w, h);
         assert!(
-            text.contains("Bonjour depuis Numen"),
+            text.contains("Bonjour depuis Pyxis"),
             "transcript absent:\n{text}"
         );
         assert!(text.contains("›"), "marqueur de prompt absent");

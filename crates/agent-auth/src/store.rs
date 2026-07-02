@@ -5,7 +5,7 @@
 
 use crate::Credential;
 
-const SERVICE: &str = "numen";
+const SERVICE: &str = "pyxis";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

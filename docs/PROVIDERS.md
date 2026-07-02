@@ -1,6 +1,6 @@
 # Couche multi-provider
 
-> La couche multi-provider est le cœur de Numen. C'est elle qui justifie le projet : « qualité Claude Code, **tous** les modèles frontier ». Là où Claude Code est Anthropic-only, Numen est multi-provider first-class. Ce document est la source de vérité de cette couche.
+> La couche multi-provider est le cœur de Pyxis. C'est elle qui justifie le projet : « qualité Claude Code, **tous** les modèles frontier ». Là où Claude Code est Anthropic-only, Pyxis est multi-provider first-class. Ce document est la source de vérité de cette couche.
 
 **Docs liées.** Décisions : [`docs/DECISIONS.md`](./DECISIONS.md) (ADR-4 = couche provider, ADR-7 = roadmap/risque). Architecture transverse : [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md). Plan d'exécution : [`docs/ROADMAP.md`](./ROADMAP.md). Ce document est la version détaillée d'ADR-4 ; toute divergence de signature entre ADR-4 et ce fichier se résout en faveur de ce fichier (taxonomie d'erreurs notamment, cf. §5.1).
 
@@ -8,12 +8,12 @@
 
 ## 0. Note de nommage (crates)
 
-Le brief réserve les crates publiables `numen`, `numen-cli`, `numen-core` (confirmés libres sur crates.io — atout décisif cargo). Le **workspace interne** est nommé en `agent-*` (`agent-core`, `agent-provider`, `agent-tui`, …) pour décrire la fonction de chaque crate sans préfixe de marque. Convention retenue, à acter dans ADR-1/ADR-5 :
+Le brief réserve les crates publiables `pyxis`, `pyxis-cli`, `pyxis-core` (confirmés libres sur crates.io — atout décisif cargo). Le **workspace interne** est nommé en `agent-*` (`agent-core`, `agent-provider`, `agent-tui`, …) pour décrire la fonction de chaque crate sans préfixe de marque. Convention retenue, à acter dans ADR-1/ADR-5 :
 
-- Crate racine publiée + binaire installé = **`numen`** (réexporte le wiring d'`agent-cli`).
+- Crate racine publiée + binaire installé = **`pyxis`** (réexporte le wiring d'`agent-cli`).
 - Crates internes du workspace = **`agent-*`** (non destinées à une publication standalone à ce stade).
 
-Ce document emploie les noms internes `agent-*`. La réservation `numen*` couvre la façade publique et le binaire.
+Ce document emploie les noms internes `agent-*`. La réservation `pyxis*` couvre la façade publique et le binaire.
 
 ---
 
@@ -21,7 +21,7 @@ Ce document emploie les noms internes `agent-*`. La réservation `numen*` couvre
 
 ### 1.1 La décision
 
-Numen implémente sa **propre couche provider**, en Rust natif, sur `reqwest` + `eventsource-stream`. Pas d'abstraction tierce au centre. Le format interne canonique est **Anthropic-like** (content blocks : `text`, `tool_use`, `tool_result`, `thinking`, `image` — soit `ContentBlock::Text/ToolUse/ToolResult/Thinking/Image`). Chaque provider possède un **adapter** qui traduit son wire format vers/depuis ce canonique. Toutes les divergences sont **localisées dans l'adapter** — le reste du système (`agent-core`, `agent-tools`, `agent-session`) ne connaît que le canonique.
+Pyxis implémente sa **propre couche provider**, en Rust natif, sur `reqwest` + `eventsource-stream`. Pas d'abstraction tierce au centre. Le format interne canonique est **Anthropic-like** (content blocks : `text`, `tool_use`, `tool_result`, `thinking`, `image` — soit `ContentBlock::Text/ToolUse/ToolResult/Thinking/Image`). Chaque provider possède un **adapter** qui traduit son wire format vers/depuis ce canonique. Toutes les divergences sont **localisées dans l'adapter** — le reste du système (`agent-core`, `agent-tools`, `agent-session`) ne connaît que le canonique.
 
 ```
 agent-core  ──(canonique)──►  agent-provider  ──(adapter)──►  wire format provider
@@ -289,7 +289,7 @@ system  →  tools  →  CLAUDE.md  →  historique  →  [volatile]
 
 - Les blocs cacheables sont **en tête**, dans un ordre **déterministe**.
 - **Jamais** de contenu volatile (timestamp, état git, sortie d'outil fraîche) **avant** un bloc caché — il invaliderait tout le préfixe.
-- Anthropic : `cache_control: ephemeral` posé sur les frontières (fin de `system`, fin de `tools`, fin de `CLAUDE.md`), **TTL 1h** (la valeur 1h est une beta Anthropic ; le défaut ephemeral est 5 min — Numen pose explicitement le TTL 1h).
+- Anthropic : `cache_control: ephemeral` posé sur les frontières (fin de `system`, fin de `tools`, fin de `CLAUDE.md`), **TTL 1h** (la valeur 1h est une beta Anthropic ; le défaut ephemeral est 5 min — Pyxis pose explicitement le TTL 1h).
 - Les autres providers profitent du même ordre stable via leur caching de préfixe implicite.
 
 ### 5.4 Multimodal
@@ -306,17 +306,17 @@ Les en-têtes `anthropic-beta` (et autres features propriétaires) ne sont émis
 
 ### 6.1 Le risque (RISQUE N°1 PRODUIT)
 
-Déployé en **janvier 2026**, **durci en avril 2026** : Anthropic bloque les outils tiers qui s'authentifient via un **abonnement Pro/Max**. Un agent tiers (= Numen) ne peut **plus** utiliser un abonnement Max d'un utilisateur pour appeler Claude. C'est une menace existentielle si le produit en dépend.
+Déployé en **janvier 2026**, **durci en avril 2026** : Anthropic bloque les outils tiers qui s'authentifient via un **abonnement Pro/Max**. Un agent tiers (= Pyxis) ne peut **plus** utiliser un abonnement Max d'un utilisateur pour appeler Claude. C'est une menace existentielle si le produit en dépend.
 
 ### 6.2 La mitigation : model-agnostic by design
 
 C'est précisément **pourquoi la couche multi-provider est le cœur du projet**. Le positionnement est **model-agnostic** :
 
 - **Provider MVP non-bloqué** : **Ollama local** (aucune auth, aucun blocage possible) + **OpenAI Chat Completions au token** (API key, hors abonnement). Anthropic est **conditionnel**, jamais requis.
-- Si Anthropic bloque, Numen **fonctionne quand même** — il bascule sur les autres providers. La valeur du produit ne repose sur aucun provider unique.
+- Si Anthropic bloque, Pyxis **fonctionne quand même** — il bascule sur les autres providers. La valeur du produit ne repose sur aucun provider unique.
 
 ### 6.3 Le go/no-go : spike auth de Phase 0
 
-Le **spike auth Anthropic** (`agent-auth`, ~1 jour) est le **go/no-go de Phase 0** (voir [`docs/ROADMAP.md`](./ROADMAP.md), Phase 0) : il détermine si Numen peut s'authentifier contre Anthropic dans des conditions acceptables. Quelle que soit son issue, le MVP avance — parce que le chemin non-bloqué (Ollama + OpenAI) ne dépend pas de ce verdict. Le résultat du spike décide seulement du **statut d'Anthropic** comme provider (first-class, dégradé, ou différé), pas de la viabilité du produit.
+Le **spike auth Anthropic** (`agent-auth`, ~1 jour) est le **go/no-go de Phase 0** (voir [`docs/ROADMAP.md`](./ROADMAP.md), Phase 0) : il détermine si Pyxis peut s'authentifier contre Anthropic dans des conditions acceptables. Quelle que soit son issue, le MVP avance — parce que le chemin non-bloqué (Ollama + OpenAI) ne dépend pas de ce verdict. Le résultat du spike décide seulement du **statut d'Anthropic** comme provider (first-class, dégradé, ou différé), pas de la viabilité du produit.
 
-> En une phrase : la couche multi-provider n'est pas une feature, c'est l'**assurance** contre le risque N°1. Tant qu'un seul provider frontier reste accessible, Numen tourne.
+> En une phrase : la couche multi-provider n'est pas une feature, c'est l'**assurance** contre le risque N°1. Tant qu'un seul provider frontier reste accessible, Pyxis tourne.

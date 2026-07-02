@@ -3,11 +3,11 @@
 //! représentative dans un `TestBackend`, sans terminal réel.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent_core::event::{ToolCallView, ToolResultView};
 use agent_core::AgentEvent;
-use agent_tui::{render, AppState};
-use ratatui::backend::TestBackend;
+use agent_core::event::{ToolCallView, ToolResultView};
+use agent_tui::{AppState, render};
 use ratatui::Terminal;
+use ratatui::backend::TestBackend;
 
 fn dump(state: &AppState, w: u16, h: u16, label: &str) {
     let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -42,7 +42,7 @@ fn tool(s: &mut AppState, name: &str, input: serde_json::Value, out: &str) {
 
 fn main() {
     let mut s = AppState::new("gpt-5.4", true);
-    s.workspace = "numen".into();
+    s.workspace = "pyxis".into();
     s.context_pct = Some(31);
 
     s.push_user("Explique le projet stp.");
@@ -61,7 +61,7 @@ fn main() {
         &mut s,
         "read",
         serde_json::json!({ "path": "README.md" }),
-        "# Numen\n...",
+        "# Pyxis\n...",
     );
     tool(
         &mut s,
@@ -70,7 +70,7 @@ fn main() {
         "[workspace]\n...",
     );
 
-    let answer = "**Numen** est un agent de code en terminal — la qualité de Claude Code, \
+    let answer = "**Pyxis** est un agent de code en terminal — la qualité de Claude Code, \
         ouvert aux modèles *frontier*.\n\n\
         ## Le produit\n\n\
         Une vraie TUI native (Rust + `ratatui`), pas un wrapper. L'objectif : orchestrer \
@@ -81,7 +81,7 @@ fn main() {
         - **Sandbox FS** via Landlock + proxy réseau allow-list.\n\
         - Rendu **markdown** propre, gouttière qui s'allume au stream.\n\n\
         ## Résumé\n\n\
-        Numen = un daimon de code, *local-first*, qui parle tes modèles GPT.";
+        Pyxis = une boussole de code, *local-first*, qui parle tes modèles GPT.";
     for chunk in answer.split_inclusive(' ') {
         s.apply(&AgentEvent::Text(chunk.into()));
     }
@@ -91,7 +91,7 @@ fn main() {
 
     // Scène 2 : réflexion EN COURS → repli + aperçu des dernières lignes pensées.
     let mut t = AppState::new("gpt-5.4", true);
-    t.workspace = "numen".into();
+    t.workspace = "pyxis".into();
     t.push_user("Refactore le parsing.");
     t.apply(&AgentEvent::Reasoning(
         "Let me think about the lexer.\n\nThe `todo!()` needs a real tokenizer. \

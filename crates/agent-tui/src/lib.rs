@@ -1,4 +1,4 @@
-//! `agent-tui` — frontend terminal de Numen (US-019). CLIENT du cœur headless :
+//! `agent-tui` — frontend terminal de Pyxis (US-019). CLIENT du cœur headless :
 //! il consomme les `agent_core::AgentEvent` (jamais d'ANSI venant du cœur) et
 //! décide seul du rendu. Esthétique monochrome + un accent, épurée (Rauch/Vercel)
 //! — la signature est une gouttière `▌` qui s'allume sur le tour en cours.

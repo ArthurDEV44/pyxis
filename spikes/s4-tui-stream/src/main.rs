@@ -10,7 +10,7 @@ use spike_tui::{AgentEvent, AppState, supports_truecolor, tokenize, ui};
 use std::io::IsTerminal;
 use std::time::Duration;
 
-const DEMO_TEXT: &str = "Numen démarre, parle à n'importe quel modèle, et streame \
+const DEMO_TEXT: &str = "Pyxis démarre, parle à n'importe quel modèle, et streame \
     la réponse token par token directement dans ton shell. Monochrome, épuré, rapide.";
 
 fn main() -> Result<()> {

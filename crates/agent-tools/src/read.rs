@@ -99,7 +99,12 @@ impl Tool for Read {
             full.as_ref()
         };
         let start = input.offset.unwrap_or(1).max(1);
-        Ok(ToolOutput::text(render_read(text, start, input.limit, oversize)))
+        Ok(ToolOutput::text(render_read(
+            text,
+            start,
+            input.limit,
+            oversize,
+        )))
     }
 }
 
@@ -131,7 +136,9 @@ fn render_read(text: &str, start: usize, limit: Option<usize>, oversize: bool) -
         if total == 0 {
             out.push_str("(fichier vide)");
         } else {
-            out.push_str(&format!("[plage hors limites : offset={start} > {total} lignes]"));
+            out.push_str(&format!(
+                "[plage hors limites : offset={start} > {total} lignes]"
+            ));
         }
         return out;
     }
@@ -162,7 +169,10 @@ mod tests {
         let out = render_read(text5(), 1, None, false);
         assert!(out.contains("     1\tl1"));
         assert!(out.contains("     5\tl5"));
-        assert!(!out.contains("offset="), "lecture complète → pas de hint: {out}");
+        assert!(
+            !out.contains("offset="),
+            "lecture complète → pas de hint: {out}"
+        );
     }
 
     #[test]

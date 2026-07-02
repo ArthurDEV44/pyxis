@@ -27,7 +27,7 @@ impl TempWs {
         static N: AtomicUsize = AtomicUsize::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
         let p =
-            std::env::temp_dir().join(format!("numen-tools-{}-{}-{}", std::process::id(), tag, n));
+            std::env::temp_dir().join(format!("pyxis-tools-{}-{}-{}", std::process::id(), tag, n));
         std::fs::create_dir_all(&p).unwrap();
         Self(p)
     }

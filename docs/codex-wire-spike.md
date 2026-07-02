@@ -1,20 +1,23 @@
 # Spike wire Codex (US-021) — protocole & verdict
 
-Statut : **verdict live consigné (2026-06-17).** EP-006 a câblé tout ce qui rend le
-spike exécutable et réversible ; le run réseau réel a été exécuté et son verdict est
-ci-dessous (section « Verdict du run live »). AC1 (cycle) et AC2 (originator=numen)
-sont OK ; AC3 a révélé une sous-estimation structurelle du `HeuristicCounter`
-(omission system prompt + tools), tracée pour EP-009/US-030.
+Statut : **verdict live historique consigné (2026-06-17), AC2 à revalider après
+rename Pyxis.** EP-006 a câblé tout ce qui rend le spike exécutable et réversible.
+Le run réseau réel ci-dessous prouvait le cycle multi-tour et l'ancien originator
+du projet. Depuis le rename, `originator=pyxis` doit être retesté. AC3 a révélé
+une sous-estimation structurelle du `HeuristicCounter` (omission system prompt +
+tools), tracée pour EP-009/US-030.
 
 ## Ce que le code livre déjà
 
 - **`originator` basculable sans recompiler.** L'en-tête d'inférence est résolu par
-  `agent_auth::oauth::openai_chatgpt::originator()` qui lit `NUMEN_ORIGINATOR`
-  (défaut `numen`). Le flow OAuth (`build_authorize_url`) garde `numen` : on ne touche
+  `agent_auth::oauth::openai_chatgpt::originator()` qui lit `PYXIS_ORIGINATOR`
+  (défaut `pyxis`). Le flow OAuth (`build_authorize_url`) garde `pyxis` : on ne touche
   pas au chemin auth validé en live.
-- **Fallback documenté et testé.** `originator_for(numen_accepted: bool)` renvoie
-  `numen` si accepté, sinon `codex_cli_rs` (l'identité du Codex CLI officiel OSS, déjà
+- **Fallback documenté et testé.** `originator_for(pyxis_accepted: bool)` renvoie
+  `pyxis` si accepté, sinon `codex_cli_rs` (l'identité du Codex CLI officiel OSS, déjà
   whitelistée). Couvert par `originator_fallback_selection`.
+- **Point post-rename.** Le verdict live `originator` doit être refait pour Pyxis.
+  Tant que ce n'est pas fait, garder le fallback `codex_cli_rs` comme plan de sortie.
 - **Wire durci autour du spike** (US-022/023/024) : connect timeout 20 s, idle timeout
   60 s, 429 terminaux non retryés, `Retry-After` honoré, dernier tour assistant persisté.
 
@@ -25,10 +28,10 @@ manuellement, jamais par l'agent.
 
 ```bash
 # 1. happy path : forcer ≥ 2 tours modèle avec un outil entre les deux.
-numen -p "lis le fichier Cargo.toml puis résume en une phrase ce qu'est ce workspace" --yes
+pyxis -p "lis le fichier Cargo.toml puis résume en une phrase ce qu'est ce workspace" --yes
 
 # 2. inspecter le transcript JSONL produit (dernier fichier de session) :
-ls -t .numen/sessions/*.jsonl | head -1
+ls -t .pyxis/sessions/*.jsonl | head -1
 ```
 
 ### AC1 — cycle multi-tour avec outil
@@ -36,12 +39,12 @@ Vérifier dans le JSONL la séquence `user → assistant(tool_use) → tool(tool
 assistant(text)` et l'absence de `400`. **À consigner :** OK / KO (+ corps d'erreur si KO).
 
 ### AC2 — originator
-- Run par défaut (`originator=numen`). Si une requête revient en `400`/`403` évoquant
+- Run par défaut (`originator=pyxis`). Si une requête revient en `400`/`403` évoquant
   l'`originator`, relancer avec le fallback :
   ```bash
-  NUMEN_ORIGINATOR=codex_cli_rs numen -p "…" --yes
+  PYXIS_ORIGINATOR=codex_cli_rs pyxis -p "…" --yes
   ```
-- **À consigner :** `numen` accepté (oui/non). Si non, garder `codex_cli_rs` comme défaut
+- **À consigner :** `pyxis` accepté (oui/non). Si non, garder `codex_cli_rs` comme défaut
   (ajuster le défaut de `originator()` ou exporter la variable en session).
 
 ### AC3 — écart tokenizer
@@ -50,22 +53,23 @@ locale `HeuristicCounter` sur le même contexte. **À consigner :** ratio réel/
 calibrer la marge de compaction (un `HeuristicCounter` qui sous-estime de X % impose une
 marge de sécurité ≥ X % sur le seuil d'auto-compaction).
 
-## Verdict du run live (2026-06-17)
+## Verdict du run live historique (2026-06-17, ancien nom)
 
-Run exécuté avec `--no-sandbox` : le Landlock de Numen échoue en `EACCES` dans
+Run exécuté avec `--no-sandbox` : le Landlock de Pyxis échoue en `EACCES` dans
 l'environnement d'automatisation imbriqué (sandbox dans sandbox). Orthogonal au
 spike wire (US-021 valide le canal Responses, pas le confinement FS) ; prompt en
-lecture seule. Le sandbox reste actif en usage normal (`numen` sans `--no-sandbox`).
+lecture seule. Le sandbox reste actif en usage normal (`pyxis` sans `--no-sandbox`).
 
 ```
 Date du run : 2026-06-17  (binaire durci EP-006, modèle gpt-5.5 par défaut)
 AC1 cycle multi-tour : OK
-  transcript .numen/sessions/1781703238804.jsonl :
+  transcript .pyxis/sessions/1781703238804.jsonl :
   user → assistant(text + tool_use:read) → tool(tool_result) → assistant(text), aucun 400.
-AC2 originator=numen : ACCEPTÉ
-  run par défaut (originator=numen), aucun 400/403 sur 2 tours + 1 outil.
-  Fallback codex_cli_rs disponible (NUMEN_ORIGINATOR + originator_for) mais NON requis.
-AC3 input_tokens réel vs estimé (sonde NUMEN_DEBUG_USAGE) :
+AC2 ancien originator : ACCEPTÉ
+  run par défaut sous l'ancien nom du projet, aucun 400/403 sur 2 tours + 1 outil.
+  Après rename, originator=pyxis reste À REVALIDER.
+  Fallback codex_cli_rs disponible (PYXIS_ORIGINATOR + originator_for).
+AC3 input_tokens réel vs estimé (sonde PYXIS_DEBUG_USAGE) :
   tour 1 : réel=1389  estimé_local=58   ratio=23.9×
   tour 2 : réel=2475  estimé_local=827  ratio=3.0×
 Décision marge compaction :

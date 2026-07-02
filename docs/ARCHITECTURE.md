@@ -1,10 +1,10 @@
-# Architecture de référence — Numen
+# Architecture de référence — Pyxis
 
 > Statut : étude / design, pré-implémentation. Aucun code écrit. Ce document est la source de vérité architecturale. Il fixe les invariants ; il ne fige pas chaque signature.
 >
 > Documents liés : [`docs/PROVIDERS.md`](./PROVIDERS.md) (couche multi-provider, taxonomie d'erreurs, stratégie cache-hit), [`docs/ROADMAP.md`](./ROADMAP.md) (phases, spike Phase 0), [`docs/DECISIONS.md`](./DECISIONS.md) (ADR — décisions structurantes).
 
-Numen est une CLI agent IA en terminal, écrite en Rust natif, multi-provider first-class, conçue pour partager son cœur avec Paneflow (GPUI). La commande est `numen`. L'inspiration vient de l'architecture interne de Claude Code, mais transposée à un binaire Rust ultra-performant et agnostique au modèle.
+Pyxis est une CLI agent IA en terminal, écrite en Rust natif, multi-provider first-class, conçue pour partager son cœur avec Paneflow (GPUI). La commande est `pyxis`. L'inspiration vient de l'architecture interne de Claude Code, mais transposée à un binaire Rust ultra-performant et agnostique au modèle.
 
 Différenciateur : **qualité Claude Code, tous les providers frontier, perf Rust + intégration profonde avec Paneflow.** Pas de pari « vertical Rust verification-grounded » (TAM trop étroit), pas de pari « sandbox déclaratif » (Codex le fait déjà). Le pari est : full Rust natif ultra-perf + multi-provider de première classe (là où Claude Code est Anthropic-only) + cœur embarquable in-process dans Paneflow.
 
@@ -12,15 +12,15 @@ Différenciateur : **qualité Claude Code, tous les providers frontier, perf Rus
 
 ## 0. Nommage des crates et du binaire
 
-Le brief a sécurisé sur crates.io les noms `numen`, `numen-cli`, `numen-core` (libres — atout décisif pour un projet Cargo). Le travail d'architecture, lui, raisonne en crates **`agent-*`** (`agent-core`, `agent-cli`, `agent-tui`, …) pour nommer les responsabilités sans préfixe redondant à l'intérieur du workspace.
+Le brief a sécurisé sur crates.io les noms `pyxis`, `pyxis-cli`, `pyxis-core` (libres — atout décisif pour un projet Cargo). Le travail d'architecture, lui, raisonne en crates **`agent-*`** (`agent-core`, `agent-cli`, `agent-tui`, …) pour nommer les responsabilités sans préfixe redondant à l'intérieur du workspace.
 
 Convention retenue, à graver avant la première ligne de code (cf. ADR-5 dans [`docs/DECISIONS.md`](./DECISIONS.md)) :
 
-- **Binaire publié et commande** : `numen`. Le crate qui produit ce binaire est `agent-cli` à l'intérieur du workspace, mais expose le nom de binaire `numen` (`[[bin]] name = "numen"`).
-- **Crate racine publiée** : `numen` (façade/ré-export public si une API de bibliothèque est ouverte un jour) ; `numen-core` et `numen-cli` restent réservés et pointeront, le cas échéant, sur `agent-core` et `agent-cli`.
-- **Crates internes** : noms `agent-*` dans le workspace (non publiés, ou publiés sous le namespace `numen-*` si besoin via `package.name`).
+- **Binaire publié et commande** : `pyxis`. Le crate qui produit ce binaire est `agent-cli` à l'intérieur du workspace, mais expose le nom de binaire `pyxis` (`[[bin]] name = "pyxis"`).
+- **Crate racine publiée** : `pyxis` (façade/ré-export public si une API de bibliothèque est ouverte un jour) ; `pyxis-core` et `pyxis-cli` restent réservés et pointeront, le cas échéant, sur `agent-core` et `agent-cli`.
+- **Crates internes** : noms `agent-*` dans le workspace (non publiés, ou publiés sous le namespace `pyxis-*` si besoin via `package.name`).
 
-Autrement dit, les réservations `numen*` couvrent la **surface publique** (binaire, façade) ; les noms `agent-*` décrivent l'**organisation interne**. Les deux ne se contredisent pas : c'est une divergence assumée entre nom publié et nom de travail. Tout le reste du document emploie les identifiants internes `agent-*`.
+Autrement dit, les réservations `pyxis*` couvrent la **surface publique** (binaire, façade) ; les noms `agent-*` décrivent l'**organisation interne**. Les deux ne se contredisent pas : c'est une divergence assumée entre nom publié et nom de travail. Tout le reste du document emploie les identifiants internes `agent-*`.
 
 ---
 
@@ -71,13 +71,13 @@ Le projet est un workspace Cargo. Chaque crate a une responsabilité unique et u
 | `agent-sandbox` | Landlock FS + proxy réseau local + `PolicyEngine`. | — |
 | `agent-auth` | Stockage de credentials (Secret Service / keyring), OAuth, refresh token. **C'est ici que se joue le go/no-go auth Anthropic.** | — |
 | `agent-tokenizer` | Comptage de tokens local (tiktoken-rs / tokenizers). Indispensable pour la compaction sur les providers sans usage en stream (Ollama). Headless. | Aucune dépendance TUI / HTTP. |
-| `agent-cli` | Binaire `numen`, wiring. **Seul crate qui dépend de tout.** | — |
+| `agent-cli` | Binaire `pyxis`, wiring. **Seul crate qui dépend de tout.** | — |
 
 ### Graphe de dépendances (sens des flèches = « dépend de »)
 
 ```
                               ┌───────────┐
-                              │ agent-cli │  (binaire `numen`, wiring complet)
+                              │ agent-cli │  (binaire `pyxis`, wiring complet)
                               └─────┬─────┘
         ┌──────────┬──────────┬─────┴─────┬──────────┬──────────┐
         ▼          ▼          ▼           ▼          ▼          ▼
@@ -403,7 +403,7 @@ Articulation withholding ↔ reactive (rappel explicite) : seules les erreurs **
 
 ## 6. MCP via `rmcp`
 
-Numen consomme MCP via le SDK Rust officiel `rmcp` (wrappé dans `agent-mcp`).
+Pyxis consomme MCP via le SDK Rust officiel `rmcp` (wrappé dans `agent-mcp`).
 
 L'état d'un serveur MCP est un **enum discriminé** : le `client` n'est **accessible que dans la variante `Connected`.** Impossible d'appeler un serveur non connecté — le compilateur l'interdit.
 
@@ -466,7 +466,7 @@ Chaque sous-agent réutilise la **même** `run_agent` (§3) : un sous-agent est 
 
 ## 9. Frontend `agent-tui` — Ratatui + crossterm
 
-`numen` s'ouvre **directement dans le shell**, ce n'est pas une fenêtre. Stack : **Ratatui + crossterm**.
+`pyxis` s'ouvre **directement dans le shell**, ce n'est pas une fenêtre. Stack : **Ratatui + crossterm**.
 
 GPUI a été **envisagé puis rejeté** pour le frontend standalone : GPUI ouvre une fenêtre GPU (app desktop), pas une CLI terminal. Clarification importante : Ink (de Claude Code) **est** un TUI — il rend de l'ANSI dans le terminal, ce n'est pas magique. **Le plafond visuel d'un terminal est identique pour Ink et Ratatui** ; c'est le **design** qui fait toute la différence.
 
@@ -520,7 +520,7 @@ Paneflow est en GPUI (Rust). Il peut donc **embarquer `agent-core` in-process** 
 - séquence de `ToolCall` → **arbre de plan** interactif.
 - `PermissionAsk` → dialogue natif GPUI.
 
-C'est précisément ce que le découplage du §1 rend possible : le **même** cœur, **sans modification**, alimente le terminal *et* Paneflow. L'enrichissement Paneflow se fait **via le protocole d'events** (potentiellement étendu de variantes additionnelles), **sans jamais casser** le mode terminal par défaut. C'est le levier d'intégration profonde qui constitue, avec la perf Rust et le multi-provider, le différenciateur de Numen.
+C'est précisément ce que le découplage du §1 rend possible : le **même** cœur, **sans modification**, alimente le terminal *et* Paneflow. L'enrichissement Paneflow se fait **via le protocole d'events** (potentiellement étendu de variantes additionnelles), **sans jamais casser** le mode terminal par défaut. C'est le levier d'intégration profonde qui constitue, avec la perf Rust et le multi-provider, le différenciateur de Pyxis.
 
 ---
 

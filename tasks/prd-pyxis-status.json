@@ -1,7 +1,7 @@
 {
   "prd": {
-    "file": "tasks/prd-numen.md",
-    "title": "Numen — CLI agent IA de codage multi-provider (MVP)",
+    "file": "tasks/prd-pyxis.md",
+    "title": "Pyxis — CLI agent IA de codage multi-provider (MVP)",
     "created_at": "2026-06-15",
     "status": "READY"
   },
@@ -52,7 +52,7 @@
       "priority": "P0",
       "stories_total": 2,
       "stories_done": 2,
-      "note": "+ capstone agent-cli (binaire numen) qui câble tout : le DoD « numen offre une session interactive » est atteint."
+      "note": "+ capstone agent-cli (binaire pyxis) qui câble tout : le DoD « pyxis offre une session interactive » est atteint."
     }
   ],
   "stories": [
@@ -396,16 +396,16 @@
     ],
     "live_verification": "Pas testable ici (pas de token). Harnais fourni : `cargo run -p agent-auth --example login` puis `cargo run -p agent-provider --example smoke -- \"prompt\" [model]`.",
     "risk_1_to_verify_live": "Reasoning items NON réinjectés (MVP). Le backend est un modèle à raisonnement (include reasoning.encrypted_content). Si 400 « reasoning item required » sur un tour multi-outil → fix borné : porter thinkingSignature de Pi (capturer l'item à output_item.done, le stocker au transcript, le réémettre dans input[]). Voir chatgpt.rs en-tête.",
-    "other_unknowns": "Slug model exact du backend Codex (défaut smoke = gpt-5), validation originator='numen' côté backend, wording d'un éventuel blocage type ThirdPartyBlocked OpenAI — tous à sonder au premier run live (cf. docs/openai-subscription-auth.md §Données manquantes).",
+    "other_unknowns": "Slug model exact du backend Codex (défaut smoke = gpt-5), validation originator='pyxis' côté backend, wording d'un éventuel blocage type ThirdPartyBlocked OpenAI — tous à sonder au premier run live (cf. docs/openai-subscription-auth.md §Données manquantes).",
     "note": "agent-cli câblera : store::load(KEYRING_ACCOUNT) → OpenAiChatGptProvider::from_credential → Deps.provider. Pas encore de revue adversariale."
   },
   "ep005": {
     "crates": [
       "crates/agent-sandbox (NOUVEAU — US-020 : Landlock FS + proxy réseau)",
       "crates/agent-tui (NOUVEAU — US-019 : frontend Ratatui monochrome)",
-      "crates/agent-cli (NOUVEAU — binaire numen, capstone de wiring)"
+      "crates/agent-cli (NOUVEAU — binaire pyxis, capstone de wiring)"
     ],
-    "tests": "133 tests verts (workspace) ; clippy 0 warning, fmt OK. Le binaire numen build et se lance (bail propre sans credential).",
+    "tests": "133 tests verts (workspace) ; clippy 0 warning, fmt OK. Le binaire pyxis build et se lance (bail propre sans credential).",
     "deps_added": [
       "ratatui 0.29",
       "crossterm 0.28",
@@ -414,9 +414,9 @@
     ],
     "design_tui": "Minimalisme raffiné (skill /frontend-design appliquée au terminal) : monochrome niveaux de gris + 1 accent teal, signature = gouttière ▌ qui s'allume sur le tour streamé, hiérarchie par poids/dim/espace négatif, Unicode fin (⚙ ⟐ ›), zéro bordure ASCII. Vérifié visuellement via l'exemple gallery (3 scènes). Dégradation sans truecolor = BOLD/DIM, layout intact.",
     "design_sandbox": "Décision : Landlock PROCESS-WIDE appliqué dans main() avant le runtime (thread principal → workers + sous-process Bash héritent ; fork-safe, ≠ pre_exec post-fork risqué). Confine toutes les écritures (Write/Edit in-process ET Bash) sans casser keyring (D-Bus, pas FS) ni provider (réseau direct). Proxy allow-list filtre le réseau Bash (env injecté sur ses commandes seulement).",
-    "wiring": "numen main() : parse args (-p/--model/--allow/--yes/--no-sandbox) → enforce_process(sandbox) AVANT runtime → load credential keyring → OpenAiChatGptProvider → proxy + harden closure → SharedSession (JsonlSession + snapshot mémoire pour continuité multi-tours) → Registry (6 outils + Approver + hardener) → Deps → dispatch headless (-p) vs interactif (tokio::select : clavier ↔ stream agent ↔ permissions).",
-    "capstone_note": "agent-cli n'était pas une story formelle mais le DoD EP-005 (« numen offre une session interactive ») l'exige. Petite extension EP-003 : PermissionRequest.input (Value brute) pour rendre un diff dans le dialog.",
-    "live_verification": "Interactif/Landlock pas testables sans terminal + token + kernel Landlock dans cet env. Arthur : `cargo run -p agent-auth --example login` puis `cargo run -p numen` (interactif) ou `numen -p \"...\" --yes`. Preview design : `cargo run -p agent-tui --example gallery`.",
+    "wiring": "pyxis main() : parse args (-p/--model/--allow/--yes/--no-sandbox) → enforce_process(sandbox) AVANT runtime → load credential keyring → OpenAiChatGptProvider → proxy + harden closure → SharedSession (JsonlSession + snapshot mémoire pour continuité multi-tours) → Registry (6 outils + Approver + hardener) → Deps → dispatch headless (-p) vs interactif (tokio::select : clavier ↔ stream agent ↔ permissions).",
+    "capstone_note": "agent-cli n'était pas une story formelle mais le DoD EP-005 (« pyxis offre une session interactive ») l'exige. Petite extension EP-003 : PermissionRequest.input (Value brute) pour rendre un diff dans le dialog.",
+    "live_verification": "Interactif/Landlock pas testables sans terminal + token + kernel Landlock dans cet env. Arthur : `cargo run -p agent-auth --example login` puis `cargo run -p pyxis` (interactif) ou `pyxis -p \"...\" --yes`. Preview design : `cargo run -p agent-tui --example gallery`.",
     "deferred": "Network confinement DUR (Landlock AccessNet V4 / nftables) — le proxy est best-effort (bypassable par socket brut). Scroll wrapping exact (approximation par lignes non-wrappées). Resume (--resume) non câblé au CLI (le crate agent-session le supporte). Revue adversariale non faite."
   }
 }

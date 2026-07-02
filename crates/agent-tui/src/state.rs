@@ -73,7 +73,7 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
         false,
     ),
     ("/clear", "Efface le contexte et repart à neuf", false),
-    ("/quit", "Quitte Numen", false),
+    ("/quit", "Quitte Pyxis", false),
 ];
 
 /// Niveau 1 de `/providers` : (id, libellé, actif). Seul l'abonnement est
@@ -100,7 +100,7 @@ pub const MODELS: &[(&str, &str)] = &[
     ("gpt-5.3-codex-spark", "[openai-codex]"),
 ];
 
-/// Le texte est-il une vraie commande Numen ? (1er mot ∈ COMMANDS). Un message
+/// Le texte est-il une vraie commande Pyxis ? (1er mot ∈ COMMANDS). Un message
 /// qui commence par un `/<skill>` n'en est PAS une → il part à l'agent.
 fn is_command(text: &str) -> bool {
     let first = text.split(' ').next().unwrap_or("");
@@ -321,7 +321,7 @@ pub struct AppState {
     /// tokens (/4). Sur une boucle `/goal`, cumule l'ensemble des relances (vue coût
     /// total) : remis à zéro seulement au front montant de `running` (`begin_turn`).
     pub turn_chars: usize,
-    /// Reduced-motion (`NO_COLOR` / `NUMEN_REDUCED_MOTION`) : spinner dégradé en point pulsé.
+    /// Reduced-motion (`NO_COLOR` / `PYXIS_REDUCED_MOTION`) : spinner dégradé en point pulsé.
     pub reduced_motion: bool,
     /// Nouveaux blocs arrivés pendant que l'utilisateur a remonté le transcript
     /// (pill « revenir en bas », US-046). Remis à 0 dès le retour au bas.
@@ -1014,7 +1014,7 @@ impl AppState {
                 if text.is_empty() {
                     InputAction::None
                 } else if is_command(&text) {
-                    // Vraie commande Numen (1er mot dans COMMANDS, ex `/models …`).
+                    // Vraie commande Pyxis (1er mot dans COMMANDS, ex `/models …`).
                     self.clear_input();
                     self.completion_index = 0;
                     InputAction::Command(text)
@@ -1338,7 +1338,7 @@ mod tests {
         assert_eq!(action, InputAction::None);
         assert_eq!(s.input, "/frontend-design ");
         assert_eq!(s.cursor, s.input.chars().count());
-        // Soumis avec un message → part à l'AGENT (pas une commande Numen).
+        // Soumis avec un message → part à l'AGENT (pas une commande Pyxis).
         for c in "refais l'UI".chars() {
             s.on_key(key(c));
         }

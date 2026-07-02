@@ -40,29 +40,29 @@ pub const DEVICE_CODE_TIMEOUT: Duration = Duration::from_secs(900);
 pub const JWT_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
 /// ⚠️ Hardcodé par client (Pi met `"pi"`). Le backend ChatGPT **peut** valider
 /// l'`originator` contre une liste connue — à tester au premier run (ADR-10).
-pub const ORIGINATOR: &str = "numen";
+pub const ORIGINATOR: &str = "pyxis";
 
-/// Fallback `originator` si le backend rejette `numen` (US-021, unhappy path) :
+/// Fallback `originator` si le backend rejette `pyxis` (US-021, unhappy path) :
 /// emprunter l'identité du Codex CLI officiel OSS, déjà sur la liste blanche du
-/// backend. Bascule à chaud via `NUMEN_ORIGINATOR` (pas de recompilation).
+/// backend. Bascule à chaud via `PYXIS_ORIGINATOR` (pas de recompilation).
 pub const ORIGINATOR_FALLBACK: &str = "codex_cli_rs";
 
 /// `originator` effectif envoyé sur la requête d'INFÉRENCE (US-021). Lit
-/// `NUMEN_ORIGINATOR` (permet de basculer `numen` ↔ `codex_cli_rs` pendant le
+/// `PYXIS_ORIGINATOR` (permet de basculer `pyxis` ↔ `codex_cli_rs` pendant le
 /// spike sans recompiler) ; défaut `ORIGINATOR`. N'affecte PAS le flow OAuth :
 /// `build_authorize_url` garde `ORIGINATOR` (changer l'auth casserait le flow
 /// validé en live, hors scope).
 pub fn originator() -> String {
-    match std::env::var("NUMEN_ORIGINATOR") {
+    match std::env::var("PYXIS_ORIGINATOR") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
         _ => ORIGINATOR.to_string(),
     }
 }
 
-/// Sélection déterministe du fallback (US-021, AC2) : `numen` si le backend
+/// Sélection déterministe du fallback (US-021, AC2) : `pyxis` si le backend
 /// l'accepte, sinon `codex_cli_rs` (whitelisté). Pur/testable, indépendant de l'env.
-pub fn originator_for(numen_accepted: bool) -> &'static str {
-    if numen_accepted {
+pub fn originator_for(pyxis_accepted: bool) -> &'static str {
+    if pyxis_accepted {
         ORIGINATOR
     } else {
         ORIGINATOR_FALLBACK
@@ -344,14 +344,14 @@ pub async fn login_browser(client: &reqwest::Client) -> Result<OAuthCredential, 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).await?;
 
     if open::that(&url).is_err() {
-        println!("Ouvre cette URL pour autoriser Numen :\n{url}");
+        println!("Ouvre cette URL pour autoriser Pyxis :\n{url}");
     }
 
     let cb = accept_callback(&listener, &state).await?;
     exchange_code(client, &cb.code, &pkce.verifier, REDIRECT_URI, now_ms()).await
 }
 
-const SUCCESS_BODY: &str = "<!doctype html><meta charset=utf-8><body style=\"font-family:system-ui;background:#0b0b0b;color:#eaeaea;display:grid;place-items:center;height:100vh\"><div><h2>Numen — connecté</h2><p>Tu peux fermer cet onglet.</p></div></body>";
+const SUCCESS_BODY: &str = "<!doctype html><meta charset=utf-8><body style=\"font-family:system-ui;background:#0b0b0b;color:#eaeaea;display:grid;place-items:center;height:100vh\"><div><h2>Pyxis — connecté</h2><p>Tu peux fermer cet onglet.</p></div></body>";
 
 /// Accepte des connexions jusqu'à recevoir un callback `/auth/callback` valide.
 /// Les requêtes parasites (favicon, etc.) reçoivent un 404 et la boucle continue.
@@ -548,7 +548,7 @@ mod tests {
             "state=STATE123",
             "id_token_add_organizations=true",
             "codex_cli_simplified_flow=true",
-            "originator=numen",
+            "originator=pyxis",
             "scope=openid",
         ] {
             assert!(url.contains(needle), "param absent: {needle}\n{url}");
@@ -652,19 +652,19 @@ mod tests {
         let h: std::collections::HashMap<_, _> = spec.headers.into_iter().collect();
         assert_eq!(h["Authorization"], "Bearer AT");
         assert_eq!(h["chatgpt-account-id"], "acct_7");
-        assert_eq!(h["originator"], "numen");
+        assert_eq!(h["originator"], "pyxis");
         assert_eq!(h["OpenAI-Beta"], "responses=experimental");
     }
 
-    // US-021 AC2 : sélection du fallback `originator`. `numen` par défaut ;
-    // `codex_cli_rs` si le backend rejette `numen` (à trancher en live).
+    // US-021 AC2 : sélection du fallback `originator`. `pyxis` par défaut ;
+    // `codex_cli_rs` si le backend rejette `pyxis` (à trancher en live).
     #[test]
     fn originator_fallback_selection() {
-        assert_eq!(originator_for(true), "numen");
+        assert_eq!(originator_for(true), "pyxis");
         assert_eq!(originator_for(false), "codex_cli_rs");
         assert_eq!(ORIGINATOR_FALLBACK, "codex_cli_rs");
-        // env non défini → défaut `numen` (le run live le surchargera si besoin).
-        assert_eq!(originator(), "numen");
+        // env non défini → défaut `pyxis` (le run live le surchargera si besoin).
+        assert_eq!(originator(), "pyxis");
     }
 
     #[test]

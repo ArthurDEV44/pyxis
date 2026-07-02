@@ -1,7 +1,7 @@
 {
   "prd": {
     "file": "tasks/prd-codex-orchestration.md",
-    "title": "Numen — Orchestration des modèles Codex (post-MVP)",
+    "title": "Pyxis — Orchestration des modèles Codex (post-MVP)",
     "created_at": "2026-06-17",
     "status": "DONE"
   },
@@ -51,7 +51,7 @@
       "started_at": "2026-06-17",
       "completed_at": "2026-06-17",
       "reviewed_at": "2026-06-17",
-      "notes": "Run live exécuté 2026-06-17 (autorisé par l'utilisateur), verdict consigné docs/codex-wire-spike.md. AC1 cycle multi-tour OK (transcript user→assistant(tool_use:read)→tool→assistant, aucun 400). AC2 originator=numen ACCEPTÉ (fallback codex_cli_rs dispo, non requis). AC3 mesuré via sonde NUMEN_DEBUG_USAGE : HeuristicCounter sous-estime 3-24× car estimate_input omet system prompt (US-027) + schémas outils ; seuil compaction réactif sûr (ancré usage réel) mais projections pré-tour/MidTurn trop optimistes → offset system+tools à câbler en EP-009/US-030. Run en --no-sandbox (Landlock EACCES en env imbriqué, orthogonal au spike wire)."
+      "notes": "Run live historique exécuté 2026-06-17 (autorisé par l'utilisateur), verdict consigné docs/codex-wire-spike.md. AC1 cycle multi-tour OK (transcript user→assistant(tool_use:read)→tool→assistant, aucun 400). AC2 validait l'ancien originator du projet ; après rename, originator=pyxis reste à revalider (fallback codex_cli_rs prêt). AC3 mesuré via sonde PYXIS_DEBUG_USAGE : HeuristicCounter sous-estime 3-24× car estimate_input omet system prompt (US-027) + schémas outils ; seuil compaction réactif sûr (ancré usage réel) mais projections pré-tour/MidTurn trop optimistes → offset system+tools à câbler en EP-009/US-030. Run en --no-sandbox (Landlock EACCES en env imbriqué, orthogonal au spike wire)."
     },
     {
       "id": "US-022",
@@ -155,7 +155,7 @@
       "started_at": "2026-06-17",
       "completed_at": "2026-06-17",
       "reviewed_at": "2026-06-17",
-      "notes": "AC1-3 satisfaits et testés : session_id UUID v4 stable (new_session_id), prompt_cache_key = clamp à 64 CODE-POINTS (chars().take, Unicode-safe, testé avec emoji), boundary inchangée. Injecté chaque requête (chatgpt.rs:315). AC4 (mesure cache hit) : la clé est envoyée, mais l'observation directe exige de parser `cached_tokens` de l'usage (non surfacé ; parse_usage ne lit que input/output) et input_tokens croît par tour → non directement comparable. Cible Month-6 par le tableau Goals, escape-hatch doc de l'AC applicable. Sonde NUMEN_DEBUG_USAGE (EP-006) déjà en place pour la mesure future."
+      "notes": "AC1-3 satisfaits et testés : session_id UUID v4 stable (new_session_id), prompt_cache_key = clamp à 64 CODE-POINTS (chars().take, Unicode-safe, testé avec emoji), boundary inchangée. Injecté chaque requête (chatgpt.rs:315). AC4 (mesure cache hit) : la clé est envoyée, mais l'observation directe exige de parser `cached_tokens` de l'usage (non surfacé ; parse_usage ne lit que input/output) et input_tokens croît par tour → non directement comparable. Cible Month-6 par le tableau Goals, escape-hatch doc de l'AC applicable. Sonde PYXIS_DEBUG_USAGE (EP-006) déjà en place pour la mesure future."
     },
     {
       "id": "US-030",

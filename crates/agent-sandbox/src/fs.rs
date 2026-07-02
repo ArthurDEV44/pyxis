@@ -31,7 +31,7 @@ impl SandboxStatus {
                 "sandbox FS NON appliqué (kernel sans Landlock effectif) — écritures non confinées",
             ),
             SandboxStatus::UnsupportedPlatform => Some(
-                "sandbox FS désactivé (hors Linux) — Numen est Linux-first ; écritures non confinées",
+                "sandbox FS désactivé (hors Linux) — Pyxis est Linux-first ; écritures non confinées",
             ),
         }
     }
