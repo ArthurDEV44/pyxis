@@ -9,9 +9,8 @@
 
 use agent_core::provider::{ProviderError, StopReason, StreamEvent, TokenUsage};
 use serde_json::Value;
+use std::collections::HashMap;
 
-/// Function call en cours d'assemblage (un seul actif à la fois : les output
-/// items de la Responses API sont streamés séquentiellement).
 struct ActiveCall {
     call_id: String,
     args: String,
@@ -20,7 +19,9 @@ struct ActiveCall {
 /// Mapper à état pour un flux de réponse. Réinstancié à chaque tour.
 #[derive(Default)]
 pub struct CodexEventMapper {
-    active: Option<ActiveCall>,
+    active: HashMap<String, ActiveCall>,
+    output_index_to_item: HashMap<u64, String>,
+    last_active_item: Option<String>,
     /// Au moins un tool call a-t-il été émis ? (override stop `completed`→`ToolUse`).
     saw_tool_call: bool,
     /// US-031 : capturer les reasoning items chiffrés pour replay ? Défaut OFF
@@ -66,20 +67,25 @@ impl CodexEventMapper {
             }]),
             "response.output_item.added" => Ok(self.on_item_added(&v)),
             "response.function_call_arguments.delta" => {
-                if let (Some(active), Some(delta)) =
-                    (self.active.as_mut(), v.get("delta").and_then(Value::as_str))
-                {
-                    active.args.push_str(delta);
+                if let (Some(key), Some(delta)) = (
+                    self.event_item_key(&v),
+                    v.get("delta").and_then(Value::as_str),
+                ) {
+                    if let Some(active) = self.active.get_mut(&key) {
+                        active.args.push_str(delta);
+                    }
                 }
                 Ok(Vec::new())
             }
             "response.function_call_arguments.done" => {
                 // Source d'autorité des arguments complets (remplace l'accumulé).
-                if let (Some(active), Some(args)) = (
-                    self.active.as_mut(),
+                if let (Some(key), Some(args)) = (
+                    self.event_item_key(&v),
                     v.get("arguments").and_then(Value::as_str),
                 ) {
-                    active.args = args.to_string();
+                    if let Some(active) = self.active.get_mut(&key) {
+                        active.args = args.to_string();
+                    }
                 }
                 Ok(Vec::new())
             }
@@ -118,11 +124,21 @@ impl CodexEventMapper {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let item_id = item_id(item)
+            .unwrap_or_else(|| call_id.as_str())
+            .to_string();
+        if let Some(index) = v.get("output_index").and_then(Value::as_u64) {
+            self.output_index_to_item.insert(index, item_id.clone());
+        }
         self.saw_tool_call = true;
-        self.active = Some(ActiveCall {
-            call_id: call_id.clone(),
-            args,
-        });
+        self.last_active_item = Some(item_id.clone());
+        self.active.insert(
+            item_id,
+            ActiveCall {
+                call_id: call_id.clone(),
+                args,
+            },
+        );
         vec![StreamEvent::ToolCallStart { id: call_id, name }]
     }
 
@@ -163,9 +179,15 @@ impl CodexEventMapper {
             .get("item")
             .and_then(|i| i.get("arguments"))
             .and_then(Value::as_str);
-        let Some(active) = self.active.take() else {
+        let Some(key) = self.event_item_key(v) else {
             return Vec::new();
         };
+        let Some(active) = self.active.remove(&key) else {
+            return Vec::new();
+        };
+        if self.last_active_item.as_deref() == Some(key.as_str()) {
+            self.last_active_item = None;
+        }
         let args = match item_args {
             Some(a) if !a.is_empty() => a.to_string(),
             _ => active.args,
@@ -180,6 +202,31 @@ impl CodexEventMapper {
         }
         out.push(StreamEvent::ToolCallEnd { id: active.call_id });
         out
+    }
+
+    fn event_item_key(&self, v: &Value) -> Option<String> {
+        if let Some(id) = v.get("item_id").and_then(Value::as_str)
+            && self.active.contains_key(id)
+        {
+            return Some(id.to_string());
+        }
+        if let Some(id) = v.get("item").and_then(item_id)
+            && self.active.contains_key(id)
+        {
+            return Some(id.to_string());
+        }
+        if let Some(index) = v.get("output_index").and_then(Value::as_u64)
+            && let Some(id) = self.output_index_to_item.get(&index)
+        {
+            return Some(id.clone());
+        }
+        if self.active.len() == 1 {
+            return self.active.keys().next().cloned();
+        }
+        self.last_active_item
+            .as_ref()
+            .filter(|id| self.active.contains_key(*id))
+            .cloned()
     }
 
     fn on_terminal(&mut self, v: &Value) -> Vec<StreamEvent> {
@@ -216,6 +263,10 @@ fn delta_event(v: &Value, ctor: impl Fn(String) -> StreamEvent) -> Vec<StreamEve
         Some(d) if !d.is_empty() => vec![ctor(d.to_string())],
         _ => Vec::new(),
     }
+}
+
+fn item_id(item: &Value) -> Option<&str> {
+    item.get("id").and_then(Value::as_str)
 }
 
 /// `response.usage` → `TokenUsage`. `input_tokens` inclut les cached (on garde la
@@ -357,6 +408,40 @@ mod tests {
             .collect();
         let parsed: serde_json::Value = serde_json::from_str(&args).expect("JSON valide");
         assert_eq!(parsed["cmd"], "ls");
+    }
+
+    #[test]
+    fn interleaved_function_calls_are_tracked_by_item_id() {
+        let ev = ingest_all(&[
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":""}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"{\"path\":\""}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_b","delta":"{\"path\":\""}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_a","delta":"a.txt\"}"}"#,
+            r#"{"type":"response.function_call_arguments.delta","item_id":"fc_b","delta":"b.txt\"}"}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","id":"fc_a","name":"read","arguments":"{\"path\":\"a.txt\"}"}}"#,
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","id":"fc_b","name":"write","arguments":"{\"path\":\"b.txt\"}"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+
+        let args_for = |call_id: &str| -> String {
+            ev.iter()
+                .filter_map(|e| match e {
+                    StreamEvent::ToolCallDelta { id, args_json } if id == call_id => {
+                        Some(args_json.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(args_for("call_a"), "{\"path\":\"a.txt\"}");
+        assert_eq!(args_for("call_b"), "{\"path\":\"b.txt\"}");
+        assert_eq!(
+            ev.last(),
+            Some(&StreamEvent::Done {
+                stop: StopReason::ToolUse
+            })
+        );
     }
 
     #[test]

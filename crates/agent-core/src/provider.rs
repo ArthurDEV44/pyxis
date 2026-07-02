@@ -29,7 +29,8 @@ pub enum ProviderKind {
 /// Le seul vocabulaire de streaming que le cœur connaît (PROVIDERS §2). Tout
 /// adapter doit produire CETTE séquence. À `ToolCallEnd`, la concaténation des
 /// `ToolCallDelta.args_json` d'un même id DOIT être un JSON valide.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StreamEvent {
     TextDelta {
         text: String,
@@ -92,6 +93,53 @@ pub struct Capabilities {
     pub reasoning: bool,
     pub server_side_state: bool,
     pub max_context: u32,
+    #[serde(default)]
+    pub limits: CapabilityLimits,
+    #[serde(default)]
+    pub tool_calling: ToolCallingCapabilities,
+    #[serde(default)]
+    pub reasoning_options: ReasoningCapabilities,
+    #[serde(default)]
+    pub cache: CacheCapabilities,
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self {
+            vision: false,
+            tools: false,
+            prompt_caching: false,
+            reasoning: false,
+            server_side_state: false,
+            max_context: 0,
+            limits: CapabilityLimits::default(),
+            tool_calling: ToolCallingCapabilities::default(),
+            reasoning_options: ReasoningCapabilities::default(),
+            cache: CacheCapabilities::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CapabilityLimits {
+    pub max_images_per_request: Option<u32>,
+    pub max_tool_schema_bytes: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ToolCallingCapabilities {
+    pub parallel_tool_calls: bool,
+    pub strict_json_schema: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReasoningCapabilities {
+    pub encrypted_replay: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CacheCapabilities {
+    pub prompt_cache_key: bool,
 }
 
 /// Définition d'outil exposée au modèle (JSON Schema d'entrée).
@@ -102,8 +150,36 @@ pub struct ToolSpec {
     pub input_schema: serde_json::Value,
 }
 
+impl ToolSpec {
+    pub fn validate(&self) -> Result<(), ToolSpecValidationError> {
+        if self.name.trim().is_empty() {
+            return Err(ToolSpecValidationError::EmptyName);
+        }
+        if !self
+            .input_schema
+            .as_object()
+            .and_then(|schema| schema.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind == "object")
+        {
+            return Err(ToolSpecValidationError::SchemaMustBeObject {
+                tool: self.name.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ToolSpecValidationError {
+    #[error("tool name is empty")]
+    EmptyName,
+    #[error("tool {tool} input_schema must be a JSON schema object")]
+    SchemaMustBeObject { tool: String },
+}
+
 /// Requête canonique (ce que `ctx.request()` produit). Transcript client-side.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRequest {
     pub model: String,
     pub system: Option<String>,
@@ -112,8 +188,44 @@ pub struct CanonicalRequest {
     pub max_output_tokens: u32,
 }
 
+impl CanonicalRequest {
+    pub fn validate(&self) -> Result<(), CanonicalRequestValidationError> {
+        if self.model.trim().is_empty() {
+            return Err(CanonicalRequestValidationError::EmptyModel);
+        }
+        if self.max_output_tokens == 0 {
+            return Err(CanonicalRequestValidationError::ZeroMaxOutputTokens);
+        }
+        for (index, message) in self.messages.iter().enumerate() {
+            message.validate().map_err(|source| {
+                CanonicalRequestValidationError::InvalidMessage {
+                    index,
+                    detail: source.to_string(),
+                }
+            })?;
+        }
+        for tool in &self.tools {
+            tool.validate()
+                .map_err(CanonicalRequestValidationError::InvalidTool)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CanonicalRequestValidationError {
+    #[error("model is empty")]
+    EmptyModel,
+    #[error("max_output_tokens must be greater than zero")]
+    ZeroMaxOutputTokens,
+    #[error("message {index} is invalid: {detail}")]
+    InvalidMessage { index: usize, detail: String },
+    #[error("tool spec is invalid: {0}")]
+    InvalidTool(#[from] ToolSpecValidationError),
+}
+
 /// Réponse non-stream (utilitaire : titres, résumés de compaction).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalResponse {
     pub content: Vec<crate::message::ContentBlock>,
     pub usage: TokenUsage,
@@ -155,7 +267,8 @@ impl ProviderError {
 }
 
 /// Taxonomie d'erreurs canonique (ADR-9). Nommée `ErrorClass` partout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorClass {
     Retryable,
     RateLimited,
@@ -164,7 +277,8 @@ pub enum ErrorClass {
     InvalidRequest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AuthError {
     Expired,
     ThirdPartyBlocked,
@@ -195,6 +309,7 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{ContentBlock, Message, Role};
 
     #[test]
     fn context_error_detection() {
@@ -216,5 +331,47 @@ mod tests {
             .is_context_error()
         );
         assert!(!ProviderError::Transport("reset".into()).is_context_error());
+    }
+
+    #[test]
+    fn canonical_request_validation_rejects_invalid_message_and_tool_schema() {
+        let invalid_message = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "c1".into(),
+                content: "out".into(),
+                untrusted: true,
+                is_error: false,
+            }],
+        };
+        let req = CanonicalRequest {
+            model: "gpt".into(),
+            system: None,
+            messages: vec![invalid_message],
+            tools: vec![],
+            max_output_tokens: 100,
+        };
+        assert!(matches!(
+            req.validate(),
+            Err(CanonicalRequestValidationError::InvalidMessage { .. })
+        ));
+
+        let req = CanonicalRequest {
+            model: "gpt".into(),
+            system: None,
+            messages: vec![Message::user("ok")],
+            tools: vec![ToolSpec {
+                name: "bad".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({ "type": "string" }),
+            }],
+            max_output_tokens: 100,
+        };
+        assert!(matches!(
+            req.validate(),
+            Err(CanonicalRequestValidationError::InvalidTool(
+                ToolSpecValidationError::SchemaMustBeObject { .. }
+            ))
+        ));
     }
 }

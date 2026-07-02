@@ -23,16 +23,17 @@ pub use agent::{AgentContext, HeadlessEnd, HeadlessResult, RunConfig, run_agent,
 pub use budget::ContextBudget;
 pub use compaction::CompactKind;
 pub use deps::Deps;
-pub use error::AgentError;
+pub use error::{AgentError, ProviderFailure, ProviderFailureKind};
 pub use event::AgentEvent;
 pub use guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget};
 pub use message::{ContentBlock, Message, Role};
 pub use provider::{
-    AuthError, Capabilities, ErrorClass, Provider, ProviderError, ProviderKind, StopReason,
-    StreamEvent, TokenUsage,
+    AuthError, CacheCapabilities, Capabilities, CapabilityLimits, ErrorClass, Provider,
+    ProviderError, ProviderKind, ReasoningCapabilities, StopReason, StreamEvent, TokenUsage,
+    ToolCallingCapabilities,
 };
 pub use session::{Session, SessionEntry, SessionError};
-pub use tools::{ToolDispatch, ToolInvocation, ToolOutcome};
+pub use tools::{ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome};
 
 #[cfg(test)]
 mod loop_tests {
@@ -51,7 +52,7 @@ mod loop_tests {
         ProviderError, ProviderKind, StopReason, StreamEvent, TokenUsage,
     };
     use crate::session::{Session, SessionError};
-    use crate::tools::{ToolDispatch, ToolInvocation, ToolOutcome};
+    use crate::tools::{ToolDispatch, ToolEventSink, ToolInvocation, ToolOutcome};
     use crate::{AgentContext, AgentEvent, Deps, RunConfig, run_agent, run_headless};
 
     // ───────── doubles de test (injectés via Deps) ─────────
@@ -187,7 +188,11 @@ mod loop_tests {
     struct EchoTools;
     #[async_trait::async_trait]
     impl ToolDispatch for EchoTools {
-        async fn dispatch(&self, calls: Vec<ToolInvocation>) -> Vec<ToolOutcome> {
+        async fn dispatch(
+            &self,
+            calls: Vec<ToolInvocation>,
+            _events: ToolEventSink,
+        ) -> Vec<ToolOutcome> {
             calls
                 .into_iter()
                 .map(|c| ToolOutcome {
@@ -226,6 +231,11 @@ mod loop_tests {
                 reasoning: false,
                 server_side_state: false,
                 max_context,
+                tool_calling: crate::provider::ToolCallingCapabilities {
+                    parallel_tool_calls: true,
+                    strict_json_schema: false,
+                },
+                ..Capabilities::default()
             },
             turns: Mutex::new(turns.into()),
             summary: "RÉSUMÉ".to_string(),
@@ -575,7 +585,10 @@ mod loop_tests {
             false,
             100_000,
         );
-        let ctx = AgentContext::new("mock").push(Message::user("fais X"));
+        let ctx = AgentContext::new("mock")
+            .push(Message::user("contexte initial"))
+            .push(Message::assistant_text("ok"))
+            .push(Message::user("fais X"));
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Reactive),
@@ -608,6 +621,7 @@ mod loop_tests {
                 id: "c1".into(),
                 args_json: "{}".into(),
             },
+            StreamEvent::ToolCallEnd { id: "c1".into() },
             StreamEvent::Done {
                 stop: StopReason::ToolUse,
             },

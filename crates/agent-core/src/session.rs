@@ -11,9 +11,16 @@ use crate::message::Message;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "entry", rename_all = "snake_case")]
 pub enum SessionEntry {
+    Meta {
+        schema_version: u32,
+    },
     Message(Message),
-    CompactBoundary { kind: CompactKind },
+    CompactBoundary {
+        kind: CompactKind,
+    },
     FileHistorySnapshot(FileSnapshot),
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

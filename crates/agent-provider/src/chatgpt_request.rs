@@ -32,6 +32,7 @@ pub fn build_responses_body(req: &CanonicalRequest, reasoning_effort: Option<&st
         "instructions": instructions,
         "input": build_input(&req.messages),
         "text": { "verbosity": "low" },
+        "max_output_tokens": req.max_output_tokens,
         "include": ["reasoning.encrypted_content"],
         "tool_choice": "auto",
         "parallel_tool_calls": true,
@@ -93,7 +94,7 @@ fn user_content(blocks: &[ContentBlock]) -> Vec<Value> {
     let mut content = Vec::new();
     for b in blocks {
         match b {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text } | ContentBlock::Summary { text } => {
                 content.push(json!({ "type": "input_text", "text": text }));
             }
             ContentBlock::Image { media_type, data } => {
@@ -226,6 +227,7 @@ mod tests {
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], json!(true));
+        assert_eq!(body["max_output_tokens"], json!(4096));
         // pas de previous_response_id (SSE stateless).
         assert!(body.get("previous_response_id").is_none());
     }
@@ -256,6 +258,20 @@ mod tests {
         assert_eq!(item["role"], "user");
         assert_eq!(item["content"][0]["type"], "input_text");
         assert_eq!(item["content"][0]["text"], "bonjour");
+    }
+
+    #[test]
+    fn typed_summary_maps_to_input_text_message() {
+        let summary = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Summary {
+                text: "résumé".into(),
+            }],
+        };
+        let body = build_responses_body(&req(vec![summary], vec![], None), None);
+        let item = &body["input"][0];
+        assert_eq!(item["content"][0]["type"], "input_text");
+        assert_eq!(item["content"][0]["text"], "résumé");
     }
 
     #[test]

@@ -6,8 +6,10 @@ use crate::compaction::CompactKind;
 use crate::error::AgentError;
 use crate::message::ToolCallId;
 use crate::transition::ExhaustReason;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// Delta de texte assistant.
     Text(String),
@@ -27,14 +29,14 @@ pub enum AgentEvent {
     Error(AgentError),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallView {
     pub id: ToolCallId,
     pub name: String,
     pub input: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultView {
     pub id: ToolCallId,
     pub content: String,
@@ -43,8 +45,12 @@ pub struct ToolResultView {
     pub untrusted: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionReq {
+    pub call_id: ToolCallId,
     pub tool: String,
     pub reason: String,
+    pub input_summary: String,
+    pub input: serde_json::Value,
+    pub mode: String,
 }

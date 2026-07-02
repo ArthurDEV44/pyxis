@@ -10,10 +10,11 @@
 use std::collections::HashMap;
 
 use crate::compaction::CompactKind;
-use crate::error::AgentError;
+use crate::error::{AgentError, ProviderFailure};
 use crate::message::{ContentBlock, Message, Role, ToolCallId};
 use crate::provider::{StopReason, StreamEvent};
 use crate::tools::ToolInvocation;
+use serde::{Deserialize, Serialize};
 
 /// Erreur de CONTEXTE retenue par le withholding (PTL / max-tokens). Distincte
 /// des erreurs transitoires (backoff) — invariant 8.
@@ -28,7 +29,8 @@ pub struct PendingError {
     pub kind: ContextErrorKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExhaustReason {
     MaxTurns(u32),
     /// Kill-switch budget tokens atteint (US-014) : `spent ≥ limit`.
@@ -89,17 +91,29 @@ pub fn pre_stream_transition(
 pub fn post_stream_transition(acc: &Accumulator) -> Transition {
     let calls = acc.tool_calls();
     match acc.stop {
-        Some(StopReason::ToolUse) if !calls.is_empty() => Transition::RunTools(calls),
+        Some(StopReason::ToolUse) if !calls.is_empty() && !acc.has_open_tool_calls() => {
+            Transition::RunTools(calls)
+        }
+        Some(StopReason::ToolUse) if acc.has_open_tool_calls() => {
+            Transition::Fail(AgentError::Provider(ProviderFailure::contract(
+                "provider ended with an open tool call",
+            )))
+        }
+        Some(StopReason::ToolUse) => Transition::Fail(AgentError::Provider(
+            ProviderFailure::contract("provider signaled tool_use without tool calls"),
+        )),
         // Output tronqué EN PLEIN tool_call → l'intention d'outil est incomplète
         // et serait silencieusement perdue. max-tokens alimente le withholding
         // (invariant 8 / ARCHITECTURE §3.4) : compaction réactive puis re-stream
         // pour régénérer un appel complet, au lieu d'un EndTurn qui jette le call.
-        Some(StopReason::MaxTokens) if !calls.is_empty() => Transition::Recover(PendingError {
-            kind: ContextErrorKind::MaxTokensInput,
-        }),
-        Some(StopReason::Refusal) => {
-            Transition::Fail(AgentError::Provider("refus du modèle".to_string()))
+        Some(StopReason::MaxTokens) if !calls.is_empty() || acc.has_open_tool_calls() => {
+            Transition::Recover(PendingError {
+                kind: ContextErrorKind::MaxTokensInput,
+            })
         }
+        Some(StopReason::Refusal) => Transition::Fail(AgentError::Provider(
+            ProviderFailure::contract("refus du modèle"),
+        )),
         // EndTurn / StopSequence / MaxTokens-sans-calls (texte tronqué mais
         // exploitable) / ToolUse-sans-calls (fail-closed) / None → fin propre.
         _ => Transition::EndTurn,
@@ -113,6 +127,11 @@ struct PartialCall {
     args: String,
 }
 
+struct CompletedCall {
+    name: String,
+    input: serde_json::Value,
+}
+
 /// Accumule les `StreamEvent` (hors `Usage`, géré par le budget) en un état
 /// décisionnel.
 #[derive(Default)]
@@ -121,6 +140,7 @@ pub struct Accumulator {
     reasoning: String,
     pub stop: Option<StopReason>,
     open: HashMap<ToolCallId, PartialCall>,
+    completed: HashMap<ToolCallId, CompletedCall>,
     order: Vec<ToolCallId>,
     /// Reasoning items chiffrés capturés (US-031, replay isolé) : `(id, contenu)`,
     /// dans l'ordre d'arrivée (avant leurs function_calls). Vides si replay OFF.
@@ -133,11 +153,20 @@ impl Accumulator {
     }
 
     /// Intègre un événement (le `Usage` est traité par le budget, pas ici).
-    pub fn push(&mut self, ev: StreamEvent) {
+    pub fn push(&mut self, ev: StreamEvent) -> Result<(), AgentError> {
         match ev {
             StreamEvent::TextDelta { text } => self.text.push_str(&text),
             StreamEvent::ReasoningDelta { text } => self.reasoning.push_str(&text),
             StreamEvent::ToolCallStart { id, name } => {
+                if id.trim().is_empty() {
+                    return Err(contract_error("tool call id is empty"));
+                }
+                if name.trim().is_empty() {
+                    return Err(contract_error(format!("tool call {id} name is empty")));
+                }
+                if self.open.contains_key(&id) || self.completed.contains_key(&id) {
+                    return Err(contract_error(format!("duplicate tool call id: {id}")));
+                }
                 self.open.insert(
                     id.clone(),
                     PartialCall {
@@ -151,38 +180,51 @@ impl Accumulator {
                 if let Some(p) = self.open.get_mut(&id) {
                     p.args.push_str(&args_json);
                 } else {
-                    self.open.insert(
-                        id.clone(),
-                        PartialCall {
-                            name: String::new(),
-                            args: args_json,
-                        },
-                    );
-                    self.order.push(id);
+                    return Err(contract_error(format!(
+                        "tool call delta without start: {id}"
+                    )));
                 }
             }
             StreamEvent::EncryptedReasoning {
                 id,
                 encrypted_content,
             } => self.reasonings.push((id, encrypted_content)),
-            StreamEvent::ToolCallEnd { .. } | StreamEvent::Usage { .. } => {}
+            StreamEvent::ToolCallEnd { id } => {
+                let Some(partial) = self.open.remove(&id) else {
+                    return Err(contract_error(format!("tool call end without start: {id}")));
+                };
+                let input = parse_tool_args(&id, &partial.args)?;
+                self.completed.insert(
+                    id,
+                    CompletedCall {
+                        name: partial.name,
+                        input,
+                    },
+                );
+            }
+            StreamEvent::Usage { .. } => {}
             StreamEvent::Done { stop } => self.stop = Some(stop),
         }
+        Ok(())
     }
 
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// Appels d'outils complets (args concaténés → JSON ; fallback `null`).
+    pub fn has_open_tool_calls(&self) -> bool {
+        !self.open.is_empty()
+    }
+
+    /// Appels d'outils complets, validés à `ToolCallEnd`.
     pub fn tool_calls(&self) -> Vec<ToolInvocation> {
         self.order
             .iter()
             .filter_map(|id| {
-                self.open.get(id).map(|p| ToolInvocation {
+                self.completed.get(id).map(|p| ToolInvocation {
                     id: id.clone(),
                     name: p.name.clone(),
-                    input: serde_json::from_str(&p.args).unwrap_or(serde_json::Value::Null),
+                    input: p.input.clone(),
                 })
             })
             .collect()
@@ -210,11 +252,11 @@ impl Accumulator {
             });
         }
         for id in &self.order {
-            if let Some(p) = self.open.get(id) {
+            if let Some(p) = self.completed.get(id) {
                 content.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: p.name.clone(),
-                    input: serde_json::from_str(&p.args).unwrap_or(serde_json::Value::Null),
+                    input: p.input.clone(),
                 });
             }
         }
@@ -225,8 +267,23 @@ impl Accumulator {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.reasoning.is_empty() && self.order.is_empty()
+        self.text.is_empty()
+            && self.reasoning.is_empty()
+            && self.reasonings.is_empty()
+            && self.completed.is_empty()
     }
+}
+
+fn parse_tool_args(id: &str, args: &str) -> Result<serde_json::Value, AgentError> {
+    if args.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(args)
+        .map_err(|e| contract_error(format!("invalid JSON arguments for tool call {id}: {e}")))
+}
+
+fn contract_error(message: impl Into<String>) -> AgentError {
+    AgentError::Provider(ProviderFailure::contract(message))
 }
 
 #[cfg(test)]
@@ -236,7 +293,7 @@ mod tests {
     fn acc_with(events: Vec<StreamEvent>) -> Accumulator {
         let mut a = Accumulator::new();
         for e in events {
-            a.push(e);
+            a.push(e).unwrap();
         }
         a
     }
@@ -305,7 +362,7 @@ mod tests {
         let a = acc_with(vec![StreamEvent::Done {
             stop: StopReason::ToolUse,
         }]);
-        assert!(matches!(post_stream_transition(&a), Transition::EndTurn));
+        assert!(matches!(post_stream_transition(&a), Transition::Fail(_)));
     }
 
     #[test]
@@ -363,6 +420,7 @@ mod tests {
                 id: "c1".into(),
                 args_json: "{}".into(),
             },
+            StreamEvent::ToolCallEnd { id: "c1".into() },
             StreamEvent::Done {
                 stop: StopReason::ToolUse,
             },
@@ -393,6 +451,7 @@ mod tests {
                 id: "c1".into(),
                 args_json: "{}".into(),
             },
+            StreamEvent::ToolCallEnd { id: "c1".into() },
             StreamEvent::Done {
                 stop: StopReason::ToolUse,
             },
@@ -400,5 +459,36 @@ mod tests {
         let m = a.to_assistant_message();
         assert_eq!(m.role, Role::Assistant);
         assert_eq!(m.content.len(), 2);
+    }
+
+    #[test]
+    fn accumulator_rejects_delta_without_start() {
+        let mut a = Accumulator::new();
+        let err = a
+            .push(StreamEvent::ToolCallDelta {
+                id: "c1".into(),
+                args_json: "{}".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Provider(_)));
+    }
+
+    #[test]
+    fn accumulator_rejects_invalid_json_at_tool_end() {
+        let mut a = Accumulator::new();
+        a.push(StreamEvent::ToolCallStart {
+            id: "c1".into(),
+            name: "bash".into(),
+        })
+        .unwrap();
+        a.push(StreamEvent::ToolCallDelta {
+            id: "c1".into(),
+            args_json: "{\"cmd\"".into(),
+        })
+        .unwrap();
+        let err = a
+            .push(StreamEvent::ToolCallEnd { id: "c1".into() })
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Provider(_)));
     }
 }

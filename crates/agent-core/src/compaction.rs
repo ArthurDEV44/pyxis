@@ -39,10 +39,10 @@ const SUMMARY_COMBINED_MAX: usize = 32_000;
 /// Vrai si `msg` est un message-résumé (produit par une compaction précédente).
 pub fn is_summary_message(msg: &Message) -> bool {
     msg.role == Role::User
-        && msg
-            .content
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX)))
+        && msg.content.iter().any(|b| {
+            matches!(b, ContentBlock::Summary { .. })
+                || matches!(b, ContentBlock::Text { text } if text.starts_with(SUMMARY_PREFIX))
+        })
 }
 
 const SUMMARY_SYSTEM: &str = "Tu résumes une conversation entre un utilisateur et un agent de codage. \
@@ -200,7 +200,7 @@ pub async fn full_compact(
     messages.clear();
     messages.push(Message {
         role: Role::User,
-        content: vec![ContentBlock::Text {
+        content: vec![ContentBlock::Summary {
             text: format!("{SUMMARY_PREFIX}{combined}"),
         }],
     });
@@ -243,6 +243,7 @@ fn strip_for_summary(msg: &Message) -> Message {
                     ContentBlock::Image { .. }
                         | ContentBlock::Thinking { .. }
                         | ContentBlock::EncryptedReasoning { .. }
+                        | ContentBlock::Summary { .. }
                 )
             })
             .cloned()
@@ -296,6 +297,7 @@ mod tests {
             reasoning: false,
             server_side_state: false,
             max_context: 100_000,
+            ..Capabilities::default()
         }
     }
 
@@ -503,6 +505,17 @@ mod tests {
         assert!(is_summary_message(&s));
         assert!(!is_summary_message(&Message::user("question normale")));
         assert!(!is_summary_message(&Message::assistant_text("réponse")));
+    }
+
+    #[test]
+    fn is_summary_message_detects_typed_summary() {
+        let s = Message {
+            role: Role::User,
+            content: vec![ContentBlock::Summary {
+                text: "corps".into(),
+            }],
+        };
+        assert!(is_summary_message(&s));
     }
 
     #[test]

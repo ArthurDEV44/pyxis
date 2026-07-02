@@ -13,8 +13,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use agent_core::event::PermissionReq;
 use agent_core::provider::ToolSpec;
-use agent_core::tools::{ToolDispatch, ToolInvocation, ToolOutcome};
+use agent_core::tools::{
+    ToolDispatch, ToolDispatchEvent, ToolEventSink, ToolInvocation, ToolOutcome,
+};
 use async_trait::async_trait;
 use futures_util::stream::{self, StreamExt};
 
@@ -99,9 +102,14 @@ impl Registry {
         out
     }
 
+    /// Chemin de confort pour les tests et appels directs au registre.
+    pub async fn dispatch(&self, calls: Vec<ToolInvocation>) -> Vec<ToolOutcome> {
+        <Self as ToolDispatch>::dispatch(self, calls, ToolEventSink::default()).await
+    }
+
     /// Pipeline strict d'un seul appel. Ne panique jamais : retourne toujours un
     /// `ToolOutcome` corrélé par `id`.
-    async fn run_one(&self, call: ToolInvocation) -> ToolOutcome {
+    async fn run_one(&self, call: ToolInvocation, events: ToolEventSink) -> ToolOutcome {
         let id = call.id.clone();
         let Some(tool) = self.tools.get(&call.name) else {
             return err_outcome(id, format!("outil inconnu: {}", call.name));
@@ -142,6 +150,14 @@ impl Registry {
                     input_summary: summarize(&call.input),
                     input: call.input.clone(),
                 };
+                events.emit(ToolDispatchEvent::PermissionAsk(PermissionReq {
+                    call_id: id.clone(),
+                    tool: req.tool.clone(),
+                    reason: req.reason.clone(),
+                    input_summary: req.input_summary.clone(),
+                    input: req.input.clone(),
+                    mode: format!("{:?}", self.mode),
+                }));
                 if !self.approver.approve(&req).await {
                     return err_outcome(
                         id,
@@ -177,7 +193,11 @@ impl Registry {
 
 #[async_trait]
 impl ToolDispatch for Registry {
-    async fn dispatch(&self, calls: Vec<ToolInvocation>) -> Vec<ToolOutcome> {
+    async fn dispatch(
+        &self,
+        calls: Vec<ToolInvocation>,
+        events: ToolEventSink,
+    ) -> Vec<ToolOutcome> {
         // Nouveau cycle de dispatch : fait décroître la fenêtre de taint.
         self.taint.begin_cycle();
 
@@ -203,7 +223,10 @@ impl ToolDispatch for Registry {
         // le taint AVANT que la phase série (mutations/Bash) ne vérifie ses
         // permissions → la défense taint intra-batch est correcte.
         let concurrent_results: Vec<(usize, ToolOutcome)> = stream::iter(concurrent)
-            .map(|(i, call)| async move { (i, self.run_one(call).await) })
+            .map(|(i, call)| {
+                let events = events.clone();
+                async move { (i, self.run_one(call, events).await) }
+            })
             .buffer_unordered(CONCURRENCY)
             .collect()
             .await;
@@ -211,7 +234,7 @@ impl ToolDispatch for Registry {
 
         // Batch série : mutations une par une.
         for (i, call) in serial {
-            indexed.push((i, self.run_one(call).await));
+            indexed.push((i, self.run_one(call, events.clone()).await));
         }
 
         // Restaure l'ordre du batch (transcripts/tests déterministes).

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agent_core::tools::{ToolDispatch, ToolInvocation, ToolOutcome};
+use agent_core::tools::{ToolInvocation, ToolOutcome};
 use async_trait::async_trait;
 use serde::Deserialize;
 
@@ -736,6 +736,9 @@ async fn default_registry_exposes_six_tool_specs() {
     let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, ["bash", "edit", "glob", "grep", "read", "write"]);
     assert!(specs.iter().all(|s| !s.description.is_empty()));
+    for spec in specs {
+        spec.validate().unwrap();
+    }
 }
 
 // ══════════════════════════ EP-007 ══════════════════════════

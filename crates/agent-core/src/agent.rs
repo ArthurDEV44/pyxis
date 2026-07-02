@@ -14,13 +14,14 @@ use futures_util::{Stream, StreamExt};
 use crate::budget::{ContextBudget, estimate_input};
 use crate::compaction::{CompactKind, CompactionState, full_compact, microcompact};
 use crate::deps::Deps;
-use crate::error::AgentError;
+use crate::error::{AgentError, ProviderFailure};
 use crate::event::{AgentEvent, ToolCallView, ToolResultView};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
 use crate::message::Message;
 use crate::provider::{
     CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
 };
+use crate::tools::{ToolDispatchEvent, ToolEventSink};
 use crate::transition::{
     Accumulator, ContextErrorKind, ExhaustReason, PendingError, Transition, post_stream_transition,
     pre_stream_transition,
@@ -178,9 +179,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         loop {
             iterations += 1;
             if iterations > iter_cap {
-                yield AgentEvent::Error(AgentError::Provider(
-                    "garde-fou d'itérations atteint".to_string(),
-                ));
+                yield AgentEvent::Error(AgentError::Provider(ProviderFailure::contract(
+                    "garde-fou d'itérations atteint",
+                )));
                 return;
             }
 
@@ -252,6 +253,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         &tools,
                         config.max_output_tokens,
                     );
+                    if let Err(e) = req.validate() {
+                        yield AgentEvent::Error(AgentError::InvalidRequest(e.to_string()));
+                        return;
+                    }
 
                     let mut stream = match deps.provider.stream(req).await {
                         Ok(s) => s,
@@ -297,11 +302,17 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         match ev {
                             Ok(StreamEvent::TextDelta { text }) => {
                                 yield AgentEvent::Text(text.clone());
-                                acc.push(StreamEvent::TextDelta { text });
+                                if let Err(e) = acc.push(StreamEvent::TextDelta { text }) {
+                                    yield AgentEvent::Error(e);
+                                    return;
+                                }
                             }
                             Ok(StreamEvent::ReasoningDelta { text }) => {
                                 yield AgentEvent::Reasoning(text.clone());
-                                acc.push(StreamEvent::ReasoningDelta { text });
+                                if let Err(e) = acc.push(StreamEvent::ReasoningDelta { text }) {
+                                    yield AgentEvent::Error(e);
+                                    return;
+                                }
                             }
                             Ok(StreamEvent::Usage { usage }) => {
                                 // Sonde d'observabilité (US-021 AC3 / US-029) : compare
@@ -321,7 +332,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 budget.observe_usage(usage);
                                 last_usage = Some(usage);
                             }
-                            Ok(other) => acc.push(other),
+                            Ok(other) => {
+                                if let Err(e) = acc.push(other) {
+                                    yield AgentEvent::Error(e);
+                                    return;
+                                }
+                            }
                             Err(e) => {
                                 stream_err = Some(e);
                                 break;
@@ -442,7 +458,12 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     is_error: true,
                                     untrusted: false,
                                 });
-                                messages.push(Message::tool_result(c.id.clone(), msg, true));
+                                messages.push(Message::tool_result_with_trust(
+                                    c.id.clone(),
+                                    msg,
+                                    true,
+                                    false,
+                                ));
                             }
                             // reboucle : le modèle reçoit le signal et peut corriger.
                         }
@@ -454,7 +475,32 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     input: c.input.clone(),
                                 });
                             }
-                            let outcomes = deps.tools.dispatch(calls).await;
+                            let (tool_event_tx, mut tool_event_rx) =
+                                tokio::sync::mpsc::unbounded_channel();
+                            let dispatch =
+                                deps.tools.dispatch(calls, ToolEventSink::new(tool_event_tx));
+                            tokio::pin!(dispatch);
+                            let mut tool_events_open = true;
+                            let outcomes = loop {
+                                tokio::select! {
+                                    event = tool_event_rx.recv(), if tool_events_open => {
+                                        match event {
+                                            Some(ToolDispatchEvent::PermissionAsk(req)) => {
+                                                yield AgentEvent::PermissionAsk(req);
+                                            }
+                                            None => tool_events_open = false,
+                                        }
+                                    }
+                                    outcomes = &mut dispatch => break outcomes,
+                                }
+                            };
+                            while let Ok(event) = tool_event_rx.try_recv() {
+                                match event {
+                                    ToolDispatchEvent::PermissionAsk(req) => {
+                                        yield AgentEvent::PermissionAsk(req);
+                                    }
+                                }
+                            }
                             for o in &outcomes {
                                 yield AgentEvent::ToolResult(ToolResultView {
                                     id: o.id.clone(),
@@ -462,10 +508,11 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     is_error: o.is_error,
                                     untrusted: o.untrusted,
                                 });
-                                messages.push(Message::tool_result(
+                                messages.push(Message::tool_result_with_trust(
                                     o.id.clone(),
                                     o.content.clone(),
                                     o.is_error,
+                                    o.untrusted,
                                 ));
                             }
                             // US-030 MidTurn : les tool_results qu'on vient d'ajouter

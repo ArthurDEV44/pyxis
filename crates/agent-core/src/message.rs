@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 
 pub type ToolCallId = String;
 
+const fn default_untrusted() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -34,6 +38,10 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: ToolCallId,
         content: String,
+        /// Résultat d'outil non fiable par défaut. Les anciens JSONL sans ce champ
+        /// sont relus en fail-closed.
+        #[serde(default = "default_untrusted")]
+        untrusted: bool,
         #[serde(default)]
         is_error: bool,
     },
@@ -48,6 +56,11 @@ pub enum ContentBlock {
     EncryptedReasoning {
         id: String,
         encrypted_content: String,
+    },
+    /// Résumé de compaction typé. Les anciens logs utilisaient un message user texte
+    /// préfixé; ce variant évite les collisions avec un vrai prompt utilisateur.
+    Summary {
+        text: String,
     },
 }
 
@@ -78,11 +91,21 @@ impl Message {
         content: impl Into<String>,
         is_error: bool,
     ) -> Self {
+        Self::tool_result_with_trust(id, content, is_error, true)
+    }
+
+    pub fn tool_result_with_trust(
+        id: impl Into<ToolCallId>,
+        content: impl Into<String>,
+        is_error: bool,
+        untrusted: bool,
+    ) -> Self {
         Self::single(
             Role::Tool,
             ContentBlock::ToolResult {
                 tool_use_id: id.into(),
                 content: content.into(),
+                untrusted,
                 is_error,
             },
         )
@@ -99,8 +122,11 @@ impl Message {
     pub fn text(&self) -> String {
         let mut out = String::new();
         for b in &self.content {
-            if let ContentBlock::Text { text } = b {
-                out.push_str(text);
+            match b {
+                ContentBlock::Text { text } | ContentBlock::Summary { text } => {
+                    out.push_str(text);
+                }
+                _ => {}
             }
         }
         out
@@ -128,6 +154,63 @@ impl Message {
             .retain(|b| !matches!(b, ContentBlock::Image { .. }));
         before - self.content.len()
     }
+
+    pub fn validate(&self) -> Result<(), MessageValidationError> {
+        if self.content.is_empty() {
+            return Err(MessageValidationError::EmptyContent);
+        }
+        for block in &self.content {
+            match (self.role, block) {
+                (Role::System, ContentBlock::Text { .. }) => {}
+                (
+                    Role::User,
+                    ContentBlock::Text { .. }
+                    | ContentBlock::Image { .. }
+                    | ContentBlock::Summary { .. },
+                ) => {}
+                (
+                    Role::Assistant,
+                    ContentBlock::Text { .. }
+                    | ContentBlock::Thinking { .. }
+                    | ContentBlock::ToolUse { .. }
+                    | ContentBlock::EncryptedReasoning { .. },
+                ) => {}
+                (Role::Tool, ContentBlock::ToolResult { .. }) => {}
+                _ => {
+                    return Err(MessageValidationError::InvalidBlockForRole {
+                        role: self.role,
+                        block_type: block.kind(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ContentBlock {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ContentBlock::Text { .. } => "text",
+            ContentBlock::Thinking { .. } => "thinking",
+            ContentBlock::ToolUse { .. } => "tool_use",
+            ContentBlock::ToolResult { .. } => "tool_result",
+            ContentBlock::Image { .. } => "image",
+            ContentBlock::EncryptedReasoning { .. } => "encrypted_reasoning",
+            ContentBlock::Summary { .. } => "summary",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MessageValidationError {
+    #[error("message content is empty")]
+    EmptyContent,
+    #[error("block {block_type} is invalid for role {role:?}")]
+    InvalidBlockForRole {
+        role: Role,
+        block_type: &'static str,
+    },
 }
 
 #[cfg(test)]
@@ -185,5 +268,29 @@ mod tests {
     fn tool_result_detection() {
         assert!(Message::tool_result("id1", "out", false).is_tool_result());
         assert!(!Message::user("hi").is_tool_result());
+    }
+
+    #[test]
+    fn tool_result_untrusted_defaults_to_true_for_old_json() {
+        let json = r#"{"type":"tool_result","tool_use_id":"c1","content":"out","is_error":false}"#;
+        let block: ContentBlock = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            block,
+            ContentBlock::ToolResult {
+                untrusted: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_tool_result_in_assistant_message() {
+        let msg = Message::assistant(vec![ContentBlock::ToolResult {
+            tool_use_id: "c1".into(),
+            content: "out".into(),
+            untrusted: true,
+            is_error: false,
+        }]);
+        assert!(msg.validate().is_err());
     }
 }

@@ -19,8 +19,9 @@ use std::time::Duration;
 use agent_auth::OAuthCredential;
 use agent_core::message::ContentBlock;
 use agent_core::provider::{
-    AuthError, CanonicalRequest, CanonicalResponse, Capabilities, ErrorClass, Provider,
-    ProviderError, ProviderKind, StopReason, StreamEvent, TokenUsage,
+    AuthError, CacheCapabilities, CanonicalRequest, CanonicalResponse, Capabilities,
+    CapabilityLimits, ErrorClass, Provider, ProviderError, ProviderKind, ReasoningCapabilities,
+    StopReason, StreamEvent, TokenUsage, ToolCallingCapabilities,
 };
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -133,6 +134,20 @@ impl OpenAiChatGptProvider {
                 // CLÉ : SSE stateless → le canonique client-side mappe (PROVIDERS §4.1).
                 server_side_state: false,
                 max_context,
+                limits: CapabilityLimits {
+                    max_images_per_request: None,
+                    max_tool_schema_bytes: Some(64 * 1024),
+                },
+                tool_calling: ToolCallingCapabilities {
+                    parallel_tool_calls: true,
+                    strict_json_schema: false,
+                },
+                reasoning_options: ReasoningCapabilities {
+                    encrypted_replay: false,
+                },
+                cache: CacheCapabilities {
+                    prompt_cache_key: true,
+                },
             },
             reasoning_effort,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,

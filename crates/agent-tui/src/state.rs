@@ -228,13 +228,14 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
                     if let ContentBlock::ToolResult {
                         tool_use_id,
                         content,
+                        untrusted,
                         is_error,
                     } = b
                     {
                         blocks.push(Block::ToolResult {
                             call_id: tool_use_id.clone(),
                             content: content.clone(),
-                            untrusted: false,
+                            untrusted: *untrusted,
                             is_error: *is_error,
                         });
                     }

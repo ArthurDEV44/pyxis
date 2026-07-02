@@ -2,6 +2,9 @@
 //! permissions, taint, pipeline) est `agent-tools` (EP-003) ; le cœur ne connaît
 //! que ce trait. En EP-002, un mock suffit à fermer la boucle stream→outil.
 
+use tokio::sync::mpsc;
+
+use crate::event::PermissionReq;
 use crate::message::ToolCallId;
 
 /// Un appel d'outil demandé par le modèle (args déjà réassemblés en JSON valide).
@@ -23,9 +26,32 @@ pub struct ToolOutcome {
     pub untrusted: bool,
 }
 
+#[derive(Debug, Clone)]
+pub enum ToolDispatchEvent {
+    PermissionAsk(PermissionReq),
+}
+
+#[derive(Clone, Default)]
+pub struct ToolEventSink {
+    tx: Option<mpsc::UnboundedSender<ToolDispatchEvent>>,
+}
+
+impl ToolEventSink {
+    pub fn new(tx: mpsc::UnboundedSender<ToolDispatchEvent>) -> Self {
+        Self { tx: Some(tx) }
+    }
+
+    pub fn emit(&self, event: ToolDispatchEvent) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(event);
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait ToolDispatch: Send + Sync {
     /// Exécute un batch d'appels et retourne leurs résultats (ordre non garanti ;
     /// chaque résultat est corrélé par `id`).
-    async fn dispatch(&self, calls: Vec<ToolInvocation>) -> Vec<ToolOutcome>;
+    async fn dispatch(&self, calls: Vec<ToolInvocation>, events: ToolEventSink)
+    -> Vec<ToolOutcome>;
 }

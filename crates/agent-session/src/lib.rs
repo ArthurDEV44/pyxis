@@ -29,6 +29,7 @@ use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
 
 /// Nom du fichier de session dans un dossier de travail.
 pub const SESSION_FILE: &str = "session.jsonl";
+pub const SESSION_SCHEMA_VERSION: u32 = 1;
 
 fn io_err(e: impl std::fmt::Display) -> SessionError {
     SessionError::Io(e.to_string())
@@ -48,15 +49,25 @@ impl JsonlSession {
     /// Crée (ou rouvre en append) le fichier de session dans `dir`.
     pub fn create_in(dir: &Path) -> Result<Self, SessionError> {
         std::fs::create_dir_all(dir).map_err(io_err)?;
+        let path = dir.join(SESSION_FILE);
+        let is_empty = std::fs::metadata(&path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(dir.join(SESSION_FILE))
+            .open(path)
             .map_err(io_err)?;
-        Ok(Self {
+        let session = Self {
             file: Mutex::new(file),
             cursor: Mutex::new(0),
-        })
+        };
+        if is_empty {
+            session.append(&SessionEntry::Meta {
+                schema_version: SESSION_SCHEMA_VERSION,
+            })?;
+        }
+        Ok(session)
     }
 
     /// Crée (ou rouvre en append) une session sur un fichier nommé (un fichier
@@ -65,15 +76,24 @@ impl JsonlSession {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
+        let is_empty = std::fs::metadata(path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .map_err(io_err)?;
-        Ok(Self {
+        let session = Self {
             file: Mutex::new(file),
             cursor: Mutex::new(0),
-        })
+        };
+        if is_empty {
+            session.append(&SessionEntry::Meta {
+                schema_version: SESSION_SCHEMA_VERSION,
+            })?;
+        }
+        Ok(session)
     }
 
     /// Bascule le fichier de persistance vers `path` (resume d'une session
@@ -83,6 +103,9 @@ impl JsonlSession {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(io_err)?;
         }
+        let is_empty = std::fs::metadata(path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -96,6 +119,11 @@ impl JsonlSession {
             .cursor
             .lock()
             .map_err(|_| SessionError::Io("verrou curseur empoisonné".into()))? = cursor;
+        if is_empty {
+            self.append(&SessionEntry::Meta {
+                schema_version: SESSION_SCHEMA_VERSION,
+            })?;
+        }
         Ok(())
     }
 
@@ -212,6 +240,7 @@ pub fn resume_file(path: &Path) -> Result<ResumedSession, SessionError> {
                 out.compactions += 1;
             }
             Ok(SessionEntry::FileHistorySnapshot(_)) => {}
+            Ok(SessionEntry::Meta { .. } | SessionEntry::Unknown) => {}
             Err(e) => {
                 if i == n - 1 {
                     // dernière ligne tronquée par un crash → ignorée (AC3).
@@ -361,6 +390,8 @@ mod tests {
         assert_eq!(resumed.messages[0].text(), "salut");
         assert_eq!(resumed.messages[1].text(), "bonjour");
         assert!(!resumed.skipped_partial);
+        let raw = std::fs::read_to_string(dir.join(SESSION_FILE)).unwrap();
+        assert!(raw.lines().next().unwrap().contains("\"entry\":\"meta\""));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -538,6 +569,23 @@ mod tests {
         // ligne corrompue AU MILIEU (suivie d'une ligne valide) → vraie corruption
         std::fs::write(&path, format!("{valid}\nGARBAGE\n{valid}\n")).unwrap();
         assert!(resume_file(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_ignores_unknown_future_entry() {
+        let dir = tmp("unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_FILE);
+        let valid = serde_json::to_string(&SessionEntry::Message(Message::user("ok"))).unwrap();
+        std::fs::write(
+            &path,
+            format!("{{\"entry\":\"future_feature\",\"x\":1}}\n{valid}\n"),
+        )
+        .unwrap();
+        let resumed = resume_file(&path).unwrap();
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(resumed.messages[0].text(), "ok");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
