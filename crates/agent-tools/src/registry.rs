@@ -51,6 +51,7 @@ impl Registry {
             mode: PermissionMode::default(),
             approver: None,
             taint_window: crate::taint::DEFAULT_WINDOW,
+            initial_taint_recent: false,
             ctx: ToolCtx::new(workspace),
         }
     }
@@ -62,6 +63,12 @@ impl Registry {
     /// Le taint est-il récent ? (exposé pour les tests / l'observabilité.)
     pub fn taint_recent(&self) -> bool {
         self.taint.is_recent()
+    }
+
+    pub fn seed_taint(&self, recent_untrusted: bool) {
+        if recent_untrusted {
+            self.taint.seed_recent();
+        }
     }
 
     /// Specs exposées au modèle (descriptions cappées), pour `AgentContext.tools`.
@@ -151,9 +158,11 @@ impl Registry {
                 );
             }
             Resolved::Ask => {
+                let taint_forced = pctx.taint_recent && tool.is_taint_sensitive();
                 let req = PermissionRequest {
                     tool: call.name.clone(),
-                    reason: ask_reason(pctx.taint_recent, tool.is_taint_sensitive()),
+                    reason: ask_reason(taint_forced),
+                    taint_forced,
                     input_summary: summarize(&call.input),
                     input: call.input.clone(),
                 };
@@ -161,6 +170,7 @@ impl Registry {
                     call_id: id.clone(),
                     tool: req.tool.clone(),
                     reason: req.reason.clone(),
+                    taint_forced: req.taint_forced,
                     input_summary: req.input_summary.clone(),
                     input: req.input.clone(),
                     mode: format!("{:?}", self.mode),
@@ -255,11 +265,16 @@ impl Registry {
 
 #[async_trait]
 impl ToolDispatch for Registry {
+    fn seed_taint(&self, recent_untrusted: bool) {
+        Registry::seed_taint(self, recent_untrusted);
+    }
+
     async fn dispatch(
         &self,
         calls: Vec<ToolInvocation>,
         events: ToolEventSink,
     ) -> Vec<ToolOutcome> {
+        let started_tainted = self.taint.is_recent();
         // Nouveau cycle de dispatch : fait décroître la fenêtre de taint.
         self.taint.begin_cycle();
 
@@ -285,7 +300,14 @@ impl ToolDispatch for Registry {
 
         // Restaure l'ordre du batch (transcripts/tests déterministes).
         indexed.sort_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, o)| o).collect()
+        let outcomes: Vec<ToolOutcome> = indexed.into_iter().map(|(_, o)| o).collect();
+        if started_tainted
+            && !outcomes.is_empty()
+            && outcomes.iter().all(|o| o.is_error && !o.untrusted)
+        {
+            self.taint.mark();
+        }
+        outcomes
     }
 }
 
@@ -319,8 +341,8 @@ fn err_outcome_tainted(
     }
 }
 
-fn ask_reason(taint_recent: bool, is_sensitive: bool) -> String {
-    if taint_recent && is_sensitive {
+fn ask_reason(taint_forced: bool) -> String {
+    if taint_forced {
         "action sensible issue de contenu non fiable (défense injection)".to_string()
     } else {
         "action sensible nécessitant confirmation".to_string()
@@ -355,6 +377,7 @@ pub struct RegistryBuilder {
     mode: PermissionMode,
     approver: Option<Arc<dyn Approver>>,
     taint_window: u64,
+    initial_taint_recent: bool,
     ctx: ToolCtx,
 }
 
@@ -369,6 +392,10 @@ impl RegistryBuilder {
     }
     pub fn taint_window(mut self, window: u64) -> Self {
         self.taint_window = window;
+        self
+    }
+    pub fn initial_taint_recent(mut self, recent: bool) -> Self {
+        self.initial_taint_recent = recent;
         self
     }
     pub fn timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -396,12 +423,14 @@ impl RegistryBuilder {
         self
     }
     pub fn build(self) -> Registry {
-        Registry {
+        let registry = Registry {
             tools: self.tools,
             mode: self.mode,
             approver: self.approver.unwrap_or_else(|| Arc::new(AutoDeny)),
             taint: TaintTracker::new(self.taint_window),
             ctx: self.ctx,
-        }
+        };
+        registry.seed_taint(self.initial_taint_recent);
+        registry
     }
 }

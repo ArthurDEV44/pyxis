@@ -147,7 +147,7 @@ pub fn estimate_input(messages: &[Message], counter: &dyn TokenCounter) -> u32 {
             total += match b {
                 ContentBlock::Text { text }
                 | ContentBlock::Thinking { text }
-                | ContentBlock::Summary { text } => counter.count_text(text),
+                | ContentBlock::Summary { text, .. } => counter.count_text(text),
                 ContentBlock::ToolUse { name, input, .. } => {
                     counter.count_text(name) + counter.count_text(&input.to_string())
                 }

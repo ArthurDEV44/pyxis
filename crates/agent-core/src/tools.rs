@@ -51,6 +51,10 @@ impl ToolEventSink {
 
 #[async_trait::async_trait]
 pub trait ToolDispatch: Send + Sync {
+    /// Reseed le taint de permission depuis un transcript repris. Les
+    /// implémentations sans taint peuvent ignorer ce signal.
+    fn seed_taint(&self, _recent_untrusted: bool) {}
+
     /// Exécute un batch d'appels et retourne leurs résultats (ordre non garanti ;
     /// chaque résultat est corrélé par `id`).
     async fn dispatch(&self, calls: Vec<ToolInvocation>, events: ToolEventSink)

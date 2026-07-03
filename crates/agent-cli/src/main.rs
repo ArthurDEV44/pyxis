@@ -17,7 +17,7 @@ use std::sync::Arc;
 use agent_auth::store;
 use agent_core::clock::SystemClock;
 use agent_core::guardrail::CostBudget;
-use agent_core::message::Message;
+use agent_core::message::{Message, recent_untrusted_content};
 use agent_core::provider::Provider;
 use agent_core::{AgentContext, Deps, RunConfig};
 use agent_provider::{KEYRING_ACCOUNT, OpenAiChatGptProvider};
@@ -29,6 +29,8 @@ use agent_tools::{Bash, Edit, Glob, Grep, Read, Registry, Write};
 use crate::approver::TuiApprover;
 use crate::interactive::InteractiveConfig;
 use crate::session::SharedSession;
+
+const RESUME_TAINT_SCAN_MESSAGES: usize = 8;
 
 struct Args {
     prompt: Option<String>,
@@ -42,6 +44,12 @@ struct Args {
     input_cost_micro_per_ktok: Option<String>,
     output_cost_micro_per_ktok: Option<String>,
     overload_fallback_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliPermissionPolicy {
+    mode: PermissionMode,
+    auto_approve_routine: bool,
 }
 
 fn parse_args() -> Args {
@@ -192,6 +200,44 @@ fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
     })
 }
 
+fn permission_policy(headless: bool, yes: bool, sandbox_enforced: bool) -> CliPermissionPolicy {
+    if !headless {
+        return CliPermissionPolicy {
+            mode: PermissionMode::Default,
+            auto_approve_routine: false,
+        };
+    }
+    if !yes {
+        return CliPermissionPolicy {
+            mode: PermissionMode::Default,
+            auto_approve_routine: false,
+        };
+    }
+    CliPermissionPolicy {
+        mode: PermissionMode::AcceptEdits,
+        auto_approve_routine: sandbox_enforced,
+    }
+}
+
+fn sandbox_enforced_from_args(args: &Args, workspace: &std::path::Path) -> bool {
+    if !args.sandbox {
+        eprintln!("[sandbox] désactivé par --no-sandbox : outils sensibles non auto-approuvés");
+        return false;
+    }
+    match agent_sandbox::enforce_process(workspace) {
+        Ok(status) => {
+            if let Some(w) = status.warning() {
+                eprintln!("[sandbox] {w}");
+            }
+            status == agent_sandbox::fs::SandboxStatus::Enforced
+        }
+        Err(e) => {
+            eprintln!("[sandbox] échec d'application : {e} ; outils sensibles non auto-approuvés");
+            false
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = parse_args();
     let workspace = std::env::current_dir()?;
@@ -215,21 +261,19 @@ fn main() -> anyhow::Result<()> {
     let context_msgs = context::messages(&workspace, &context::today_utc());
 
     // Sandbox FS AVANT le runtime (thread principal → hérité par les workers).
-    if args.sandbox {
-        match agent_sandbox::enforce_process(&workspace) {
-            Ok(status) => {
-                if let Some(w) = status.warning() {
-                    eprintln!("[sandbox] {w}");
-                }
-            }
-            Err(e) => eprintln!("[sandbox] échec d'application : {e} — écritures non confinées"),
-        }
-    }
+    let sandbox_enforced = sandbox_enforced_from_args(&args, &workspace);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run(args, workspace, skills, mcp_config, context_msgs))
+    rt.block_on(run(
+        args,
+        workspace,
+        skills,
+        mcp_config,
+        context_msgs,
+        sandbox_enforced,
+    ))
 }
 
 /// Découvre les serveurs MCP avant le sandbox : `<workspace>/.mcp.json` (priorité
@@ -279,6 +323,7 @@ async fn run(
     skills: Vec<String>,
     mcp_config: agent_mcp::McpConfigFile,
     context_msgs: Vec<Message>,
+    sandbox_enforced: bool,
 ) -> anyhow::Result<()> {
     let run_config = run_config_from_args(&args)?;
     // 1. Credential abonnement ChatGPT (keyring). Absente → on guide vers le login.
@@ -333,6 +378,10 @@ async fn run(
             .lock()
             .map_err(|_| anyhow::anyhow!("session : snapshot empoisonné"))? = initial_messages;
     }
+    let initial_taint_recent = recent_untrusted_content(
+        &conversation.lock().map(|g| g.clone()).unwrap_or_default(),
+        RESUME_TAINT_SCAN_MESSAGES,
+    );
 
     // Objectif de session persistant (`/goal`) : chargé du sidecar `.pyxis/goal`
     // (survit au redémarrage), composé dans le system prompt à chaque tour.
@@ -344,22 +393,21 @@ async fn run(
     // 4. Registry d'outils + approbateur (TUI en interactif, auto en headless).
     let headless = args.prompt.is_some();
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
-    let (mode, approver): (PermissionMode, Arc<dyn agent_tools::permission::Approver>) = if headless
-    {
-        // -p : pas d'interlocuteur. --yes auto-accepte ; sinon refuse le sensible.
-        let appr: Arc<dyn agent_tools::permission::Approver> = if args.yes {
-            Arc::new(AutoApprove)
+    let policy = permission_policy(headless, args.yes, sandbox_enforced);
+    let approver: Arc<dyn agent_tools::permission::Approver> = if headless {
+        if policy.auto_approve_routine {
+            Arc::new(AutoApprove::new())
         } else {
             Arc::new(AutoDeny)
-        };
-        (PermissionMode::AcceptEdits, appr)
+        }
     } else {
-        (PermissionMode::Default, Arc::new(TuiApprover::new(perm_tx)))
+        Arc::new(TuiApprover::new(perm_tx))
     };
 
     let registry = Registry::builder(&workspace)
-        .mode(mode)
+        .mode(policy.mode)
         .approver(approver)
+        .initial_taint_recent(initial_taint_recent)
         .command_hardener(harden)
         .register(Read)
         .register(Glob)
@@ -457,7 +505,7 @@ async fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, parse_args_from, run_config_from_args};
+    use super::{Args, parse_args_from, permission_policy, run_config_from_args};
 
     fn args() -> Args {
         Args {
@@ -548,5 +596,26 @@ mod tests {
         ]);
         assert_eq!(args.resume.as_deref(), Some(""));
         assert_eq!(args.prompt.as_deref(), Some("continue"));
+    }
+
+    #[test]
+    fn headless_without_yes_is_fail_closed_default() {
+        let p = permission_policy(true, false, true);
+        assert_eq!(p.mode, agent_tools::permission::PermissionMode::Default);
+        assert!(!p.auto_approve_routine);
+    }
+
+    #[test]
+    fn headless_yes_accepts_routine_only_when_sandbox_enforced() {
+        let p = permission_policy(true, true, true);
+        assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
+        assert!(p.auto_approve_routine);
+    }
+
+    #[test]
+    fn headless_yes_does_not_auto_approve_without_sandbox() {
+        let p = permission_policy(true, true, false);
+        assert_eq!(p.mode, agent_tools::permission::PermissionMode::AcceptEdits);
+        assert!(!p.auto_approve_routine);
     }
 }

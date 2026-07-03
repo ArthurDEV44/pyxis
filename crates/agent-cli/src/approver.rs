@@ -78,6 +78,7 @@ mod tests {
         PermissionRequest {
             tool: tool.into(),
             reason: "test".into(),
+            taint_forced: false,
             input_summary: input.to_string(),
             input,
         }

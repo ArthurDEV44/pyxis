@@ -49,6 +49,58 @@ pub fn confine(workspace: &Path, path: &str) -> Result<PathBuf, ToolError> {
     }
 }
 
+/// Vérifie que le plus profond ancêtre existant de `target` résout réellement
+/// sous le workspace. À appeler avant `create_dir_all` pour ne pas créer de
+/// répertoire via un symlink/junction hors workspace.
+pub fn ensure_existing_ancestor_confined(
+    workspace: &Path,
+    target: &Path,
+    display_path: &str,
+) -> Result<(), ToolError> {
+    let root =
+        std::fs::canonicalize(workspace).map_err(|e| ToolError::Io(format!("workspace: {e}")))?;
+    let mut probe = target;
+    loop {
+        match std::fs::symlink_metadata(probe) {
+            Ok(_) => {
+                let real = std::fs::canonicalize(probe)
+                    .map_err(|e| ToolError::Io(format!("{}: {e}", probe.display())))?;
+                return if real.starts_with(&root) {
+                    Ok(())
+                } else {
+                    Err(ToolError::OutsideWorkspace(display_path.into()))
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                probe = probe
+                    .parent()
+                    .ok_or_else(|| ToolError::OutsideWorkspace(display_path.into()))?;
+            }
+            Err(e) => return Err(ToolError::Io(format!("{}: {e}", probe.display()))),
+        }
+    }
+}
+
+/// Vérifie que `target` lui-même, s'il existe, ne résout pas hors workspace.
+/// Pour un fichier nouveau, vérifie son parent après création des dossiers.
+pub fn ensure_real_path_confined(
+    workspace: &Path,
+    target: &Path,
+    display_path: &str,
+) -> Result<(), ToolError> {
+    ensure_existing_ancestor_confined(workspace, target, display_path)?;
+    if std::fs::symlink_metadata(target).is_ok() {
+        let root = std::fs::canonicalize(workspace)
+            .map_err(|e| ToolError::Io(format!("workspace: {e}")))?;
+        let real = std::fs::canonicalize(target)
+            .map_err(|e| ToolError::Io(format!("{}: {e}", target.display())))?;
+        if !real.starts_with(&root) {
+            return Err(ToolError::OutsideWorkspace(display_path.into()));
+        }
+    }
+    Ok(())
+}
+
 /// Normalise un chemin absolu lexicalement (résout `.`/`..`).
 fn lexical_normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -109,5 +161,31 @@ mod tests {
         let ws = Path::new("/work/repo");
         let p = confine(ws, "src/foo/../bar.rs").unwrap();
         assert_eq!(p, PathBuf::from("/work/repo/src/bar.rs"));
+    }
+
+    #[test]
+    fn real_path_rejects_symlink_escape_when_platform_allows_symlink() {
+        let root = std::env::temp_dir().join(format!("pyxis-path-root-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("pyxis-path-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = root.join("link");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_dir(&outside, &link).is_ok();
+        if !linked {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return;
+        }
+        let err = ensure_existing_ancestor_confined(&root, &link.join("file.txt"), "link/file.txt")
+            .unwrap_err();
+        assert!(matches!(err, ToolError::OutsideWorkspace(_)));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

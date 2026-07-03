@@ -628,7 +628,10 @@ mod tests {
     fn summary(text: &str) -> Message {
         Message {
             role: Role::User,
-            content: vec![ContentBlock::Summary { text: text.into() }],
+            content: vec![ContentBlock::Summary {
+                text: text.into(),
+                source_untrusted: false,
+            }],
         }
     }
 

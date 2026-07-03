@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use agent_core::message::{ContentBlock, Message};
+use agent_core::message::{ContentBlock, Message, recent_untrusted_content};
 use agent_core::provider::ToolSpec;
 use agent_core::{AgentContext, AgentEvent, Deps, RunConfig, Session, run_agent};
 use agent_provider::KEYRING_ACCOUNT;
@@ -496,6 +496,10 @@ async fn event_loop(
                                             if let Ok(mut g) = conversation.lock() {
                                                 *g = msgs.clone();
                                             }
+                                            deps.tools.seed_taint(recent_untrusted_content(
+                                                &msgs,
+                                                crate::RESUME_TAINT_SCAN_MESSAGES,
+                                            ));
                                             state.blocks = blocks_from_messages(&msgs);
                                             // L'historique reste global au dossier (déjà chargé).
                                             state.blocks.push(Block::Notice(format!(

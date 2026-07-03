@@ -60,6 +60,11 @@ impl TaintTracker {
         }
     }
 
+    /// Reseed depuis un transcript repris contenant du contenu non fiable récent.
+    pub fn seed_recent(&self) {
+        self.mark();
+    }
+
     /// Le taint est-il récent (dans la fenêtre) ? Sert à forcer `Ask`.
     pub fn is_recent(&self) -> bool {
         match self.state.lock() {

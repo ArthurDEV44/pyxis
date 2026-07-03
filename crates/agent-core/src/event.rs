@@ -55,6 +55,7 @@ pub struct PermissionReq {
     pub call_id: ToolCallId,
     pub tool: String,
     pub reason: String,
+    pub taint_forced: bool,
     pub input_summary: String,
     pub input: serde_json::Value,
     pub mode: String,

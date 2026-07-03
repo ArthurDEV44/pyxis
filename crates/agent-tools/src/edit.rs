@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::{ToolError, ValidationError};
-use crate::path::confine;
+use crate::path::{confine, ensure_real_path_confined};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
@@ -84,6 +84,7 @@ impl Tool for Edit {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
+        ensure_real_path_confined(&ctx.workspace, &path, &input.path)?;
         let content = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
@@ -113,6 +114,7 @@ impl Tool for Edit {
             }
         };
 
+        ensure_real_path_confined(&ctx.workspace, &path, &input.path)?;
         tokio::fs::write(&path, updated.as_bytes())
             .await
             .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;

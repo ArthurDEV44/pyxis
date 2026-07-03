@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::ToolError;
-use crate::path::confine;
+use crate::path::{confine, ensure_existing_ancestor_confined, ensure_real_path_confined};
 use crate::permission::{PermCtx, PermissionDecision};
 use crate::tool::{Tool, ToolCtx, ToolOutput};
 
@@ -62,10 +62,12 @@ impl Tool for Write {
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let path = confine(&ctx.workspace, &input.path)?;
         if let Some(parent) = path.parent() {
+            ensure_existing_ancestor_confined(&ctx.workspace, parent, &input.path)?;
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(|e| ToolError::Io(format!("création du dossier parent: {e}")))?;
         }
+        ensure_real_path_confined(&ctx.workspace, &path, &input.path)?;
         let bytes = input.content.len();
         tokio::fs::write(&path, input.content.as_bytes())
             .await

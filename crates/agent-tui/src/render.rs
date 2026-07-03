@@ -487,7 +487,7 @@ fn push_block<'a>(
             push_wrapped(
                 lines,
                 vec![Span::styled(
-                    text.clone(),
+                    sanitize(text),
                     theme.fg().add_modifier(Modifier::BOLD),
                 )],
                 Span::styled("› ", theme.dim()),
@@ -1280,6 +1280,15 @@ mod tests {
         let out = draw(&s, 80, 24);
         assert!(out.contains("salut"));
         assert!(!out.contains("PYXIS"), "accueil doit s'effacer:\n{out}");
+    }
+
+    #[test]
+    fn user_block_is_sanitized() {
+        let mut s = AppState::new("gpt-5.5", true);
+        s.push_user("hello\x1b]0;pwned\x07world");
+        let out = draw(&s, 80, 24);
+        assert!(!out.contains('\u{1b}'), "ESC résiduel:\n{out}");
+        assert!(out.contains("helloworld"), "texte assaini absent:\n{out}");
     }
 
     // Terminal trop étroit pour la carte → repli compact, sans panic, marque visible.

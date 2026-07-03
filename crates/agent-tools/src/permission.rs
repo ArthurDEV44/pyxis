@@ -61,9 +61,11 @@ pub enum Resolved {
 /// Résout la décision finale. PURE (sans I/O) → testable unitairement.
 ///
 /// Priorité :
-/// 1. `BypassPermissions` → toujours `Allow` (court-circuit total).
-/// 2. `Plan` → `Allow` si l'outil est read-only, sinon `Deny` (aucune mutation).
-/// 3. Sinon : on part de la baseline outil, on la met en forme selon le mode,
+/// 1. `Deny` outil → toujours `Deny` (invariant terminal).
+/// 2. `BypassPermissions` → `Allow` pour les actions demandant seulement une
+///    confirmation utilisateur.
+/// 3. `Plan` → `Allow` si l'outil est read-only, sinon `Deny` (aucune mutation).
+/// 4. Sinon : on part de la baseline outil, on la met en forme selon le mode,
 ///    puis le **taint** force `Ask` pour une action mutante/sensible (sauf Bypass, déjà
 ///    traité) — invariant 3 / §4.6.
 pub fn resolve_permission(
@@ -74,7 +76,10 @@ pub fn resolve_permission(
     is_taint_sensitive: bool,
     taint_recent: bool,
 ) -> Resolved {
-    // 1. Bypass : court-circuit (même le taint ne s'applique pas).
+    if baseline == PermissionDecision::Deny {
+        return Resolved::Deny;
+    }
+    // Bypass : court-circuit des confirmations utilisateur, pas des hard-deny.
     if mode == PermissionMode::BypassPermissions {
         return Resolved::Allow;
     }
@@ -124,6 +129,8 @@ pub fn resolve_permission(
 pub struct PermissionRequest {
     pub tool: String,
     pub reason: String,
+    /// Vrai si la demande est forcée par du contenu non fiable récent.
+    pub taint_forced: bool,
     /// Résumé court de l'entrée (ex. la commande Bash, le chemin écrit).
     pub input_summary: String,
     /// Entrée structurée brute — permet au frontend de rendre un aperçu riche
@@ -139,14 +146,37 @@ pub trait Approver: Send + Sync {
     async fn approve(&self, req: &PermissionRequest) -> bool;
 }
 
-/// Approbateur qui accepte tout (mode `-p --yes`, ou tests du chemin passant).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct AutoApprove;
+/// Approbateur automatique. Par défaut, il accepte les demandes routinières mais
+/// refuse les demandes forcées par taint.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoApprove {
+    approve_tainted: bool,
+}
+
+impl AutoApprove {
+    pub const fn new() -> Self {
+        Self {
+            approve_tainted: false,
+        }
+    }
+
+    pub const fn including_tainted() -> Self {
+        Self {
+            approve_tainted: true,
+        }
+    }
+}
+
+impl Default for AutoApprove {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl Approver for AutoApprove {
-    async fn approve(&self, _req: &PermissionRequest) -> bool {
-        true
+    async fn approve(&self, req: &PermissionRequest) -> bool {
+        !req.taint_forced || self.approve_tainted
     }
 }
 
@@ -194,6 +224,19 @@ mod tests {
                 true
             ),
             Resolved::Allow
+        );
+    }
+
+    #[test]
+    fn bypass_does_not_override_explicit_deny() {
+        assert_eq!(
+            res(
+                PermissionMode::BypassPermissions,
+                PermissionDecision::Deny,
+                SENSITIVE,
+                true
+            ),
+            Resolved::Deny
         );
     }
 
