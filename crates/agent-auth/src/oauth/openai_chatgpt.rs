@@ -397,6 +397,21 @@ fn random_state() -> String {
 /// échange le code. L'ouverture du navigateur est best-effort — en cas d'échec,
 /// l'URL est imprimée pour collage manuel.
 pub async fn login_browser(client: &reqwest::Client) -> Result<OAuthCredential, AuthError> {
+    login_browser_with_notice(client, |url, opened| {
+        if !opened {
+            println!("Ouvre cette URL pour autoriser Pyxis :\n{url}");
+        }
+    })
+    .await
+}
+
+pub async fn login_browser_with_notice<F>(
+    client: &reqwest::Client,
+    on_auth_url: F,
+) -> Result<OAuthCredential, AuthError>
+where
+    F: FnOnce(&str, bool),
+{
     let pkce = Pkce::generate();
     let state = random_state();
     let url = build_authorize_url(&pkce.challenge, &state)?;
@@ -404,9 +419,8 @@ pub async fn login_browser(client: &reqwest::Client) -> Result<OAuthCredential, 
     // bind AVANT d'ouvrir le navigateur (sinon course sur le callback)
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", CALLBACK_PORT)).await?;
 
-    if open::that(&url).is_err() {
-        println!("Ouvre cette URL pour autoriser Pyxis :\n{url}");
-    }
+    let opened = open::that(&url).is_ok();
+    on_auth_url(&url, opened);
 
     let cb = tokio::time::timeout(CALLBACK_TIMEOUT, accept_callback(&listener, &state))
         .await

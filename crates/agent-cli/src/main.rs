@@ -14,7 +14,7 @@ mod session;
 
 use std::sync::Arc;
 
-use agent_auth::{ProviderId, store};
+use agent_auth::{OAuthCredential, ProviderId, store};
 use agent_core::clock::SystemClock;
 use agent_core::guardrail::CostBudget;
 use agent_core::message::{Message, recent_untrusted_content};
@@ -51,6 +51,12 @@ struct Args {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CliPermissionPolicy {
     mode: PermissionMode,
+}
+
+enum CredentialBootstrap {
+    Connected(OAuthCredential),
+    Missing,
+    WrongProvider(ProviderId),
 }
 
 const HELP: &str = "\
@@ -329,6 +335,8 @@ fn main() -> anyhow::Result<()> {
     // (US-028). Injecté ensuite comme messages éphémères par tour.
     let context_msgs = context::messages(&workspace, &context::today_utc());
 
+    let credential = prepare_credential_before_sandbox(&args)?;
+
     // Sandbox FS AVANT le runtime (thread principal → hérité par les workers).
     let sandbox_enforced = sandbox_enforced_from_args(&args, &workspace);
 
@@ -342,6 +350,7 @@ fn main() -> anyhow::Result<()> {
         mcp_config,
         context_msgs,
         sandbox_enforced,
+        credential,
     ))
 }
 
@@ -379,6 +388,96 @@ fn home_dir() -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
+fn load_chatgpt_credential() -> anyhow::Result<CredentialBootstrap> {
+    match store::load(KEYRING_ACCOUNT)? {
+        Some(agent_auth::Credential::Oauth(o)) if o.provider == ProviderId::OpenAiChatGpt => {
+            Ok(CredentialBootstrap::Connected(o))
+        }
+        Some(agent_auth::Credential::Oauth(o)) => {
+            Ok(CredentialBootstrap::WrongProvider(o.provider))
+        }
+        _ => Ok(CredentialBootstrap::Missing),
+    }
+}
+
+fn headless_auth_error(bootstrap: &CredentialBootstrap) -> String {
+    match bootstrap {
+        CredentialBootstrap::Connected(_) => String::new(),
+        CredentialBootstrap::Missing => {
+            "Pyxis n'est pas connecté à ChatGPT. Lance `pyxis` sans -p pour ouvrir l'onboarding."
+                .into()
+        }
+        CredentialBootstrap::WrongProvider(provider) => format!(
+            "Credential ChatGPT invalide dans le keyring ({provider:?}). Lance `pyxis` sans -p pour reconnecter ChatGPT."
+        ),
+    }
+}
+
+fn prepare_credential_before_sandbox(args: &Args) -> anyhow::Result<OAuthCredential> {
+    let bootstrap = load_chatgpt_credential()?;
+    match bootstrap {
+        CredentialBootstrap::Connected(cred) => Ok(cred),
+        missing_or_invalid if args.prompt.is_some() => {
+            anyhow::bail!("{}", headless_auth_error(&missing_or_invalid))
+        }
+        CredentialBootstrap::Missing => run_auth_onboarding(),
+        CredentialBootstrap::WrongProvider(provider) => {
+            eprintln!(
+                "Credential ChatGPT invalide dans le keyring ({provider:?}). Reconnexion requise."
+            );
+            run_auth_onboarding()
+        }
+    }
+}
+
+fn save_chatgpt_credential(cred: OAuthCredential) -> anyhow::Result<()> {
+    store::save(KEYRING_ACCOUNT, &agent_auth::Credential::Oauth(cred))?;
+    match load_chatgpt_credential()? {
+        CredentialBootstrap::Connected(_) => Ok(()),
+        CredentialBootstrap::Missing => anyhow::bail!(
+            "Credential ChatGPT non retrouvée après écriture keyring. Le secret store Windows n'a pas persisté l'entrée."
+        ),
+        CredentialBootstrap::WrongProvider(provider) => anyhow::bail!(
+            "Credential ChatGPT relue avec le mauvais provider ({provider:?}) après écriture keyring."
+        ),
+    }
+}
+
+fn run_auth_onboarding() -> anyhow::Result<OAuthCredential> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        eprintln!();
+        eprintln!("Bienvenue dans Pyxis");
+        eprintln!("Connexion ChatGPT requise pour utiliser l'agent.");
+        eprintln!();
+
+        let client = reqwest::Client::new();
+        let cred =
+            agent_auth::oauth::openai_chatgpt::login_browser_with_notice(&client, |url, opened| {
+                if opened {
+                    eprintln!("Navigateur ouvert. Termine la connexion ChatGPT puis reviens ici.");
+                    eprintln!("Si rien ne s'affiche, ouvre cette URL :");
+                    eprintln!("{url}");
+                } else {
+                    eprintln!("Ouvre cette URL pour autoriser Pyxis :");
+                    eprintln!("{url}");
+                }
+            })
+            .await?;
+
+        let stored = cred.clone();
+        tokio::task::spawn_blocking(move || save_chatgpt_credential(stored))
+            .await
+            .map_err(|e| anyhow::anyhow!("keyring : {e}"))??;
+
+        eprintln!("Connecté. Lancement de Pyxis...");
+        eprintln!();
+        Ok(cred)
+    })
+}
+
 /// Liste les skills disponibles dans `~/.agents/skills` (un dossier = un skill,
 /// nom = nom du dossier), triés. Symlink partagé entre CLIs ; lecture best-effort.
 fn read_skills() -> Vec<String> {
@@ -406,26 +505,12 @@ async fn run(
     mcp_config: agent_mcp::McpConfigFile,
     context_msgs: Vec<Message>,
     sandbox_enforced: bool,
+    cred: OAuthCredential,
 ) -> anyhow::Result<()> {
     let run_config = run_config_from_args(&args)?;
     let headless = args.prompt.is_some();
-    // 1. Credential abonnement ChatGPT (keyring). Absente → on guide vers le login.
-    let cred = match store::load(KEYRING_ACCOUNT)? {
-        Some(agent_auth::Credential::Oauth(o)) if o.provider == ProviderId::OpenAiChatGpt => o,
-        Some(agent_auth::Credential::Oauth(o)) => {
-            anyhow::bail!(
-                "Credential ChatGPT invalide dans le keyring ({:?}). Relance le login :\n  \
-                 cargo run -p agent-auth --example login",
-                o.provider
-            );
-        }
-        _ => {
-            anyhow::bail!(
-                "Pas de credential ChatGPT. Connecte-toi d'abord :\n  \
-                 cargo run -p agent-auth --example login"
-            );
-        }
-    };
+    // 1. Credential abonnement ChatGPT chargée avant le sandbox. Si elle manque en
+    // interactif, l'onboarding OAuth a déjà tourné avant d'arriver ici.
     let mut chatgpt = OpenAiChatGptProvider::new(
         cred,
         agent_provider::DEFAULT_MAX_CONTEXT,

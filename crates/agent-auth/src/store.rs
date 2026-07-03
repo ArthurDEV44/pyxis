@@ -2,6 +2,10 @@
 //! Service / keyring, jamais en clair sur disque. On NE réplique PAS le
 //! `~/.pi/agent/auth.json` clair de Pi : le blob JSON (tokens inclus) vit dans
 //! le keyring, chiffré par l'OS.
+//!
+//! On utilise `set_secret` plutôt que `set_password` : sur Windows, `keyring`
+//! encode les passwords en UTF-16 avant `CredWriteW`, ce qui divise inutilement
+//! la taille disponible pour les tokens OAuth.
 
 use crate::Credential;
 
@@ -22,15 +26,23 @@ fn entry(account: &str) -> Result<keyring::Entry, StoreError> {
 /// Persiste une credential (blob JSON) dans le keyring sous la clé `account`
 /// (typiquement `oauth:openai_chatgpt` ou `apikey:openai_chat`).
 pub fn save(account: &str, cred: &Credential) -> Result<(), StoreError> {
-    let blob = serde_json::to_string(cred)?;
-    entry(account)?.set_password(&blob)?;
+    let blob = serde_json::to_vec(cred)?;
+    entry(account)?.set_secret(&blob)?;
     Ok(())
 }
 
 /// Lit une credential, `None` si absente.
 pub fn load(account: &str) -> Result<Option<Credential>, StoreError> {
-    match entry(account)?.get_password() {
-        Ok(blob) => Ok(Some(serde_json::from_str(&blob)?)),
+    let entry = entry(account)?;
+    match entry.get_secret() {
+        Ok(blob) => match serde_json::from_slice(&blob) {
+            Ok(cred) => Ok(Some(cred)),
+            Err(secret_err) => match entry.get_password() {
+                Ok(password_blob) => Ok(Some(serde_json::from_str(&password_blob)?)),
+                Err(keyring::Error::NoEntry) => Err(secret_err.into()),
+                Err(e) => Err(e.into()),
+            },
+        },
         Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(e.into()),
     }

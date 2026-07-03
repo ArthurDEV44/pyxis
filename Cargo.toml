@@ -33,7 +33,11 @@ base64 = "0.22"
 hex = "0.4"
 url = "2"
 thiserror = "2"
-keyring = { version = "3", features = ["sync-secret-service"] }
+keyring = { version = "3", features = [
+    "apple-native",
+    "sync-secret-service",
+    "windows-native",
+] }
 open = "5"
 async-trait = "0.1"
 async-stream = "0.3"

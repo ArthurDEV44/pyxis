@@ -8,6 +8,8 @@
 //! - system prompt → `instructions` (string), JAMAIS un item `input[]`.
 //! - SSE **stateless** : pas de `previous_response_id` → contexte complet dans
 //!   `input[]` à chaque tour (mappe le canonique, ARCHITECTURE/PROVIDERS §4.1).
+//! - pas de `max_output_tokens` : le backend ChatGPT/Codex le rejette, même si
+//!   `CanonicalRequest` le conserve pour les budgets internes.
 //! - `call_id` corrèle `function_call` ↔ `function_call_output`.
 //!
 //! Les reasoning items chiffrés sont réinjectés avant leurs `function_call` quand
@@ -51,7 +53,6 @@ pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOption
         "instructions": instructions,
         "input": build_input(&req.messages),
         "text": { "verbosity": options.text_verbosity },
-        "max_output_tokens": req.max_output_tokens,
         "tool_choice": "auto",
         "parallel_tool_calls": options.parallel_tool_calls,
     });
@@ -301,7 +302,7 @@ mod tests {
         assert!(body.get("include").is_none());
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], json!(true));
-        assert_eq!(body["max_output_tokens"], json!(4096));
+        assert!(body.get("max_output_tokens").is_none());
         // pas de previous_response_id (SSE stateless).
         assert!(body.get("previous_response_id").is_none());
     }
