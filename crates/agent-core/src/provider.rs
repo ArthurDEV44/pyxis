@@ -379,6 +379,12 @@ pub trait Provider: Send + Sync {
             retry_after_ms: None,
         })
     }
+
+    /// Invalidation locale d'une credential après logout utilisateur. Les providers
+    /// stateless ou sans credential en mémoire peuvent garder le no-op.
+    async fn disconnect_auth(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

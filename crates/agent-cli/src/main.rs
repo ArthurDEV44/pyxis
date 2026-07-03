@@ -14,7 +14,7 @@ mod session;
 
 use std::sync::Arc;
 
-use agent_auth::store;
+use agent_auth::{ProviderId, store};
 use agent_core::clock::SystemClock;
 use agent_core::guardrail::CostBudget;
 use agent_core::message::{Message, recent_untrusted_content};
@@ -328,7 +328,14 @@ async fn run(
     let run_config = run_config_from_args(&args)?;
     // 1. Credential abonnement ChatGPT (keyring). Absente → on guide vers le login.
     let cred = match store::load(KEYRING_ACCOUNT)? {
-        Some(agent_auth::Credential::Oauth(o)) => o,
+        Some(agent_auth::Credential::Oauth(o)) if o.provider == ProviderId::OpenAiChatGpt => o,
+        Some(agent_auth::Credential::Oauth(o)) => {
+            anyhow::bail!(
+                "Credential ChatGPT invalide dans le keyring ({:?}). Relance le login :\n  \
+                 cargo run -p agent-auth --example login",
+                o.provider
+            );
+        }
         _ => {
             anyhow::bail!(
                 "Pas de credential ChatGPT. Connecte-toi d'abord :\n  \

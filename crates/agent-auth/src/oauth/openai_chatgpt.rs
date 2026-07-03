@@ -35,6 +35,8 @@ pub const DEVICE_VERIFICATION_URI: &str = "https://auth.openai.com/codex/device"
 pub const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 pub const SCOPE: &str = "openid profile email offline_access";
 pub const CALLBACK_PORT: u16 = 1455;
+pub const CALLBACK_TIMEOUT: Duration = Duration::from_secs(900);
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEVICE_CODE_TIMEOUT: Duration = Duration::from_secs(900);
 /// Namespace du claim custom où vit `chatgpt_account_id` (`openai-codex.ts:44`).
 pub const JWT_CLAIM_NAMESPACE: &str = "https://api.openai.com/auth";
@@ -87,6 +89,8 @@ pub enum AuthError {
     Jwt(String),
     #[error("chatgpt_account_id absent du token")]
     MissingAccountId,
+    #[error("credential provider inattendu : {0:?}")]
+    WrongProvider(ProviderId),
     #[error("callback OAuth : {0}")]
     Callback(String),
     #[error("state OAuth ne correspond pas (anti-CSRF)")]
@@ -166,10 +170,19 @@ fn token_to_credential(token: TokenResponse, now_ms: u64) -> Result<OAuthCredent
 }
 
 /// Résultat d'un callback browser.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CallbackResult {
     pub code: String,
     pub state: String,
+}
+
+impl std::fmt::Debug for CallbackResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallbackResult")
+            .field("code", &"Secret(***)")
+            .field("state", &"Secret(***)")
+            .finish()
+    }
 }
 
 /// Parse la ligne de requête HTTP du callback (`GET /auth/callback?code=…&state=… HTTP/1.1`)
@@ -182,10 +195,10 @@ pub fn parse_callback_request_line(
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| AuthError::Callback("ligne de requête HTTP invalide".to_string()))?;
-    if !target.starts_with("/auth/callback") {
-        return Err(AuthError::Callback(format!("path inattendu : {target}")));
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path != "/auth/callback" {
+        return Err(AuthError::Callback(format!("path inattendu : {path}")));
     }
-    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
 
     let mut code = None;
     let mut state = None;
@@ -206,7 +219,7 @@ pub fn parse_callback_request_line(
 }
 
 /// Issue d'un poll device-code.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PollOutcome {
     Pending,
     SlowDown,
@@ -214,6 +227,26 @@ pub enum PollOutcome {
         authorization_code: String,
         code_verifier: String,
     },
+}
+
+impl std::fmt::Debug for PollOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => f.write_str("Pending"),
+            Self::SlowDown => f.write_str("SlowDown"),
+            Self::Done { .. } => f
+                .debug_struct("Done")
+                .field("authorization_code", &"Secret(***)")
+                .field("code_verifier", &"Secret(***)")
+                .finish(),
+        }
+    }
+}
+
+fn device_error_code(body: &serde_json::Value) -> Option<&str> {
+    body.get("errorCode")
+        .or_else(|| body.get("error"))
+        .and_then(|v| v.as_str())
 }
 
 /// Classifie une réponse de poll device-code (RFC 8628 + spécificités Codex).
@@ -235,27 +268,55 @@ pub fn classify_device_poll(
             )),
         };
     }
-    if status == 403 || status == 404 {
-        return Ok(PollOutcome::Pending);
-    }
-    match body.get("errorCode").and_then(|v| v.as_str()).unwrap_or("") {
-        "deviceauth_authorization_pending" => Ok(PollOutcome::Pending),
-        "slow_down" => Ok(PollOutcome::SlowDown),
-        other => Err(AuthError::DeviceDenied(other.to_string())),
+    match device_error_code(body) {
+        Some("deviceauth_authorization_pending" | "authorization_pending") => {
+            Ok(PollOutcome::Pending)
+        }
+        Some("slow_down") => Ok(PollOutcome::SlowDown),
+        Some("expired_token") => Err(AuthError::DeviceTimeout),
+        Some(other) => Err(AuthError::DeviceDenied(other.to_string())),
+        None if status == 403 || status == 404 => Ok(PollOutcome::Pending),
+        None => Err(AuthError::DeviceDenied(format!("http {status}"))),
     }
 }
 
 /// Spécification de requête d'inférence pour l'abonnement ChatGPT (backend
 /// Responses API). À brancher dans l'adapter `agent-provider` (`OpenAiChatGpt`).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RequestSpec {
     pub url: String,
     pub headers: Vec<(String, String)>,
 }
 
+impl std::fmt::Debug for RequestSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<(&str, &str)> = self
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                let value = if k.eq_ignore_ascii_case("authorization")
+                    || k.eq_ignore_ascii_case("chatgpt-account-id")
+                {
+                    "Secret(***)"
+                } else {
+                    v.as_str()
+                };
+                (k.as_str(), value)
+            })
+            .collect();
+        f.debug_struct("RequestSpec")
+            .field("url", &self.url)
+            .field("headers", &headers)
+            .finish()
+    }
+}
+
 /// En-têtes d'inférence SSE pour une credential abonnement ChatGPT. Le
 /// `chatgpt-account-id` (dérivé du JWT) est requis pour router vers le compte.
 pub fn responses_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> {
+    if cred.provider != ProviderId::OpenAiChatGpt {
+        return Err(AuthError::WrongProvider(cred.provider));
+    }
     let account_id = cred
         .account_id
         .as_deref()
@@ -347,7 +408,9 @@ pub async fn login_browser(client: &reqwest::Client) -> Result<OAuthCredential, 
         println!("Ouvre cette URL pour autoriser Pyxis :\n{url}");
     }
 
-    let cb = accept_callback(&listener, &state).await?;
+    let cb = tokio::time::timeout(CALLBACK_TIMEOUT, accept_callback(&listener, &state))
+        .await
+        .map_err(|_| AuthError::Callback("callback OAuth expiré".to_string()))??;
     exchange_code(client, &cb.code, &pkce.verifier, REDIRECT_URI, now_ms()).await
 }
 
@@ -359,12 +422,29 @@ async fn accept_callback(
     listener: &tokio::net::TcpListener,
     expected_state: &str,
 ) -> Result<CallbackResult, AuthError> {
+    accept_callback_with_read_timeout(listener, expected_state, CALLBACK_READ_TIMEOUT).await
+}
+
+async fn accept_callback_with_read_timeout(
+    listener: &tokio::net::TcpListener,
+    expected_state: &str,
+    read_timeout: Duration,
+) -> Result<CallbackResult, AuthError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     loop {
         let (mut sock, _) = listener.accept().await?;
         let mut buf = [0u8; 2048];
-        let n = sock.read(&mut buf).await?;
+        let n = match tokio::time::timeout(read_timeout, sock.read(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                let _ = sock
+                    .write_all(b"HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            }
+        };
         let req = String::from_utf8_lossy(&buf[..n]);
         let line = req.lines().next().unwrap_or("");
 
@@ -395,18 +475,37 @@ async fn accept_callback(
 // ──────────────────────────── Device-code flow (headless) ────────────────────────────
 
 /// Informations à présenter à l'utilisateur pour le device flow.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceAuth {
     pub user_code: String,
     pub verification_uri: String,
 }
 
+impl std::fmt::Debug for DeviceAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceAuth")
+            .field("user_code", &"Secret(***)")
+            .field("verification_uri", &self.verification_uri)
+            .finish()
+    }
+}
+
 /// État interne de poll (séparé de l'affichage utilisateur).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceAuthState {
     device_auth_id: String,
     user_code: String,
     interval: u64,
+}
+
+impl std::fmt::Debug for DeviceAuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceAuthState")
+            .field("device_auth_id", &"Secret(***)")
+            .field("user_code", &"Secret(***)")
+            .field("interval", &self.interval)
+            .finish()
+    }
 }
 
 /// Démarre le device flow : retourne l'état à poller + les infos à afficher.
@@ -563,6 +662,17 @@ mod tests {
         let cb = parse_callback_request_line(line, "s1").unwrap();
         assert_eq!(cb.code, "abc123");
 
+        assert!(matches!(
+            parse_callback_request_line("GET /auth/callback2?code=abc123&state=s1 HTTP/1.1", "s1"),
+            Err(AuthError::Callback(_))
+        ));
+        assert!(matches!(
+            parse_callback_request_line(
+                "GET /auth/callback/extra?code=abc123&state=s1 HTTP/1.1",
+                "s1"
+            ),
+            Err(AuthError::Callback(_))
+        ));
         // mauvais state → CSRF
         assert!(matches!(
             parse_callback_request_line(line, "WRONG"),
@@ -598,6 +708,19 @@ mod tests {
             classify_device_poll(400, &serde_json::json!({"errorCode":"slow_down"})).unwrap(),
             PollOutcome::SlowDown
         );
+        assert_eq!(
+            classify_device_poll(400, &serde_json::json!({"error":"authorization_pending"}))
+                .unwrap(),
+            PollOutcome::Pending
+        );
+        assert!(matches!(
+            classify_device_poll(403, &serde_json::json!({"errorCode":"access_denied"})),
+            Err(AuthError::DeviceDenied(e)) if e == "access_denied"
+        ));
+        assert!(matches!(
+            classify_device_poll(404, &serde_json::json!({"error":"expired_token"})),
+            Err(AuthError::DeviceTimeout)
+        ));
         let done = classify_device_poll(
             200,
             &serde_json::json!({"authorization_code":"C","code_verifier":"V"}),
@@ -654,6 +777,97 @@ mod tests {
         assert_eq!(h["chatgpt-account-id"], "acct_7");
         assert_eq!(h["originator"], "pyxis");
         assert_eq!(h["OpenAI-Beta"], "responses=experimental");
+    }
+
+    #[test]
+    fn responses_request_rejects_wrong_provider() {
+        let cred = OAuthCredential {
+            provider: ProviderId::Anthropic,
+            access: Secret::new("AT"),
+            refresh: Secret::new("RT"),
+            expires_at: 0,
+            account_id: Some("acct_7".into()),
+        };
+        assert!(matches!(
+            responses_request(&cred),
+            Err(AuthError::WrongProvider(ProviderId::Anthropic))
+        ));
+    }
+
+    #[test]
+    fn debug_output_redacts_oauth_transients() {
+        let cred = OAuthCredential {
+            provider: ProviderId::OpenAiChatGpt,
+            access: Secret::new("AT_SECRET"),
+            refresh: Secret::new("RT_SECRET"),
+            expires_at: 0,
+            account_id: Some("acct_7".into()),
+        };
+        let spec = responses_request(&cred).unwrap();
+        let spec_dbg = format!("{spec:?}");
+        assert!(!spec_dbg.contains("AT_SECRET"));
+        assert!(!spec_dbg.contains("acct_7"));
+        assert!(spec_dbg.contains("Secret(***)"));
+
+        let cb = CallbackResult {
+            code: "CODE_SECRET".into(),
+            state: "STATE_SECRET".into(),
+        };
+        let cb_dbg = format!("{cb:?}");
+        assert!(!cb_dbg.contains("CODE_SECRET"));
+        assert!(!cb_dbg.contains("STATE_SECRET"));
+
+        let done = PollOutcome::Done {
+            authorization_code: "AUTH_CODE_SECRET".into(),
+            code_verifier: "VERIFIER_SECRET".into(),
+        };
+        let done_dbg = format!("{done:?}");
+        assert!(!done_dbg.contains("AUTH_CODE_SECRET"));
+        assert!(!done_dbg.contains("VERIFIER_SECRET"));
+
+        let st = DeviceAuthState {
+            device_auth_id: "DEVICE_SECRET".into(),
+            user_code: "USER_SECRET".into(),
+            interval: 5,
+        };
+        let st_dbg = format!("{st:?}");
+        assert!(!st_dbg.contains("DEVICE_SECRET"));
+        assert!(!st_dbg.contains("USER_SECRET"));
+
+        let display = DeviceAuth {
+            user_code: "DISPLAY_CODE_SECRET".into(),
+            verification_uri: DEVICE_VERIFICATION_URI.into(),
+        };
+        let display_dbg = format!("{display:?}");
+        assert!(!display_dbg.contains("DISPLAY_CODE_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn callback_read_timeout_ignores_silent_socket() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            accept_callback_with_read_timeout(&listener, "s1", Duration::from_millis(20)).await
+        });
+
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let mut good = tokio::net::TcpStream::connect(addr).await.unwrap();
+        good.write_all(b"GET /auth/callback?code=abc123&state=s1 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let cb = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(cb.code, "abc123");
     }
 
     // US-021 AC2 : sélection du fallback `originator`. `pyxis` par défaut ;

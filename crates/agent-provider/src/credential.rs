@@ -14,10 +14,15 @@ use agent_core::provider::ProviderError;
 const REFRESH_MARGIN_MS: u64 = 60_000;
 
 pub struct CredentialManager {
-    cred: tokio::sync::Mutex<OAuthCredential>,
+    state: tokio::sync::Mutex<CredentialState>,
     http: reqwest::Client,
     /// Clé keyring où réécrire la credential rafraîchie (refresh rotatif).
     keyring_account: String,
+}
+
+struct CredentialState {
+    cred: Option<OAuthCredential>,
+    persist_dirty: bool,
 }
 
 impl CredentialManager {
@@ -27,7 +32,10 @@ impl CredentialManager {
         keyring_account: impl Into<String>,
     ) -> Self {
         Self {
-            cred: tokio::sync::Mutex::new(cred),
+            state: tokio::sync::Mutex::new(CredentialState {
+                cred: Some(cred),
+                persist_dirty: false,
+            }),
             http,
             keyring_account: keyring_account.into(),
         }
@@ -36,31 +44,61 @@ impl CredentialManager {
     /// Garantit un access token frais (refresh + réécriture keyring si nécessaire)
     /// et retourne la spec de requête d'inférence (URL + en-têtes propriétaires).
     pub async fn request_spec(&self) -> Result<RequestSpec, ProviderError> {
-        let mut cred = self.cred.lock().await;
+        let mut state = self.state.lock().await;
         let now = openai_chatgpt::now_ms();
-        if now.saturating_add(REFRESH_MARGIN_MS) >= cred.expires_at {
-            self.refresh_locked(&mut cred, now).await?;
+        if state.cred.is_none() {
+            return Err(disconnected_error());
         }
-        openai_chatgpt::responses_request(&cred).map_err(convert_auth_err)
+        if state.persist_dirty {
+            let cred = state.cred.as_ref().ok_or_else(disconnected_error)?;
+            self.persist(cred).await?;
+            state.persist_dirty = false;
+        }
+        let cred = state.cred.as_mut().ok_or_else(disconnected_error)?;
+        if now.saturating_add(REFRESH_MARGIN_MS) >= cred.expires_at {
+            self.refresh_locked(&mut state, now).await?;
+        }
+        let cred = state.cred.as_ref().ok_or_else(disconnected_error)?;
+        openai_chatgpt::responses_request(cred).map_err(convert_auth_err)
     }
 
     /// Force un refresh même si l'horloge locale pense encore le token valide.
     pub async fn force_refresh(&self) -> Result<(), ProviderError> {
-        let mut cred = self.cred.lock().await;
-        self.refresh_locked(&mut cred, openai_chatgpt::now_ms())
+        let mut state = self.state.lock().await;
+        if state.cred.is_none() {
+            return Err(disconnected_error());
+        }
+        self.refresh_locked(&mut state, openai_chatgpt::now_ms())
             .await
+    }
+
+    /// Invalide la credential en mémoire. Utilisé par le logout interactif après
+    /// suppression keyring pour empêcher une résurrection au prochain refresh.
+    pub async fn disconnect(&self) {
+        let mut state = self.state.lock().await;
+        state.cred = None;
+        state.persist_dirty = false;
     }
 
     async fn refresh_locked(
         &self,
-        cred: &mut OAuthCredential,
+        state: &mut CredentialState,
         now: u64,
     ) -> Result<(), ProviderError> {
-        let refreshed = openai_chatgpt::refresh(&self.http, cred.refresh.expose(), now)
+        let refresh_token = state
+            .cred
+            .as_ref()
+            .ok_or_else(disconnected_error)?
+            .refresh
+            .expose()
+            .to_string();
+        let refreshed = openai_chatgpt::refresh(&self.http, &refresh_token, now)
             .await
             .map_err(convert_auth_err)?;
+        state.cred = Some(refreshed.clone());
+        state.persist_dirty = true;
         self.persist(&refreshed).await?;
-        *cred = refreshed;
+        state.persist_dirty = false;
         Ok(())
     }
 
@@ -73,6 +111,14 @@ impl CredentialManager {
             .await
             .map_err(|e| ProviderError::Transport(format!("join keyring: {e}")))?
             .map_err(|e| ProviderError::Transport(format!("keyring: {e}")))
+    }
+}
+
+fn disconnected_error() -> ProviderError {
+    ProviderError::Http {
+        status: 401,
+        message: "auth disconnected".to_string(),
+        retry_after_ms: None,
     }
 }
 

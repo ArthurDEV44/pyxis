@@ -11,7 +11,7 @@
 //! (défaut `DEFAULT_MODEL`). En cas de `400 ... not supported`, passe le bon id
 //! en 2e arg (slugs versionnés : `gpt-5.4`, `gpt-5.5`…).
 
-use agent_auth::{Credential, store};
+use agent_auth::{Credential, ProviderId, store};
 use agent_core::message::Message;
 use agent_core::provider::{CanonicalRequest, Provider, StreamEvent};
 use agent_provider::{DEFAULT_MODEL, KEYRING_ACCOUNT, OpenAiChatGptProvider};
@@ -26,7 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = args.next().unwrap_or_else(|| DEFAULT_MODEL.to_string());
 
     let cred = match store::load(KEYRING_ACCOUNT)? {
-        Some(Credential::Oauth(o)) => o,
+        Some(Credential::Oauth(o)) if o.provider == ProviderId::OpenAiChatGpt => o,
+        Some(Credential::Oauth(o)) => {
+            eprintln!(
+                "Credential ChatGPT invalide dans le keyring ({:?}). Relance :\n  cargo run -p agent-auth --example login",
+                o.provider
+            );
+            std::process::exit(1);
+        }
         _ => {
             eprintln!(
                 "Pas de credential ChatGPT. Lance d'abord :\n  cargo run -p agent-auth --example login"

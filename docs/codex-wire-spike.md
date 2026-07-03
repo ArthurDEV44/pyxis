@@ -108,8 +108,8 @@ relevés en audit) :
 - **AC4 — drop au changement de modèle** : vider les `EncryptedReasoning` du
   transcript au switch de slug (`/models`), sinon le reasoning d'un modèle précédent
   est réinjecté (risque 400).
-- **Données au repos (OWASP LLM06)** : `encrypted_content` est persisté verbatim dans
-  le JSONL de session. Décider : filtrer les `EncryptedReasoning` avant `session.sync`
-  (le reasoning ne survit pas au `/resume`, acceptable) ou les rédiger côté writer.
+- **Données au repos (OWASP LLM06)** : `agent-session` filtre les
+  `EncryptedReasoning` avant écriture JSONL (`sync` et checkpoint). Le replay reste
+  disponible en mémoire pendant la session active, mais ne survit pas au `/resume`.
 - **Borne mémoire** : poser un cap par item (ex. 64 Ko) et par tour (ex. 16 items) sur
   l'accumulation des reasoning items (`Accumulator.reasonings`).

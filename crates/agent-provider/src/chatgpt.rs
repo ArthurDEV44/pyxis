@@ -257,6 +257,99 @@ fn is_auth_expired(body: &str) -> bool {
     body.to_ascii_lowercase().contains("expired")
 }
 
+fn redact_bearer_tokens(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.to_ascii_lowercase().find("bearer ") {
+        let (before, after_before) = rest.split_at(pos);
+        out.push_str(before);
+        out.push_str("Bearer [redacted]");
+        let value = &after_before["bearer ".len()..];
+        let end = value
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '}' | ']'))
+            .unwrap_or(value.len());
+        rest = &value[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_form_value(input: &str, key: &str) -> String {
+    let marker = format!("{key}=");
+    let lower_marker = marker.to_ascii_lowercase();
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(pos) = rest.to_ascii_lowercase().find(&lower_marker) {
+        let (before, after_before) = rest.split_at(pos);
+        out.push_str(before);
+        out.push_str(&after_before[..marker.len()]);
+        out.push_str("[redacted]");
+        let value = &after_before[marker.len()..];
+        let end = value
+            .find(|c: char| c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ',' | ';'))
+            .unwrap_or(value.len());
+        rest = &value[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn sensitive_json_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("authorization")
+        || lower.contains("credential")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower == "api_key"
+        || lower == "apikey"
+        || lower == "chatgpt-account-id"
+        || lower == "chatgpt_account_id"
+        || lower == "account_id"
+}
+
+fn redact_json_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if sensitive_json_key(key) {
+                    *value = serde_json::Value::String("[redacted]".to_string());
+                } else {
+                    redact_json_secrets(value);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_secrets(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_error_body(body: &str) -> String {
+    let mut text = if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) {
+        redact_json_secrets(&mut value);
+        serde_json::to_string(&value).unwrap_or_else(|_| body.to_string())
+    } else {
+        body.to_string()
+    };
+    text = redact_bearer_tokens(&text);
+    for key in [
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "authorization",
+        "chatgpt-account-id",
+        "chatgpt_account_id",
+        "api_key",
+    ] {
+        text = redact_form_value(&text, key);
+    }
+    text
+}
+
 /// Parse le délai serveur d'un `Retry-After` en millisecondes (US-023), dans
 /// l'ordre de priorité de Pi : `retry-after-ms` (ms exactes) > `Retry-After`
 /// (secondes entières) > `Retry-After` (date HTTP IMF-fixdate, delta vs `now_ms`).
@@ -387,7 +480,7 @@ impl Provider for OpenAiChatGptProvider {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             let retry_after_ms = parse_retry_after_ms(resp.headers(), now_ms);
-            let mut text = resp.text().await.unwrap_or_default();
+            let mut text = sanitize_error_body(&resp.text().await.unwrap_or_default());
             text.truncate(MAX_ERR_BODY);
             return Err(ProviderError::Http {
                 status: code,
@@ -459,6 +552,11 @@ impl Provider for OpenAiChatGptProvider {
 
     async fn refresh_auth(&self) -> Result<(), ProviderError> {
         self.creds.force_refresh().await
+    }
+
+    async fn disconnect_auth(&self) -> Result<(), ProviderError> {
+        self.creds.disconnect().await;
+        Ok(())
     }
 
     fn classify_error(&self, err: &ProviderError) -> ErrorClass {
@@ -638,6 +736,38 @@ mod tests {
                 retry_after_ms: None,
             }),
             ErrorClass::Auth(AuthError::Invalid)
+        ));
+    }
+
+    #[test]
+    fn error_body_sanitizer_redacts_tokens_and_account_ids() {
+        let json = r#"{"error":"bad","access_token":"AT","refresh_token":"RT","nested":{"chatgpt_account_id":"acct_1"}}"#;
+        let redacted = sanitize_error_body(json);
+        assert!(!redacted.contains("AT"));
+        assert!(!redacted.contains("RT"));
+        assert!(!redacted.contains("acct_1"));
+        assert!(redacted.contains("[redacted]"));
+
+        let raw =
+            "Authorization: Bearer AT_SECRET\nrefresh_token=RT_SECRET&chatgpt-account-id=acct_2";
+        let redacted = sanitize_error_body(raw);
+        assert!(!redacted.contains("AT_SECRET"));
+        assert!(!redacted.contains("RT_SECRET"));
+        assert!(!redacted.contains("acct_2"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_invalidates_in_memory_credential() {
+        let p = provider();
+        p.disconnect_auth().await.unwrap();
+        let err = p.creds.request_spec().await.unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::Http {
+                status: 401,
+                message,
+                ..
+            } if message == "auth disconnected"
         ));
     }
 

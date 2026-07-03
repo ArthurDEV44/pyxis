@@ -11,10 +11,19 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Pkce {
     pub verifier: String,
     pub challenge: String,
+}
+
+impl std::fmt::Debug for Pkce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pkce")
+            .field("verifier", &"Secret(***)")
+            .field("challenge", &"Secret(***)")
+            .finish()
+    }
 }
 
 impl Pkce {
@@ -60,5 +69,17 @@ mod tests {
         assert!(
             !p.verifier.contains('=') && !p.verifier.contains('+') && !p.verifier.contains('/')
         );
+    }
+
+    #[test]
+    fn debug_redacts_verifier_and_challenge() {
+        let p = Pkce {
+            verifier: "VERIFIER_SECRET".into(),
+            challenge: "CHALLENGE_PUBLIC_BUT_LINKABLE".into(),
+        };
+        let dbg = format!("{p:?}");
+        assert!(!dbg.contains("VERIFIER_SECRET"));
+        assert!(!dbg.contains("CHALLENGE_PUBLIC_BUT_LINKABLE"));
+        assert!(dbg.contains("Secret(***)"));
     }
 }

@@ -559,19 +559,21 @@ async fn event_loop(
                                 }
                                 "subscription codex disconnect" => {
                                     if state.provider_connected {
-                                        match agent_auth::store::delete(KEYRING_ACCOUNT) {
-                                            Ok(()) => {
+                                        if let Err(e) = agent_auth::store::delete(KEYRING_ACCOUNT) {
+                                            state
+                                                .blocks
+                                                .push(Block::Error(format!("déconnexion : {e}")));
+                                        } else if let Err(e) = deps.provider.disconnect_auth().await {
+                                            state.blocks.push(Block::Error(format!(
+                                                "déconnexion provider : {e}"
+                                            )));
+                                        } else {
                                                 state.provider_connected = false;
                                                 state.blocks.push(Block::Notice(
                                                     "Déconnecté de Codex (credential supprimée). \
-                                                     La session courante reste active ; relance \
-                                                     le login pour les prochains lancements."
+                                                     Relance le login avant le prochain appel modèle."
                                                         .into(),
                                                 ));
-                                            }
-                                            Err(e) => state
-                                                .blocks
-                                                .push(Block::Error(format!("déconnexion : {e}"))),
                                         }
                                     } else {
                                         state

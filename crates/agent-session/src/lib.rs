@@ -237,7 +237,9 @@ impl Session for JsonlSession {
             .map_err(|_| SessionError::Io("verrou session empoisonné".into()))?;
         let start = state.cursor.min(messages.len());
         for (offset, m) in messages[start..].iter().enumerate() {
-            write_entry_locked(&mut state, &SessionEntry::Message(m.clone()))?;
+            let mut persisted = m.clone();
+            redact_encrypted_reasoning(std::slice::from_mut(&mut persisted));
+            write_entry_locked(&mut state, &SessionEntry::Message(persisted))?;
             state.cursor = start + offset + 1;
         }
         Ok(())
@@ -253,11 +255,13 @@ impl Session for JsonlSession {
             .state
             .lock()
             .map_err(|_| SessionError::Io("verrou session empoisonné".into()))?;
+        let mut persisted = messages.to_vec();
+        redact_encrypted_reasoning(&mut persisted);
         write_entry_locked(
             &mut state,
             &SessionEntry::CompactCheckpoint {
                 kind,
-                messages: messages.to_vec(),
+                messages: persisted,
             },
         )?;
         state.cursor = messages.len();
@@ -679,6 +683,82 @@ mod tests {
         assert!(
             raw.contains("\"entry\":\"compact_checkpoint\""),
             "nouveaux checkpoints en entrée unique"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sync_does_not_persist_encrypted_reasoning() {
+        let dir = tmp("sync-redact-reasoning");
+        let s = JsonlSession::create_in(&dir).unwrap();
+        let assistant = Message::assistant(vec![
+            ContentBlock::EncryptedReasoning {
+                id: "rs_1".into(),
+                encrypted_content: "ENC_SECRET".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+        ]);
+        s.sync(&[assistant]).await.unwrap();
+        drop(s);
+
+        let raw = std::fs::read_to_string(dir.join(SESSION_FILE)).unwrap();
+        assert!(!raw.contains("ENC_SECRET"));
+        let resumed = resume_dir(&dir).unwrap();
+        assert!(
+            resumed.messages[0]
+                .content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::EncryptedReasoning { .. }))
+        );
+        assert!(
+            resumed.messages[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_does_not_persist_encrypted_reasoning() {
+        let dir = tmp("checkpoint-redact-reasoning");
+        let s = JsonlSession::create_in(&dir).unwrap();
+        let assistant = Message::assistant(vec![
+            ContentBlock::EncryptedReasoning {
+                id: "rs_1".into(),
+                encrypted_content: "ENC_SECRET".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+        ]);
+        s.checkpoint(CompactKind::Auto, &[summary("[résumé]"), assistant])
+            .await
+            .unwrap();
+        drop(s);
+
+        let raw = std::fs::read_to_string(dir.join(SESSION_FILE)).unwrap();
+        assert!(!raw.contains("ENC_SECRET"));
+        let resumed = resume_dir(&dir).unwrap();
+        assert!(
+            resumed
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .all(|b| !matches!(b, ContentBlock::EncryptedReasoning { .. }))
+        );
+        assert!(
+            resumed
+                .messages
+                .iter()
+                .flat_map(|m| &m.content)
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
