@@ -154,10 +154,10 @@ impl Session for JsonlSession {
             .lock()
             .map_err(|_| SessionError::Io("verrou curseur empoisonné".into()))?;
         let start = (*cur).min(messages.len());
-        for m in &messages[start..] {
+        for (offset, m) in messages[start..].iter().enumerate() {
             self.append(&SessionEntry::Message(m.clone()))?;
+            *cur = start + offset + 1;
         }
-        *cur = messages.len();
         Ok(())
     }
 
@@ -215,6 +215,7 @@ pub fn resume_file(path: &Path) -> Result<ResumedSession, SessionError> {
         Err(e) => return Err(io_err(e)),
     };
 
+    let ends_with_newline = content.ends_with('\n');
     let lines: Vec<&str> = content.lines().collect();
     let n = lines.len();
     let mut out = ResumedSession::default();
@@ -242,7 +243,7 @@ pub fn resume_file(path: &Path) -> Result<ResumedSession, SessionError> {
             Ok(SessionEntry::FileHistorySnapshot(_)) => {}
             Ok(SessionEntry::Meta { .. } | SessionEntry::Unknown) => {}
             Err(e) => {
-                if i == n - 1 {
+                if i == n - 1 && !ends_with_newline {
                     // dernière ligne tronquée par un crash → ignorée (AC3).
                     out.skipped_partial = true;
                 } else {
@@ -481,6 +482,21 @@ mod tests {
         );
         assert_eq!(resumed.messages.len(), 1);
         assert_eq!(resumed.messages[0].text(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_errors_on_corrupt_final_line_with_newline() {
+        let dir = tmp("corrupt-final-newline");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_FILE);
+        let valid = serde_json::to_string(&SessionEntry::Message(Message::user("ok"))).unwrap();
+        std::fs::write(&path, format!("{valid}\nGARBAGE\n")).unwrap();
+
+        assert!(
+            resume_file(&path).is_err(),
+            "une ligne finale corrompue terminée par newline n'est pas une troncature"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

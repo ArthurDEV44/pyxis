@@ -230,6 +230,37 @@ impl Tool for Hang {
     }
 }
 
+struct FailsUntrusted;
+
+#[async_trait]
+impl Tool for FailsUntrusted {
+    type Input = serde_json::Value;
+    fn name(&self) -> &str {
+        "fails_untrusted"
+    }
+    fn description(&self) -> String {
+        "fails".into()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn is_concurrency_safe(&self) -> bool {
+        true
+    }
+    fn is_sensitive(&self) -> bool {
+        false
+    }
+    fn permission(&self, _i: &Self::Input, _c: &PermCtx) -> PermissionDecision {
+        PermissionDecision::Allow
+    }
+    async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::Rejected("sortie externe invalide".into()))
+    }
+}
+
 fn allow_approver() -> Arc<dyn Approver> {
     Arc::new(crate::permission::AutoApprove)
 }
@@ -352,6 +383,10 @@ async fn timeout_does_not_hang_the_dispatch() {
     assert_eq!(out.len(), 1);
     assert!(out[0].is_error);
     assert!(out[0].content.contains("timeout"));
+    assert!(
+        reg.taint_recent(),
+        "timeout untrusted doit marquer le taint"
+    );
 }
 
 // ══════════════════════════ US-011 ══════════════════════════
@@ -739,6 +774,25 @@ async fn default_registry_exposes_six_tool_specs() {
     for spec in specs {
         spec.validate().unwrap();
     }
+}
+
+#[tokio::test]
+async fn untrusted_tool_error_marks_taint() {
+    let reg = Registry::builder("/tmp")
+        .mode(PermissionMode::Default)
+        .approver(allow_approver())
+        .register(FailsUntrusted)
+        .build();
+    assert!(!reg.taint_recent(), "pas de taint au départ");
+    let out = reg
+        .dispatch(vec![call("a", "fails_untrusted", serde_json::json!({}))])
+        .await;
+    assert!(by_id(&out, "a").is_error);
+    assert!(by_id(&out, "a").untrusted);
+    assert!(
+        reg.taint_recent(),
+        "une erreur d'outil untrusted entre dans le transcript"
+    );
 }
 
 // ══════════════════════════ EP-007 ══════════════════════════

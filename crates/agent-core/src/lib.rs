@@ -69,11 +69,14 @@ mod loop_tests {
         caps: Capabilities,
         turns: Mutex<VecDeque<MockTurn>>,
         summary: String,
+        summary_usage: TokenUsage,
         summary_fails: bool,
         log: Arc<Mutex<Vec<&'static str>>>,
+        refreshes: Arc<Mutex<u32>>,
         /// Capture les `messages` de chaque requête (US-028 : vérifier l'injection
         /// éphémère sans toucher au transcript persistant).
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        request_models: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -89,6 +92,7 @@ mod loop_tests {
             req: CanonicalRequest,
         ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
             self.log.lock().unwrap().push("stream");
+            self.request_models.lock().unwrap().push(req.model.clone());
             self.requests.lock().unwrap().push(req.messages.clone());
             match self.turns.lock().unwrap().pop_front() {
                 Some(MockTurn::Stream(evs)) => Ok(Box::pin(futures_util::stream::iter(
@@ -120,7 +124,7 @@ mod loop_tests {
                 content: vec![ContentBlock::Text {
                     text: self.summary.clone(),
                 }],
-                usage: TokenUsage::default(),
+                usage: self.summary_usage,
                 stop: StopReason::EndTurn,
             })
         }
@@ -128,10 +132,19 @@ mod loop_tests {
             match err {
                 ProviderError::Http { status: 429, .. } => ErrorClass::RateLimited,
                 ProviderError::Http { status: 529, .. } => ErrorClass::Overloaded(529),
+                ProviderError::Http {
+                    status: 401,
+                    message,
+                    ..
+                } if message.contains("expired") => ErrorClass::Auth(AuthError::Expired),
                 ProviderError::Http { status: 401, .. } => ErrorClass::Auth(AuthError::Invalid),
                 ProviderError::Http { status: 400, .. } => ErrorClass::InvalidRequest,
                 _ => ErrorClass::Retryable,
             }
+        }
+        async fn refresh_auth(&self) -> Result<(), ProviderError> {
+            *self.refreshes.lock().unwrap() += 1;
+            Ok(())
         }
     }
 
@@ -221,14 +234,27 @@ mod loop_tests {
 
     struct Harness {
         log: Arc<Mutex<Vec<&'static str>>>,
+        refreshes: Arc<Mutex<u32>>,
         boundaries: Arc<InMemorySession>,
         requests: Arc<Mutex<Vec<Vec<Message>>>>,
+        request_models: Arc<Mutex<Vec<String>>>,
         deps: Deps,
     }
 
     fn harness(turns: Vec<MockTurn>, summary_fails: bool, max_context: u32) -> Harness {
+        harness_with_summary_usage(turns, summary_fails, max_context, TokenUsage::default())
+    }
+
+    fn harness_with_summary_usage(
+        turns: Vec<MockTurn>,
+        summary_fails: bool,
+        max_context: u32,
+        summary_usage: TokenUsage,
+    ) -> Harness {
         let log = Arc::new(Mutex::new(Vec::new()));
+        let refreshes = Arc::new(Mutex::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_models = Arc::new(Mutex::new(Vec::new()));
         let session = Arc::new(InMemorySession {
             synced: Mutex::new(Vec::new()),
             cursor: Mutex::new(0),
@@ -251,9 +277,12 @@ mod loop_tests {
             },
             turns: Mutex::new(turns.into()),
             summary: "RÉSUMÉ".to_string(),
+            summary_usage,
             summary_fails,
             log: Arc::clone(&log),
+            refreshes: Arc::clone(&refreshes),
             requests: Arc::clone(&requests),
+            request_models: Arc::clone(&request_models),
         });
         let deps = Deps {
             provider,
@@ -264,8 +293,10 @@ mod loop_tests {
         };
         Harness {
             log,
+            refreshes,
             boundaries: session,
             requests,
+            request_models,
             deps,
         }
     }
@@ -598,6 +629,88 @@ mod loop_tests {
     }
 
     #[tokio::test]
+    async fn invalid_context_geometry_fails_before_provider_call() {
+        let h = harness(vec![text_turn("jamais")], false, 100);
+        let ctx = AgentContext::new("mock")
+            .with_config(RunConfig {
+                max_output_tokens: 100,
+                ..RunConfig::default()
+            })
+            .push(Message::user("go"));
+        let events = drive(ctx, h.deps).await;
+        assert!(
+            matches!(
+                events.first(),
+                Some(AgentEvent::Error(crate::AgentError::InvalidRequest(_)))
+            ),
+            "géométrie contexte invalide attendue: {events:?}"
+        );
+        assert!(
+            !h.log.lock().unwrap().contains(&"stream"),
+            "le provider ne doit pas être appelé"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_expired_refreshes_then_retries_opening_stream() {
+        let h = harness(
+            vec![
+                MockTurn::Err(ProviderError::Http {
+                    status: 401,
+                    message: "access token expired".into(),
+                    retry_after_ms: None,
+                }),
+                text_turn("ok"),
+            ],
+            false,
+            100_000,
+        );
+        let refreshes = Arc::clone(&h.refreshes);
+        let log = Arc::clone(&h.log);
+        let ctx = AgentContext::new("mock").push(Message::user("go"));
+        let events = drive(ctx, h.deps).await;
+        assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+        assert_eq!(*refreshes.lock().unwrap(), 1);
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| **entry == "stream")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn overload_opening_stream_switches_to_configured_fallback_model() {
+        let h = harness(
+            vec![
+                MockTurn::Err(ProviderError::Http {
+                    status: 529,
+                    message: "overloaded".into(),
+                    retry_after_ms: None,
+                }),
+                text_turn("ok"),
+            ],
+            false,
+            100_000,
+        );
+        let request_models = Arc::clone(&h.request_models);
+        let ctx = AgentContext::new("primary")
+            .with_config(RunConfig {
+                overload_fallback_model: Some("fallback".into()),
+                ..RunConfig::default()
+            })
+            .push(Message::user("go"));
+        let events = drive(ctx, h.deps).await;
+        assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
+        assert_eq!(
+            *request_models.lock().unwrap(),
+            vec!["primary".to_string(), "fallback".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn retry_after_visible_delta_resets_headless_output() {
         let h = harness(
             vec![
@@ -879,6 +992,106 @@ mod loop_tests {
             events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ToolResult(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_stream_usage_counts_before_retry() {
+        let h = harness(
+            vec![
+                MockTurn::StreamThenErr(
+                    vec![StreamEvent::Usage {
+                        usage: TokenUsage {
+                            input: 100,
+                            output: 50,
+                        },
+                    }],
+                    ProviderError::Stream("reset".into()),
+                ),
+                text_turn("jamais atteint"),
+            ],
+            false,
+            1_000_000,
+        );
+        let log = Arc::clone(&h.log);
+        let ctx = AgentContext::new("mock")
+            .with_config(RunConfig {
+                token_budget: Some(120),
+                max_output_tokens: 10,
+                ..RunConfig::default()
+            })
+            .push(Message::user("contexte"))
+            .push(Message::assistant_text("ok"))
+            .push(Message::user("go"));
+        let events = drive(ctx, h.deps).await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Exhausted(ExhaustReason::TokenBudget {
+                    spent: 150,
+                    limit: 120
+                }))
+            ),
+            "usage du stream échoué doit compter: {events:?}"
+        );
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| **entry == "stream")
+                .count(),
+            1,
+            "le retry doit être bloqué par le budget avant de rouvrir un stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_usage_counts_against_token_budget() {
+        let h = harness_with_summary_usage(
+            vec![
+                MockTurn::Err(ProviderError::ContextLengthExceeded),
+                text_turn("jamais atteint"),
+            ],
+            false,
+            100_000,
+            TokenUsage {
+                input: 100,
+                output: 50,
+            },
+        );
+        let log = Arc::clone(&h.log);
+        let ctx = AgentContext::new("mock")
+            .with_config(RunConfig {
+                token_budget: Some(120),
+                max_output_tokens: 10,
+                ..RunConfig::default()
+            })
+            .push(Message::user("contexte"))
+            .push(Message::assistant_text("ok"))
+            .push(Message::user("go"));
+        let events = drive(ctx, h.deps).await;
+        assert!(
+            has_compacted(&events, CompactKind::Reactive),
+            "compaction réactive attendue: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(AgentEvent::Exhausted(ExhaustReason::TokenBudget {
+                    spent: 150,
+                    limit: 120
+                }))
+            ),
+            "usage de compaction doit compter: {events:?}"
+        );
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|entry| **entry == "stream")
+                .count(),
+            1,
+            "aucun stream post-compaction ne doit démarrer après budget atteint"
         );
     }
 

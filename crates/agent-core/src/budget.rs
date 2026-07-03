@@ -28,6 +28,23 @@ pub struct ContextBudget {
 }
 
 impl ContextBudget {
+    /// Variante faillible pour le wiring runtime : une fenêtre inutilisable est une
+    /// erreur de config/provider, pas un budget à seuils zéro.
+    pub fn try_for_model(max_context: u32, output_reserve: u32) -> Result<Self, String> {
+        if max_context == 0 {
+            return Err("max_context provider nul".to_string());
+        }
+        if output_reserve == 0 {
+            return Err("max_output_tokens nul".to_string());
+        }
+        if output_reserve >= max_context {
+            return Err(format!(
+                "max_output_tokens ({output_reserve}) doit rester inférieur au contexte ({max_context})"
+            ));
+        }
+        Ok(Self::for_model(max_context, output_reserve))
+    }
+
     /// Construit le budget depuis la fenêtre du modèle. Seuils : micro à 70 %,
     /// auto à 80 % de la fenêtre utilisable (`max_context - output_reserve`).
     pub fn for_model(max_context: u32, output_reserve: u32) -> Self {
@@ -88,9 +105,12 @@ impl ContextBudget {
         self.current_input = estimated_input;
     }
 
-    /// US-030 : signale qu'une compaction vient de réussir → le prochain `usage`
-    /// réel ancrera le baseline `prefill` (anti double-compaction immédiate).
-    pub fn mark_compacted(&mut self) {
+    /// US-030 : signale qu'une compaction vient de réussir. Le contexte compacté
+    /// estimé devient un baseline immédiat pour éviter une double-compaction avant
+    /// le prochain stream ; le prochain `usage` réel le remplacera.
+    pub fn mark_compacted(&mut self, compacted_input: u32) {
+        self.current_input = compacted_input;
+        self.prefill_input = compacted_input;
         self.awaiting_baseline = true;
     }
 
@@ -184,6 +204,15 @@ mod tests {
     }
 
     #[test]
+    fn invalid_context_geometry_is_rejected() {
+        assert!(ContextBudget::try_for_model(0, 200).is_err());
+        assert!(ContextBudget::try_for_model(1000, 0).is_err());
+        assert!(ContextBudget::try_for_model(1000, 1000).is_err());
+        assert!(ContextBudget::try_for_model(1000, 1001).is_err());
+        assert!(ContextBudget::try_for_model(1000, 200).is_ok());
+    }
+
+    #[test]
     fn usage_seen_vs_estimated() {
         let mut b = ContextBudget::for_model(1000, 200);
         b.begin_turn();
@@ -209,7 +238,11 @@ mod tests {
     fn post_compaction_baseline_prevents_immediate_recompaction() {
         // fenêtre 1000, réserve 200 → auto 640.
         let mut b = ContextBudget::for_model(1000, 200);
-        b.mark_compacted();
+        b.mark_compacted(650);
+        assert!(
+            !b.should_autocompact(),
+            "le baseline estimé bloque la recompaction avant usage réel"
+        );
         // 1er usage réel post-compaction : 650 (overhead incompressible). Sans
         // baseline, 650 >= 640 → recompaction immédiate. Avec baseline : 650 devient
         // prefill, donc current - prefill = 0 → pas de compaction.

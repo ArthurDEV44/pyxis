@@ -14,6 +14,7 @@ use crate::error::{AgentError, ProviderFailure};
 use crate::message::{ContentBlock, Message, Role, ToolCallId};
 use crate::provider::{StopReason, StreamEvent};
 use crate::tools::ToolInvocation;
+use agent_tokenizer::TokenCounter;
 use serde::{Deserialize, Serialize};
 
 /// Erreur de CONTEXTE retenue par le withholding (PTL / max-tokens). Distincte
@@ -286,6 +287,31 @@ impl Accumulator {
             && self.reasonings.is_empty()
             && self.completed.is_empty()
     }
+
+    /// Estimation conservative de la sortie générée quand le provider n'a pas
+    /// envoyé d'`Usage`. Inclut le texte visible, le reasoning, les tool calls et
+    /// les fragments incomplets éventuels avant erreur.
+    pub fn estimate_output(&self, counter: &dyn TokenCounter) -> u32 {
+        let mut total = counter
+            .count_text(&self.text)
+            .saturating_add(counter.count_text(&self.reasoning));
+        for (id, encrypted_content) in &self.reasonings {
+            total = total
+                .saturating_add(counter.count_text(id))
+                .saturating_add(counter.count_text(encrypted_content));
+        }
+        for call in self.completed.values() {
+            total = total
+                .saturating_add(counter.count_text(&call.name))
+                .saturating_add(counter.count_text(&call.input.to_string()));
+        }
+        for call in self.open.values() {
+            total = total
+                .saturating_add(counter.count_text(&call.name))
+                .saturating_add(counter.count_text(&call.args));
+        }
+        u32::try_from(total).unwrap_or(u32::MAX)
+    }
 }
 
 fn parse_tool_args(id: &str, args: &str) -> Result<serde_json::Value, AgentError> {
@@ -303,6 +329,7 @@ fn contract_error(message: impl Into<String>) -> AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_tokenizer::HeuristicCounter;
 
     fn acc_with(events: Vec<StreamEvent>) -> Accumulator {
         let mut a = Accumulator::new();
@@ -487,6 +514,35 @@ mod tests {
         let m = a.to_assistant_message();
         assert_eq!(m.role, Role::Assistant);
         assert_eq!(m.content.len(), 2);
+    }
+
+    #[test]
+    fn fallback_output_estimate_counts_reasoning_and_tool_calls() {
+        let a = acc_with(vec![
+            StreamEvent::ReasoningDelta {
+                text: "reasoning caché".into(),
+            },
+            StreamEvent::EncryptedReasoning {
+                id: "rs_1".into(),
+                encrypted_content: "ENC".into(),
+            },
+            StreamEvent::ToolCallStart {
+                id: "c1".into(),
+                name: "bash".into(),
+            },
+            StreamEvent::ToolCallDelta {
+                id: "c1".into(),
+                args_json: "{\"cmd\":\"ls\"}".into(),
+            },
+            StreamEvent::ToolCallEnd { id: "c1".into() },
+            StreamEvent::Done {
+                stop: StopReason::ToolUse,
+            },
+        ]);
+        assert!(
+            a.estimate_output(&HeuristicCounter) > 0,
+            "une sortie sans texte visible doit quand même compter"
+        );
     }
 
     #[test]

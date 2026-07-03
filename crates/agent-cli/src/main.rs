@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use agent_auth::store;
 use agent_core::clock::SystemClock;
+use agent_core::guardrail::CostBudget;
 use agent_core::message::Message;
 use agent_core::provider::Provider;
 use agent_core::{AgentContext, Deps, RunConfig};
@@ -35,6 +36,11 @@ struct Args {
     allow_hosts: Vec<String>,
     yes: bool,
     sandbox: bool,
+    token_budget: Option<String>,
+    cost_budget_micro_usd: Option<String>,
+    input_cost_micro_per_ktok: Option<String>,
+    output_cost_micro_per_ktok: Option<String>,
+    overload_fallback_model: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -44,6 +50,11 @@ fn parse_args() -> Args {
         allow_hosts: Vec::new(),
         yes: false,
         sandbox: true,
+        token_budget: None,
+        cost_budget_micro_usd: None,
+        input_cost_micro_per_ktok: None,
+        output_cost_micro_per_ktok: None,
+        overload_fallback_model: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -61,6 +72,11 @@ fn parse_args() -> Args {
             }
             "--yes" | "-y" => args.yes = true,
             "--no-sandbox" => args.sandbox = false,
+            "--token-budget" => args.token_budget = it.next(),
+            "--cost-budget-micro-usd" => args.cost_budget_micro_usd = it.next(),
+            "--input-cost-micro-per-ktok" => args.input_cost_micro_per_ktok = it.next(),
+            "--output-cost-micro-per-ktok" => args.output_cost_micro_per_ktok = it.next(),
+            "--overload-fallback-model" => args.overload_fallback_model = it.next(),
             other => {
                 // un argument nu sans -p est traité comme le prompt (mode -p implicite).
                 if args.prompt.is_none() && !other.starts_with('-') {
@@ -70,6 +86,79 @@ fn parse_args() -> Args {
         }
     }
     args
+}
+
+fn parse_positive_u64(raw: &str, name: &str) -> anyhow::Result<u64> {
+    let value = raw
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| anyhow::anyhow!("{name} doit être un entier positif"))?;
+    if value == 0 {
+        anyhow::bail!("{name} doit être > 0");
+    }
+    Ok(value)
+}
+
+fn setting_u64(arg: &Option<String>, env: &str, name: &str) -> anyhow::Result<Option<u64>> {
+    match arg {
+        Some(raw) => parse_positive_u64(raw, name).map(Some),
+        None => match std::env::var(env) {
+            Ok(raw) if !raw.trim().is_empty() => parse_positive_u64(&raw, env).map(Some),
+            _ => Ok(None),
+        },
+    }
+}
+
+fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
+    let token_budget = setting_u64(&args.token_budget, "PYXIS_TOKEN_BUDGET", "--token-budget")?;
+    let cost_limit = setting_u64(
+        &args.cost_budget_micro_usd,
+        "PYXIS_COST_BUDGET_MICRO_USD",
+        "--cost-budget-micro-usd",
+    )?;
+    let input_price = setting_u64(
+        &args.input_cost_micro_per_ktok,
+        "PYXIS_INPUT_COST_MICRO_PER_KTOK",
+        "--input-cost-micro-per-ktok",
+    )?;
+    let output_price = setting_u64(
+        &args.output_cost_micro_per_ktok,
+        "PYXIS_OUTPUT_COST_MICRO_PER_KTOK",
+        "--output-cost-micro-per-ktok",
+    )?;
+
+    let cost_budget = match (cost_limit, input_price, output_price) {
+        (None, None, None) => None,
+        (Some(limit_micro_usd), Some(input_micro_per_ktok), Some(output_micro_per_ktok)) => {
+            Some(CostBudget {
+                limit_micro_usd,
+                input_micro_per_ktok,
+                output_micro_per_ktok,
+            })
+        }
+        _ => anyhow::bail!(
+            "budget coût incomplet : fournir --cost-budget-micro-usd, --input-cost-micro-per-ktok et --output-cost-micro-per-ktok"
+        ),
+    };
+    let overload_fallback_model = args
+        .overload_fallback_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("PYXIS_OVERLOAD_FALLBACK_MODEL")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+
+    Ok(RunConfig {
+        token_budget,
+        cost_budget,
+        overload_fallback_model,
+        ..RunConfig::default()
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -160,6 +249,7 @@ async fn run(
     mcp_config: agent_mcp::McpConfigFile,
     context_msgs: Vec<Message>,
 ) -> anyhow::Result<()> {
+    let run_config = run_config_from_args(&args)?;
     // 1. Credential abonnement ChatGPT (keyring). Absente → on guide vers le login.
     let cred = match store::load(KEYRING_ACCOUNT)? {
         Some(agent_auth::Credential::Oauth(o)) => o,
@@ -267,7 +357,7 @@ async fn run(
             system: Some(interactive::compose_system(&base, goal.as_deref())),
             messages: vec![Message::user(prompt)],
             tools: tool_specs,
-            config: RunConfig::default(),
+            config: run_config,
             context_messages: context_msgs,
         };
         let result = agent_core::run_headless(ctx, deps).await;
@@ -298,7 +388,7 @@ async fn run(
             model: args.model,
             tool_guidelines,
             context_messages: context_msgs,
-            run_config: RunConfig::default(),
+            run_config,
             tool_specs,
             truecolor: agent_tui::supports_truecolor(),
             // Reduced-motion : spinner dégradé en point pulsé (US-044).
@@ -322,4 +412,69 @@ async fn run(
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Args, run_config_from_args};
+
+    fn args() -> Args {
+        Args {
+            model: "mock".into(),
+            prompt: None,
+            allow_hosts: Vec::new(),
+            yes: false,
+            sandbox: true,
+            token_budget: None,
+            cost_budget_micro_usd: None,
+            input_cost_micro_per_ktok: None,
+            output_cost_micro_per_ktok: None,
+            overload_fallback_model: None,
+        }
+    }
+
+    #[test]
+    fn run_config_reads_token_budget_flag() {
+        let mut args = args();
+        args.token_budget = Some("1234".into());
+        let cfg = run_config_from_args(&args).unwrap();
+        assert_eq!(cfg.token_budget, Some(1234));
+    }
+
+    #[test]
+    fn run_config_reads_complete_cost_budget() {
+        let mut args = args();
+        args.cost_budget_micro_usd = Some("10".into());
+        args.input_cost_micro_per_ktok = Some("2".into());
+        args.output_cost_micro_per_ktok = Some("4".into());
+        let cfg = run_config_from_args(&args).unwrap();
+        let cost = cfg.cost_budget.unwrap();
+        assert_eq!(cost.limit_micro_usd, 10);
+        assert_eq!(cost.input_micro_per_ktok, 2);
+        assert_eq!(cost.output_micro_per_ktok, 4);
+    }
+
+    #[test]
+    fn run_config_rejects_incomplete_cost_budget() {
+        let mut args = args();
+        args.cost_budget_micro_usd = Some("10".into());
+        let err = run_config_from_args(&args).unwrap_err().to_string();
+        assert!(err.contains("budget coût incomplet"));
+    }
+
+    #[test]
+    fn run_config_rejects_zero_budget() {
+        let mut args = args();
+        args.token_budget = Some("0".into());
+        let err = run_config_from_args(&args).unwrap_err().to_string();
+        assert!(err.contains("doit être > 0"));
+    }
+
+    #[test]
+    fn run_config_reads_overload_fallback_model() {
+        let mut args = args();
+        args.overload_fallback_model = Some(" fallback ".into());
+        let cfg = run_config_from_args(&args).unwrap();
+        assert_eq!(cfg.overload_fallback_model.as_deref(), Some("fallback"));
+    }
 }

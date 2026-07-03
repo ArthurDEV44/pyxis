@@ -172,9 +172,17 @@ impl Registry {
         let untrusted = tool.returns_untrusted();
         match tokio::time::timeout(self.ctx.timeout, tool.invoke(call.input, &self.ctx)).await {
             Err(_elapsed) => {
+                if untrusted {
+                    self.taint.mark();
+                }
                 err_outcome_tainted(id, "timeout outil dépassé".to_string(), untrusted)
             }
-            Ok(Err(e)) => err_outcome_tainted(id, e.to_string(), untrusted),
+            Ok(Err(e)) => {
+                if untrusted {
+                    self.taint.mark();
+                }
+                err_outcome_tainted(id, e.to_string(), untrusted)
+            }
             Ok(Ok(out)) => {
                 // 4. taint : une sortie untrusted vient d'entrer dans le contexte.
                 if untrusted {

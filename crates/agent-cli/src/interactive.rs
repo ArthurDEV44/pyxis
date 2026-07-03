@@ -79,6 +79,8 @@ const GOAL_CONTINUE_PROMPT: &str = "Poursuis l'objectif de session. S'il reste \
     du travail, continue. S'il est pleinement atteint et vérifié, termine ta \
     réponse par <<GOAL_DONE>> seul sur la dernière ligne.";
 
+const GOAL_ITERS_FILE: &str = "goal.iters";
+
 /// Compose le system prompt effectif : base + DIRECTIVE de complétion. L'objectif
 /// vit dans `instructions` (re-envoyé chaque tour) donc survit à la compaction —
 /// `agent-core::compaction` ne touche que `messages`, jamais le system.
@@ -162,14 +164,61 @@ fn launch_turn(
 fn take_goal_done(state: &mut AppState) -> bool {
     for block in state.blocks.iter_mut().rev() {
         if let Block::Assistant { text, .. } = block {
-            if text.contains(GOAL_DONE_MARKER) {
-                *text = text.replace(GOAL_DONE_MARKER, "").trim_end().to_string();
+            let trimmed = text.trim_end();
+            let marker_is_last_line = trimmed
+                .lines()
+                .next_back()
+                .is_some_and(|line| line.trim() == GOAL_DONE_MARKER);
+            if marker_is_last_line {
+                let mut lines: Vec<&str> = trimmed.lines().collect();
+                if lines
+                    .last()
+                    .is_some_and(|line| line.trim() == GOAL_DONE_MARKER)
+                {
+                    lines.pop();
+                }
+                *text = lines.join("\n").trim_end().to_string();
                 return true;
             }
             return false;
         }
     }
     false
+}
+
+fn session_path_from_arg(sessions_dir: &Path, arg: &str) -> Option<PathBuf> {
+    let candidate = Path::new(arg);
+    if arg.trim().is_empty()
+        || candidate.components().count() != 1
+        || candidate.extension().and_then(|e| e.to_str()) != Some("jsonl")
+    {
+        return None;
+    }
+    Some(sessions_dir.join(candidate))
+}
+
+fn read_goal_iters(path: Option<&Path>) -> u32 {
+    path.and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+fn write_goal_iters(path: Option<&Path>, value: u32) -> std::io::Result<()> {
+    if let Some(path) = path {
+        std::fs::write(path, value.to_string())?;
+    }
+    Ok(())
+}
+
+fn remove_if_exists(path: Option<&Path>) -> std::io::Result<()> {
+    if let Some(path) = path {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 fn scrub_encrypted_reasoning(messages: &mut [Message]) -> usize {
@@ -236,6 +285,7 @@ async fn event_loop(
     state.mcp_servers = mcp_metas(&mcp);
     // Sidecar de l'objectif persistant (`<workspace>/.pyxis/goal`).
     let goal_path = sessions_dir.parent().map(|p| p.join("goal"));
+    let goal_iters_path = sessions_dir.parent().map(|p| p.join(GOAL_ITERS_FILE));
     // Historique des prompts de TOUT le dossier (toutes les conversations).
     state.load_history(agent_session::workspace_prompts(
         &sessions_dir,
@@ -260,7 +310,11 @@ async fn event_loop(
     let mut running = false;
     // Compteur de relances automatiques de la boucle d'objectif (reset à chaque
     // saisie utilisateur / nouvel objectif).
-    let mut goal_iters: u32 = 0;
+    let mut goal_iters: u32 = if cfg.goal.is_some() {
+        read_goal_iters(goal_iters_path.as_deref())
+    } else {
+        0
+    };
     let mut pending_resp: Option<oneshot::Sender<bool>> = None;
 
     // Tick d'animation du spinner (US-044). 100 ms ≈ 10 fps : fluide et quasi gratuit
@@ -359,8 +413,11 @@ async fn event_loop(
                                 })),
                                 "clear" => {
                                     cfg.goal = None;
-                                    if let Some(p) = &goal_path {
-                                        let _ = std::fs::remove_file(p);
+                                    if let Err(e) = remove_if_exists(goal_path.as_deref()) {
+                                        state.blocks.push(Block::Error(format!("goal: {e}")));
+                                    }
+                                    if let Err(e) = remove_if_exists(goal_iters_path.as_deref()) {
+                                        state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
                                     state.blocks.push(Block::Notice("Objectif effacé.".into()));
                                 }
@@ -368,8 +425,13 @@ async fn event_loop(
                                     // Fixe l'objectif (sidecar : survit redémarrage + /resume)
                                     // ET lance immédiatement le travail vers lui.
                                     cfg.goal = Some(g.to_string());
-                                    if let Some(p) = &goal_path {
-                                        let _ = std::fs::write(p, g);
+                                    if let Some(p) = &goal_path
+                                        && let Err(e) = std::fs::write(p, g)
+                                    {
+                                        state.blocks.push(Block::Error(format!("goal: {e}")));
+                                    }
+                                    if let Err(e) = write_goal_iters(goal_iters_path.as_deref(), 0) {
+                                        state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
                                     goal_iters = 0;
                                     state.push_user(g);
@@ -385,7 +447,12 @@ async fn event_loop(
                                 ));
                             }
                             "/resume" => {
-                                let path = sessions_dir.join(arg);
+                                let Some(path) = session_path_from_arg(&sessions_dir, arg) else {
+                                    state.blocks.push(Block::Error(
+                                        "resume: identifiant de session invalide".into(),
+                                    ));
+                                    continue;
+                                };
                                 match agent_session::resume_file(&path) {
                                     Ok(r) if !r.messages.is_empty() => {
                                         let msgs = r.messages;
@@ -520,8 +587,11 @@ async fn event_loop(
                         if endturn && cfg.goal.is_some() {
                             if take_goal_done(&mut state) {
                                 cfg.goal = None;
-                                if let Some(p) = &goal_path {
-                                    let _ = std::fs::remove_file(p);
+                                if let Err(e) = remove_if_exists(goal_path.as_deref()) {
+                                    state.blocks.push(Block::Error(format!("goal: {e}")));
+                                }
+                                if let Err(e) = remove_if_exists(goal_iters_path.as_deref()) {
+                                    state.blocks.push(Block::Error(format!("goal: {e}")));
                                 }
                                 state
                                     .blocks
@@ -529,6 +599,13 @@ async fn event_loop(
                                 running = false;
                             } else if goal_iters < MAX_GOAL_ITERS {
                                 goal_iters += 1;
+                                if let Err(e) =
+                                    write_goal_iters(goal_iters_path.as_deref(), goal_iters)
+                                {
+                                    state.blocks.push(Block::Error(format!("goal: {e}")));
+                                    running = false;
+                                    continue;
+                                }
                                 state.blocks.push(Block::Notice(format!(
                                     "↻ poursuite de l'objectif ({goal_iters}/{MAX_GOAL_ITERS})…"
                                 )));
@@ -793,9 +870,13 @@ fn new_session_path(dir: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{GOAL_DONE_MARKER, compose_system, scrub_encrypted_reasoning, take_goal_done};
+    use super::{
+        GOAL_DONE_MARKER, compose_system, scrub_encrypted_reasoning, session_path_from_arg,
+        take_goal_done,
+    };
     use agent_core::message::{ContentBlock, Message};
     use agent_tui::{AppState, Block};
+    use std::path::Path;
 
     #[test]
     fn compose_system_pins_completion_directive() {
@@ -833,6 +914,35 @@ mod tests {
                 if text == "c'est terminé" && !text.contains(GOAL_DONE_MARKER)),
             "marqueur strippé du dernier bloc",
         );
+    }
+
+    #[test]
+    fn take_goal_done_requires_marker_as_last_line() {
+        let mut s = AppState::new("gpt-5", false);
+        s.blocks.push(Block::Assistant {
+            text: format!("texte {GOAL_DONE_MARKER} au milieu"),
+            streaming: false,
+        });
+        assert!(!take_goal_done(&mut s));
+
+        s.blocks.push(Block::Assistant {
+            text: format!("terminé\n{GOAL_DONE_MARKER}\n\n"),
+            streaming: false,
+        });
+        assert!(take_goal_done(&mut s));
+    }
+
+    #[test]
+    fn session_path_from_arg_rejects_path_traversal() {
+        let sessions = Path::new("/tmp/pyxis-sessions");
+        assert_eq!(
+            session_path_from_arg(sessions, "123.jsonl").unwrap(),
+            sessions.join("123.jsonl")
+        );
+        assert!(session_path_from_arg(sessions, "../123.jsonl").is_none());
+        assert!(session_path_from_arg(sessions, "/tmp/123.jsonl").is_none());
+        assert!(session_path_from_arg(sessions, "nested/123.jsonl").is_none());
+        assert!(session_path_from_arg(sessions, "123.txt").is_none());
     }
 
     #[test]

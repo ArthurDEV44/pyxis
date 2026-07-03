@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AgentError;
 use crate::message::{ContentBlock, Message, Role};
-use crate::provider::{CanonicalRequest, Provider};
+use crate::provider::{CanonicalRequest, Provider, TokenUsage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,7 +106,7 @@ pub async fn full_compact(
     messages: &mut Vec<Message>,
     model: &str,
     provider: &dyn Provider,
-) -> Result<(), AgentError> {
+) -> Result<TokenUsage, AgentError> {
     // On conserve le dernier message utilisateur (l'ask courant) hors résumé.
     // IMPORTANT : on ne mute PAS `messages` de façon destructive avant que le
     // résumé ait réussi — un échec provider doit préserver le transcript
@@ -162,6 +162,7 @@ pub async fn full_compact(
     };
     // `?` ici laisse `messages` intact en cas d'échec (From<ProviderError>).
     let resp = provider.complete(req).await?;
+    let usage = resp.usage;
     let new_summary: String = resp
         .content
         .iter()
@@ -207,7 +208,7 @@ pub async fn full_compact(
     if let Some(u) = trailing_user {
         messages.push(u);
     }
-    Ok(())
+    Ok(usage)
 }
 
 /// Garde la QUEUE de `s` sur `max` octets (frontière de caractère), préfixée d'un

@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
+use tokio::io::AsyncReadExt;
 
 use crate::error::{ToolError, ValidationError};
 use crate::permission::{PermCtx, PermissionDecision};
@@ -81,11 +82,23 @@ impl Tool for Bash {
         let mut cmd = tokio::process::Command::new("sh");
 
         #[cfg(not(windows))]
-        cmd.arg("-c").arg(&input.command);
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.arg("-c").arg(&input.command);
+            cmd.process_group(0);
+        }
 
         cmd.current_dir(&ctx.workspace)
             .kill_on_drop(true)
-            .stdin(std::process::Stdio::null());
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        #[cfg(windows)]
+        {
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
 
         // Durcissement sandbox (réseau via HTTP_PROXY) injecté par l'agent-cli.
         // Le confinement FS Landlock est process-wide → hérité par ce sous-process.
@@ -93,28 +106,89 @@ impl Tool for Bash {
             harden(&mut cmd);
         }
 
-        let output = cmd
-            .output()
-            .await
+        let mut child = cmd
+            .spawn()
             .map_err(|e| ToolError::Io(format!("lancement du shell: {e}")))?;
+        let pid = child.id();
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_task = tokio::spawn(async move {
+            match stdout {
+                Some(out) => read_tail(out).await,
+                None => Capture::default(),
+            }
+        });
+        let stderr_task = tokio::spawn(async move {
+            match stderr {
+                Some(err) => read_tail(err).await,
+                None => Capture::default(),
+            }
+        });
+
+        let inner_timeout = ctx
+            .timeout
+            .checked_sub(std::time::Duration::from_millis(25))
+            .unwrap_or(ctx.timeout);
+        let (status, timed_out) = match tokio::time::timeout(inner_timeout, child.wait()).await {
+            Ok(res) => (
+                Some(res.map_err(|e| ToolError::Io(format!("attente du shell: {e}")))?),
+                false,
+            ),
+            Err(_) => {
+                if let Some(pid) = pid {
+                    kill_process_tree(pid).await;
+                }
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                (None, true)
+            }
+        };
+
+        let stdout = stdout_task
+            .await
+            .map_err(|e| ToolError::Io(format!("lecture stdout: {e}")))?;
+        let stderr = stderr_task
+            .await
+            .map_err(|e| ToolError::Io(format!("lecture stderr: {e}")))?;
 
         let mut body = String::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stdout.is_empty() {
-            body.push_str(&stdout);
+        let stdout_text = String::from_utf8_lossy(&stdout.bytes);
+        let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+        if stdout.omitted > 0 {
+            body.push_str(&format!(
+                "[... stdout tronqué, {} octets, début omis]\n",
+                stdout.omitted
+            ));
         }
-        if !stderr.is_empty() {
+        if !stdout.is_empty() {
+            body.push_str(&stdout_text);
+        }
+        if !stderr_text.is_empty() || stderr.omitted > 0 {
             if !body.is_empty() && !body.ends_with('\n') {
                 body.push('\n');
             }
-            body.push_str(&stderr);
+            if stderr.omitted > 0 {
+                body.push_str(&format!(
+                    "[... stderr tronqué, {} octets, début omis]\n",
+                    stderr.omitted
+                ));
+            }
+            body.push_str(&stderr_text);
         }
         if body.len() > MAX_OUTPUT {
             body = truncate_tail(&body, MAX_OUTPUT);
         }
 
-        let code = output.status.code();
+        if timed_out {
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str("[timeout outil dépassé]");
+            return Ok(ToolOutput::error(body));
+        }
+
+        let code = status.and_then(|s| s.code());
         match code {
             Some(0) => {
                 if body.is_empty() {
@@ -131,6 +205,71 @@ impl Tool for Bash {
                 Ok(ToolOutput::error(body))
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct Capture {
+    bytes: Vec<u8>,
+    omitted: usize,
+}
+
+impl Capture {
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+async fn read_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> Capture {
+    let mut out = Capture::default();
+    let mut buf = [0_u8; 8192];
+    loop {
+        let n = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        out.bytes.extend_from_slice(&buf[..n]);
+        if out.bytes.len() > MAX_OUTPUT {
+            let overflow = out.bytes.len() - MAX_OUTPUT;
+            out.bytes.drain(0..overflow);
+            out.omitted = out.omitted.saturating_add(overflow);
+        }
+    }
+    out
+}
+
+async fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = tokio::process::Command::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .arg("/T")
+            .arg("/F")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+    #[cfg(not(windows))]
+    {
+        let group = format!("-{pid}");
+        let _ = tokio::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(&group)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = tokio::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(&group)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
     }
 }
 

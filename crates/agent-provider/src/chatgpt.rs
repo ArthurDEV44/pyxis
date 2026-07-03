@@ -253,6 +253,10 @@ pub fn is_terminal_rate_limit(body: &str) -> bool {
         .any(|m| lower.contains(m))
 }
 
+fn is_auth_expired(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("expired")
+}
+
 /// Parse le délai serveur d'un `Retry-After` en millisecondes (US-023), dans
 /// l'ordre de priorité de Pi : `retry-after-ms` (ms exactes) > `Retry-After`
 /// (secondes entières) > `Retry-After` (date HTTP IMF-fixdate, delta vs `now_ms`).
@@ -453,11 +457,16 @@ impl Provider for OpenAiChatGptProvider {
         })
     }
 
+    async fn refresh_auth(&self) -> Result<(), ProviderError> {
+        self.creds.force_refresh().await
+    }
+
     fn classify_error(&self, err: &ProviderError) -> ErrorClass {
         match err {
             ProviderError::Http {
                 status, message, ..
             } => match *status {
+                401 | 403 if is_auth_expired(message) => ErrorClass::Auth(AuthError::Expired),
                 401 | 403 => ErrorClass::Auth(AuthError::Invalid),
                 // 429 quota épuisé (corps GoUsageLimitError/billing/…) → TERMINAL :
                 // jamais retryé (US-023). Un 429 transitoire reste `RateLimited`.
@@ -609,6 +618,27 @@ mod tests {
         assert!(is_terminal_rate_limit("GOUSAGELIMITERROR"));
         assert!(is_terminal_rate_limit("Quota Exceeded"));
         assert!(!is_terminal_rate_limit("transient overload, retry"));
+    }
+
+    #[test]
+    fn expired_auth_is_classified_for_refresh() {
+        let p = provider();
+        assert!(matches!(
+            p.classify_error(&ProviderError::Http {
+                status: 401,
+                message: "access token expired".into(),
+                retry_after_ms: None,
+            }),
+            ErrorClass::Auth(AuthError::Expired)
+        ));
+        assert!(matches!(
+            p.classify_error(&ProviderError::Http {
+                status: 401,
+                message: "invalid token".into(),
+                retry_after_ms: None,
+            }),
+            ErrorClass::Auth(AuthError::Invalid)
+        ));
     }
 
     // US-023 : parsing `Retry-After` dans les 3 formats (ms exactes, secondes

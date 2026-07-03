@@ -39,13 +39,29 @@ impl CredentialManager {
         let mut cred = self.cred.lock().await;
         let now = openai_chatgpt::now_ms();
         if now.saturating_add(REFRESH_MARGIN_MS) >= cred.expires_at {
-            let refreshed = openai_chatgpt::refresh(&self.http, cred.refresh.expose(), now)
-                .await
-                .map_err(convert_auth_err)?;
-            self.persist(&refreshed).await?;
-            *cred = refreshed;
+            self.refresh_locked(&mut cred, now).await?;
         }
         openai_chatgpt::responses_request(&cred).map_err(convert_auth_err)
+    }
+
+    /// Force un refresh même si l'horloge locale pense encore le token valide.
+    pub async fn force_refresh(&self) -> Result<(), ProviderError> {
+        let mut cred = self.cred.lock().await;
+        self.refresh_locked(&mut cred, openai_chatgpt::now_ms())
+            .await
+    }
+
+    async fn refresh_locked(
+        &self,
+        cred: &mut OAuthCredential,
+        now: u64,
+    ) -> Result<(), ProviderError> {
+        let refreshed = openai_chatgpt::refresh(&self.http, cred.refresh.expose(), now)
+            .await
+            .map_err(convert_auth_err)?;
+        self.persist(&refreshed).await?;
+        *cred = refreshed;
+        Ok(())
     }
 
     /// Réécrit la credential rafraîchie dans le keyring (op bloquante → hors

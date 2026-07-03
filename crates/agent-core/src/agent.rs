@@ -19,7 +19,7 @@ use crate::event::{AgentEvent, ToolCallView, ToolResultView};
 use crate::guardrail::{CostBudget, LoopDecision, LoopGuard, UsageBudget, batch_signature};
 use crate::message::{Message, ToolCallId};
 use crate::provider::{
-    CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
+    AuthError, CanonicalRequest, ErrorClass, ProviderError, StreamEvent, TokenUsage, ToolSpec,
 };
 use crate::tools::{ToolDispatchEvent, ToolEventSink, ToolOutcome};
 use crate::transition::{
@@ -43,6 +43,8 @@ pub struct RunConfig {
     pub token_budget: Option<u64>,
     /// US-014 — budget cumulé de coût (kill-switch). `None` = désactivé.
     pub cost_budget: Option<CostBudget>,
+    /// Modèle de repli optionnel après une surcharge provider.
+    pub overload_fallback_model: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -57,6 +59,7 @@ impl Default for RunConfig {
             loop_guard_threshold: 3,
             token_budget: None,
             cost_budget: None,
+            overload_fallback_model: None,
         }
     }
 }
@@ -150,6 +153,90 @@ fn retry_delay(base: Duration, err: &ProviderError) -> Duration {
     }
 }
 
+fn retry_jitter_ms(
+    now_ms: u64,
+    attempt: u32,
+    class: ErrorClass,
+    err: &ProviderError,
+    cap_ms: u64,
+) -> u64 {
+    if cap_ms == 0 {
+        return 0;
+    }
+    let class_code = match class {
+        ErrorClass::Retryable => 1,
+        ErrorClass::RateLimited => 2,
+        ErrorClass::Overloaded(status) => status as u64,
+        ErrorClass::Auth(_) => 3,
+        ErrorClass::InvalidRequest => 4,
+    };
+    let status_code = match err {
+        ProviderError::Http { status, .. } => *status as u64,
+        ProviderError::Transport(_) => 10,
+        ProviderError::Decode(_) => 11,
+        ProviderError::Stream(_) => 12,
+        ProviderError::ContextLengthExceeded => 13,
+    };
+    let mut x = now_ms
+        ^ ((attempt as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ (class_code << 32)
+        ^ status_code;
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    x ^= x >> 33;
+    1 + (x % cap_ms)
+}
+
+fn transient_retry_delay(
+    config: &RunConfig,
+    attempt: u32,
+    class: ErrorClass,
+    err: &ProviderError,
+    now_ms: u64,
+) -> Duration {
+    let mut base = backoff(config, attempt);
+    if matches!(class, ErrorClass::Overloaded(_)) {
+        base = base.saturating_mul(3);
+    }
+    let delay = retry_delay(base, err);
+    if matches!(
+        err,
+        ProviderError::Http {
+            retry_after_ms: Some(ms),
+            ..
+        } if *ms >= MAX_RETRY_AFTER_MS
+    ) {
+        return delay;
+    }
+    let delay_ms = delay.as_millis().min(u64::MAX as u128) as u64;
+    let jitter_cap = (delay_ms / 5).min(250);
+    delay.saturating_add(Duration::from_millis(retry_jitter_ms(
+        now_ms, attempt, class, err, jitter_cap,
+    )))
+}
+
+fn maybe_switch_to_overload_fallback(
+    model: &mut String,
+    config: &RunConfig,
+    fallback_used: &mut bool,
+    class: ErrorClass,
+) -> bool {
+    if !matches!(class, ErrorClass::Overloaded(_)) || *fallback_used {
+        return false;
+    }
+    let Some(fallback) = config
+        .overload_fallback_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|fallback| !fallback.is_empty() && *fallback != model)
+    else {
+        return false;
+    };
+    *model = fallback.to_string();
+    *fallback_used = true;
+    true
+}
+
 fn validate_tool_outcomes(
     expected_ids: &[ToolCallId],
     outcomes: &[ToolOutcome],
@@ -187,14 +274,43 @@ fn validate_tool_outcomes(
     Ok(())
 }
 
+fn estimate_current_input(messages: &[Message], static_input_tokens: u32, deps: &Deps) -> u32 {
+    estimate_input(messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens)
+}
+
+fn record_attempt_usage(
+    usage_budget: &mut UsageBudget,
+    budget: &mut ContextBudget,
+    last_usage: Option<TokenUsage>,
+    messages: &[Message],
+    static_input_tokens: u32,
+    acc: &Accumulator,
+    deps: &Deps,
+) {
+    if let Some(u) = last_usage {
+        usage_budget.record_usage(u);
+    } else {
+        let est_in = estimate_current_input(messages, static_input_tokens, deps);
+        let est_out = acc.estimate_output(deps.tokenizer.as_ref());
+        budget.observe_estimated(est_in);
+        usage_budget.record(est_in as u64, est_out as u64);
+    }
+}
+
 /// Lance l'agent. Renvoie un `Stream<AgentEvent>` à consommer (TUI, `-p`, Paneflow).
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
-        let AgentContext { model, system, mut messages, tools, config, context_messages } = ctx;
+        let AgentContext { mut model, system, mut messages, tools, config, context_messages } = ctx;
 
         // ContextBudget calculé UNE FOIS pour ce modèle (invariant 5).
         let max_context = deps.provider.capabilities().max_context;
-        let mut budget = ContextBudget::for_model(max_context, config.max_output_tokens);
+        let mut budget = match ContextBudget::try_for_model(max_context, config.max_output_tokens) {
+            Ok(budget) => budget,
+            Err(e) => {
+                yield AgentEvent::Error(AgentError::InvalidRequest(e));
+                return;
+            }
+        };
         // L'usage backend compte tout ce qui est envoyé : system, contexte
         // éphémère, schémas d'outils et transcript. Les projections locales doivent
         // porter le même overhead statique, sinon la compaction arrive trop tard.
@@ -208,6 +324,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
         let mut pending: Option<PendingError> = None;
         let mut model_turns: u32 = 0;
         let mut transient_retries: u32 = 0;
+        let mut overload_fallback_used = false;
         let mut iterations: u32 = 0;
         let iter_cap = config.max_turns.saturating_mul(4).saturating_add(32);
         // US-014 — garde-fous déterministes (override de la logique du modèle).
@@ -267,7 +384,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     if budget.should_microcompact() {
                         let pruned = microcompact(&mut messages, config.micro_keep_recent);
                         if pruned > 0 {
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens));
+                            budget.observe_estimated(estimate_current_input(&messages, static_input_tokens, &deps));
                             yield AgentEvent::Compacted(CompactKind::Micro);
                         }
                     }
@@ -276,7 +393,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // projection (contexte estimé + sortie max) franchirait le
                     // budget (edge case #3, « avant un gros tour »).
                     if usage_budget.is_active() {
-                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens) as u64;
+                        let est_in = estimate_current_input(&messages, static_input_tokens, &deps) as u64;
                         if let Some(reason) =
                             usage_budget.would_exceed(est_in, config.max_output_tokens as u64)
                         {
@@ -305,10 +422,21 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             pending = Some(PendingError { kind: ContextErrorKind::PromptTooLong });
                             continue;
                         }
-                        Err(e) => match deps.provider.classify_error(&e) {
+                        Err(e) => {
+                            let class = deps.provider.classify_error(&e);
+                            match class {
                             ErrorClass::Retryable
                             | ErrorClass::RateLimited
                             | ErrorClass::Overloaded(_) => {
+                                if maybe_switch_to_overload_fallback(
+                                    &mut model,
+                                    &config,
+                                    &mut overload_fallback_used,
+                                    class,
+                                ) {
+                                    transient_retries = 0;
+                                    continue;
+                                }
                                 if transient_retries >= config.max_retries {
                                     yield AgentEvent::Error((&e).into());
                                     return;
@@ -317,11 +445,26 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 // attempt indexé à partir de 0 → délais 1×,2×,4×.
                                 // US-023 : honore Retry-After (max(backoff, retry_after), borné).
                                 deps.clock
-                                    .sleep(retry_delay(
-                                        backoff(&config, transient_retries - 1),
+                                    .sleep(transient_retry_delay(
+                                        &config,
+                                        transient_retries - 1,
+                                        class,
                                         &e,
+                                        deps.clock.now_ms(),
                                     ))
                                     .await;
+                                continue;
+                            }
+                            ErrorClass::Auth(AuthError::Expired) => {
+                                if transient_retries >= config.max_retries {
+                                    yield AgentEvent::Error(AgentError::Auth(AuthError::Expired));
+                                    return;
+                                }
+                                transient_retries += 1;
+                                if let Err(refresh_err) = deps.provider.refresh_auth().await {
+                                    yield AgentEvent::Error((&refresh_err).into());
+                                    return;
+                                }
                                 continue;
                             }
                             ErrorClass::Auth(a) => {
@@ -332,7 +475,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error((&e).into());
                                 return;
                             }
-                        },
+                        }},
                     };
 
                     // Consommation du stream : yields live (jamais d'ANSI).
@@ -387,6 +530,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
 
                     if let Some(e) = stream_err {
+                        record_attempt_usage(
+                            &mut usage_budget,
+                            &mut budget,
+                            last_usage,
+                            &messages,
+                            static_input_tokens,
+                            &acc,
+                            &deps,
+                        );
                         if e.is_context_error() {
                             if acc.has_visible_output() {
                                 yield AgentEvent::StreamReset;
@@ -394,10 +546,23 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             pending = Some(PendingError { kind: ContextErrorKind::PromptTooLong });
                             continue;
                         }
-                        match deps.provider.classify_error(&e) {
+                        let class = deps.provider.classify_error(&e);
+                        match class {
                             ErrorClass::Retryable
                             | ErrorClass::RateLimited
                             | ErrorClass::Overloaded(_) => {
+                                if maybe_switch_to_overload_fallback(
+                                    &mut model,
+                                    &config,
+                                    &mut overload_fallback_used,
+                                    class,
+                                ) {
+                                    if acc.has_visible_output() {
+                                        yield AgentEvent::StreamReset;
+                                    }
+                                    transient_retries = 0;
+                                    continue;
+                                }
                                 if transient_retries >= config.max_retries {
                                     if acc.has_visible_output() {
                                         yield AgentEvent::StreamReset;
@@ -412,11 +577,29 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 // attempt indexé à partir de 0 → délais 1×,2×,4×.
                                 // US-023 : honore Retry-After (max(backoff, retry_after), borné).
                                 deps.clock
-                                    .sleep(retry_delay(
-                                        backoff(&config, transient_retries - 1),
+                                    .sleep(transient_retry_delay(
+                                        &config,
+                                        transient_retries - 1,
+                                        class,
                                         &e,
+                                        deps.clock.now_ms(),
                                     ))
                                     .await;
+                                continue;
+                            }
+                            ErrorClass::Auth(AuthError::Expired) => {
+                                if acc.has_visible_output() {
+                                    yield AgentEvent::StreamReset;
+                                }
+                                if transient_retries >= config.max_retries {
+                                    yield AgentEvent::Error(AgentError::Auth(AuthError::Expired));
+                                    return;
+                                }
+                                transient_retries += 1;
+                                if let Err(refresh_err) = deps.provider.refresh_auth().await {
+                                    yield AgentEvent::Error((&refresh_err).into());
+                                    return;
+                                }
                                 continue;
                             }
                             ErrorClass::Auth(a) => {
@@ -443,14 +626,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     // localement pour alimenter le seuil de compaction (invariant 7). On
                     // comptabilise aussi le tour dans le budget US-014 (réel si
                     // disponible, sinon estimé : input contexte + output généré).
-                    if let Some(u) = last_usage {
-                        usage_budget.record_usage(u);
-                    } else {
-                        let est_in = estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens);
-                        let est_out = deps.tokenizer.count_text(acc.text()) as u32;
-                        budget.observe_estimated(est_in);
-                        usage_budget.record(est_in as u64, est_out as u64);
-                    }
+                    record_attempt_usage(
+                        &mut usage_budget,
+                        &mut budget,
+                        last_usage,
+                        &messages,
+                        static_input_tokens,
+                        &acc,
+                        &deps,
+                    );
 
                     let transition = post_stream_transition(&acc);
                     let commits_assistant =
@@ -587,8 +771,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             // tour précédent). On PROJETTE leur poids (sans écraser le
                             // budget réel) ; si un long résultat franchit le seuil, on
                             // force la compaction au prochain tour, avant le modèle.
-                            let projected = estimate_input(&messages, deps.tokenizer.as_ref())
-                                .saturating_add(static_input_tokens);
+                            let projected = estimate_current_input(&messages, static_input_tokens, &deps);
                             if budget.would_autocompact(projected) {
                                 force_compact = true;
                             }
@@ -598,7 +781,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 }
                 Transition::Compact(kind) => {
                     match full_compact(&mut messages, &model, deps.provider.as_ref()).await {
-                        Ok(()) => {
+                        Ok(usage) => {
+                            usage_budget.record_usage(usage);
                             compaction.record_success();
                             // checkpoint ATOMIQUE : frontière + transcript résumé en
                             // une opération ; erreur I/O propagée (pas de let _ qui
@@ -607,10 +791,10 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens));
                             // US-030 : ancre le baseline sur le PROCHAIN usage réel
                             // (anti double-compaction immédiate).
-                            budget.mark_compacted();
+                            let compacted_input = estimate_current_input(&messages, static_input_tokens, &deps);
+                            budget.mark_compacted(compacted_input);
                             yield AgentEvent::Compacted(kind);
                         }
                         Err(_) => {
@@ -622,14 +806,15 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             // anti error-loop : microcompact structurel pour baisser
                             // la pression avant de reboucler.
                             let _ = microcompact(&mut messages, config.micro_keep_recent);
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens));
+                            budget.observe_estimated(estimate_current_input(&messages, static_input_tokens, &deps));
                         }
                     }
                 }
                 Transition::Recover(_) => {
                     // withholding : compaction REACTIVE ; échec confirmé → propagation.
                     match full_compact(&mut messages, &model, deps.provider.as_ref()).await {
-                        Ok(()) => {
+                        Ok(usage) => {
+                            usage_budget.record_usage(usage);
                             // PAS de record_success() ici : le succès d'une compaction
                             // réactive ne doit pas réinitialiser le compteur d'échecs
                             // PROACTIFS du circuit breaker (#4/#7).
@@ -639,8 +824,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                 yield AgentEvent::Error(AgentError::Session(e.to_string()));
                                 return;
                             }
-                            budget.observe_estimated(estimate_input(&messages, deps.tokenizer.as_ref()).saturating_add(static_input_tokens));
-                            budget.mark_compacted();
+                            let compacted_input = estimate_current_input(&messages, static_input_tokens, &deps);
+                            budget.mark_compacted(compacted_input);
                             yield AgentEvent::Compacted(CompactKind::Reactive);
                         }
                         Err(e) => {
@@ -763,6 +948,61 @@ mod tests {
             retry_delay(base, &http(Some(3_600_000))),
             Duration::from_millis(MAX_RETRY_AFTER_MS)
         );
+    }
+
+    #[test]
+    fn overloaded_retry_uses_longer_base_delay() {
+        let cfg = RunConfig {
+            backoff_base_ms: 10,
+            ..RunConfig::default()
+        };
+        let err = ProviderError::Http {
+            status: 529,
+            message: String::new(),
+            retry_after_ms: None,
+        };
+        let overloaded = transient_retry_delay(&cfg, 0, ErrorClass::Overloaded(529), &err, 0);
+        let retryable = transient_retry_delay(&cfg, 0, ErrorClass::Retryable, &err, 0);
+        assert!(overloaded > Duration::from_millis(30));
+        assert!(overloaded <= Duration::from_millis(36));
+        assert!(retryable > Duration::from_millis(10));
+        assert!(retryable <= Duration::from_millis(12));
+    }
+
+    #[test]
+    fn retry_after_cap_is_not_extended_by_jitter() {
+        let cfg = RunConfig {
+            backoff_base_ms: 10,
+            ..RunConfig::default()
+        };
+        let err = http(Some(3_600_000));
+        assert_eq!(
+            transient_retry_delay(&cfg, 0, ErrorClass::RateLimited, &err, 0),
+            Duration::from_millis(MAX_RETRY_AFTER_MS)
+        );
+    }
+
+    #[test]
+    fn overload_fallback_switches_once() {
+        let cfg = RunConfig {
+            overload_fallback_model: Some("fallback".into()),
+            ..RunConfig::default()
+        };
+        let mut model = "primary".to_string();
+        let mut used = false;
+        assert!(maybe_switch_to_overload_fallback(
+            &mut model,
+            &cfg,
+            &mut used,
+            ErrorClass::Overloaded(529)
+        ));
+        assert_eq!(model, "fallback");
+        assert!(!maybe_switch_to_overload_fallback(
+            &mut model,
+            &cfg,
+            &mut used,
+            ErrorClass::Overloaded(529)
+        ));
     }
 
     // backoff : exponentiel plafonné à 32× (2^5), pas de débordement.

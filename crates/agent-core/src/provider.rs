@@ -287,6 +287,16 @@ pub trait Provider: Send + Sync {
     /// Classifie une erreur transport/HTTP en `ErrorClass` (source de vérité du
     /// retry). Les erreurs de contexte ne passent PAS par ici (cf. withholding).
     fn classify_error(&self, err: &ProviderError) -> ErrorClass;
+
+    /// Refresh forcé après une erreur d'auth expirée remontée par le backend.
+    /// Les providers sans OAuth gardent le comportement fatal par défaut.
+    async fn refresh_auth(&self) -> Result<(), ProviderError> {
+        Err(ProviderError::Http {
+            status: 401,
+            message: "auth refresh unsupported".into(),
+            retry_after_ms: None,
+        })
+    }
 }
 
 #[cfg(test)]
