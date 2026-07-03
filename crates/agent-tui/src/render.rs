@@ -11,10 +11,12 @@ use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as Boundary, BorderType, Borders, Paragraph, Wrap};
+use unicode_segmentation::UnicodeSegmentation;
 
 use agent_core::ToolErrorKind;
 
 use crate::cache::fingerprint;
+use crate::measure;
 use crate::state::{AppState, Block, COMMANDS, MenuItem, PermissionPrompt, Status};
 use crate::theme::Theme;
 use crate::tool;
@@ -22,6 +24,7 @@ use crate::tool;
 const INDENT: &str = "  ";
 /// Zone de saisie : box bordée (3 lignes) + ligne de statut (1).
 const INPUT_HEIGHT: u16 = 4;
+const MENU_MAX_ITEMS: u16 = 8;
 
 /// Rendu complet d'une frame.
 pub fn render(frame: &mut Frame, state: &AppState) {
@@ -36,8 +39,14 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     // Menu de commandes slash : popup intercalé entre transcript et input (jamais
     // pendant un dialog de permission). +1 ligne pour le rappel des raccourcis.
     let matches = state.menu_items();
-    let menu = state.pending.is_none() && state.menu_open();
-    let menu_height = if menu { matches.len() as u16 + 1 } else { 0 };
+    let menu_open = state.pending.is_none() && !matches.is_empty();
+    let max_menu_height = area.height.saturating_sub(bottom_height).saturating_sub(1);
+    let menu_height = if menu_open {
+        ((matches.len() as u16).min(MENU_MAX_ITEMS) + 1).min(max_menu_height)
+    } else {
+        0
+    };
+    let menu = menu_open && menu_height > 0;
 
     let chunks = Layout::vertical([
         Constraint::Min(1),
@@ -302,17 +311,34 @@ fn render_command_menu(
     theme: &Theme,
     matches: &[MenuItem],
 ) {
+    if area.height == 0 {
+        return;
+    }
     let sel = state.completion_index.min(matches.len().saturating_sub(1));
     let width = area.width as usize;
+    let visible_items = (area.height as usize).saturating_sub(1).min(matches.len());
+    if visible_items == 0 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{INDENT}↑↓ naviguer · ⏎ exécuter · ⇥ compléter · esc annuler"),
+                theme.faint(),
+            ))),
+            area,
+        );
+        return;
+    }
+    let start = sel.saturating_add(1).saturating_sub(visible_items);
+    let end = (start + visible_items).min(matches.len());
     let namecol = matches
         .iter()
-        .map(|m| m.label.chars().count())
+        .map(|m| measure::width(&m.label))
         .max()
         .unwrap_or(8)
         .clamp(8, 48);
 
-    let mut lines: Vec<Line> = Vec::with_capacity(matches.len() + 1);
-    for (i, item) in matches.iter().enumerate() {
+    let mut lines: Vec<Line> = Vec::with_capacity(visible_items + 1);
+    for (offset, item) in matches[start..end].iter().enumerate() {
+        let i = start + offset;
         let selected = i == sel;
         let marker = if selected { "› " } else { "  " };
         let marker_st = if selected {
@@ -342,10 +368,10 @@ fn render_command_menu(
         let name_disp = fit(&item.label, namecol);
         let desc_room = width.saturating_sub(2 + namecol + 2).max(1);
         let desc_disp = fit(&item.hint, desc_room);
-        let desc_len = desc_disp.chars().count();
+        let desc_len = measure::width(&desc_disp);
         let mut spans = vec![
             Span::styled(marker, marker_st),
-            Span::styled(format!("{name_disp:<namecol$}"), name_st),
+            Span::styled(measure::pad_right(name_disp, namecol), name_st),
             Span::raw("  "),
             Span::styled(desc_disp, hint_st),
         ];
@@ -361,36 +387,41 @@ fn render_command_menu(
             line
         });
     }
-    lines.push(Line::from(Span::styled(
-        format!("{INDENT}↑↓ naviguer · ⏎ exécuter · ⇥ compléter · esc annuler"),
-        theme.faint(),
-    )));
+    let footer = if matches.len() > visible_items {
+        format!(
+            "{INDENT}{}-{}/{} · ↑↓ naviguer · ⏎ exécuter · ⇥ compléter · esc annuler",
+            start + 1,
+            end,
+            matches.len()
+        )
+    } else {
+        format!("{INDENT}↑↓ naviguer · ⏎ exécuter · ⇥ compléter · esc annuler")
+    };
+    lines.push(Line::from(Span::styled(footer, theme.faint())));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Tronque `s` à `width` colonnes (ellipse `…` si dépassement).
 fn fit(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
-        return s.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let mut out: String = s.chars().take(width - 1).collect();
-    out.push('…');
-    out
+    measure::truncate(s, width)
 }
 
 fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let width = area.width as usize;
     // Index des appels d'outils par id : apparie un ToolResult à son ToolCall
     // (US-033) pour dériver le résumé `⎿` depuis l'input du call.
-    let mut calls: std::collections::HashMap<&str, (&str, &serde_json::Value)> =
+    let mut calls: std::collections::HashMap<&str, (&str, &serde_json::Value, u64)> =
         std::collections::HashMap::new();
     for block in &state.blocks {
-        if let Block::ToolCall { id, name, input } = block {
-            calls.insert(id.as_str(), (name.as_str(), input));
+        if let Block::ToolCall {
+            id,
+            name,
+            input,
+            input_hash,
+        } = block
+        {
+            calls.insert(id.as_str(), (name.as_str(), input, *input_hash));
         }
     }
 
@@ -430,11 +461,15 @@ fn render_transcript(frame: &mut Frame, area: Rect, state: &AppState, theme: &Th
     // ligne qui dépasserait la largeur en COLONNES (wide chars CJK/emoji, que le
     // compte en `char` ne voit pas) est re-wrappée par ratatui plutôt que TRONQUÉE
     // (aucune perte). La borne de scroll se calcule donc sur les lignes APRÈS wrap.
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let max_off = (para.line_count(area.width) as u16).saturating_sub(area.height);
+    let max_off = lines.len().saturating_sub(area.height as usize);
     state.scroll_max.set(max_off);
-    let offset = max_off - state.scroll.min(max_off);
-    frame.render_widget(para.scroll((offset, 0)), area);
+    let offset = max_off.saturating_sub(state.scroll.min(max_off));
+    let visible = lines
+        .into_iter()
+        .skip(offset)
+        .take(area.height as usize)
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), area);
     render_scroll_pill(frame, area, state, theme);
 }
 
@@ -448,7 +483,7 @@ fn render_scroll_pill(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     }
     let plural = if state.unseen > 1 { "x" } else { "" };
     let label = format!(" ↓ {} nouveau{plural} · ⇟ ", state.unseen);
-    let w = (label.chars().count() as u16).min(area.width);
+    let w = (measure::width(&label) as u16).min(area.width);
     let pill = Rect {
         x: area.x + area.width.saturating_sub(w),
         y: area.y + area.height - 1,
@@ -480,7 +515,7 @@ fn push_block<'a>(
     theme: &Theme,
     is_last: bool,
     width: usize,
-    calls: &std::collections::HashMap<&'a str, (&'a str, &'a serde_json::Value)>,
+    calls: &std::collections::HashMap<&'a str, (&'a str, &'a serde_json::Value, u64)>,
 ) {
     match block {
         Block::User(text) => {
@@ -495,13 +530,18 @@ fn push_block<'a>(
                 width,
             );
         }
-        Block::Assistant { text, .. } => {
+        Block::Assistant { text, streaming } => {
             // Markdown rendu, ANCRÉ par une puce teal ; corps aligné à 2 colonnes
             // (gouttière suspendue : puce sur la 1re sous-ligne, reste indenté). La
             // largeur de CONTENU (hors gouttière) sert à dimensionner les tables
             // markdown (US-043) — même valeur que le wrap d'`emit_block`.
             let avail = width.saturating_sub(INDENT.len());
-            let md = crate::markdown::render_markdown(&sanitize(text), theme, avail);
+            let clean = sanitize(text);
+            let md = if *streaming {
+                crate::markdown::render_markdown_with_highlight(&clean, theme, avail, false)
+            } else {
+                crate::markdown::render_markdown(&clean, theme, avail)
+            };
             emit_block(lines, &md, Span::styled("● ", theme.accent()), width);
         }
         Block::Reasoning(text) => {
@@ -588,7 +628,9 @@ fn push_block<'a>(
                     }
                 }
             } else {
-                let call = calls.get(call_id.as_str()).copied();
+                let call = calls
+                    .get(call_id.as_str())
+                    .map(|(name, input, _)| (*name, *input));
                 // Résumé secondaire `⎿` (nombres mis en évidence) apparié au call.
                 push_wrapped(
                     lines,
@@ -666,11 +708,8 @@ fn push_wrapped(
     cont: Span<'static>,
     width: usize,
 ) {
-    let prefix_w = first
-        .content
-        .chars()
-        .count()
-        .max(cont.content.chars().count());
+    let prefix_w =
+        measure::width(first.content.as_ref()).max(measure::width(cont.content.as_ref()));
     let avail = width.saturating_sub(prefix_w).max(1);
     for (i, sub) in wrap_content(&content, avail).into_iter().enumerate() {
         let lead = if i == 0 { first.clone() } else { cont.clone() };
@@ -680,39 +719,45 @@ fn push_wrapped(
     }
 }
 
-/// Word-wrap d'une suite de spans à `width` colonnes (comptées en chars), styles
-/// préservés. Coupe au dernier espace ; à défaut (mot plus long que `width`),
-/// coupe dur. Retourne au moins une sous-ligne (éventuellement vide).
+/// Word-wrap d'une suite de spans à `width` colonnes terminal, styles préservés.
+/// Coupe au dernier espace ; à défaut (mot plus long que `width`), coupe dur.
+/// Retourne au moins une sous-ligne (éventuellement vide).
 fn wrap_content(spans: &[Span], width: usize) -> Vec<Vec<Span<'static>>> {
-    let mut chars: Vec<(char, Style)> = Vec::new();
+    let mut units: Vec<(String, Style, usize)> = Vec::new();
     for s in spans {
-        for c in s.content.chars() {
-            chars.push((c, s.style));
+        for g in s.content.as_ref().graphemes(true) {
+            units.push((g.to_string(), s.style, measure::width(g)));
         }
     }
-    if width == 0 || chars.is_empty() {
-        return vec![rebuild(&chars)];
+    if width == 0 || units.is_empty() {
+        return vec![rebuild(&units)];
     }
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
-    let mut line: Vec<(char, Style)> = Vec::new();
+    let mut line: Vec<(String, Style, usize)> = Vec::new();
+    let mut line_w = 0usize;
     let mut last_space: Option<usize> = None;
-    for (c, st) in chars {
-        line.push((c, st));
-        if c == ' ' {
+    for (g, st, gw) in units {
+        line_w += gw;
+        line.push((g, st, gw));
+        if line.last().is_some_and(|(g, _, _)| g == " ") {
             last_space = Some(line.len() - 1);
         }
-        if line.len() > width {
+        if line_w > width {
             if let Some(sp) = last_space {
                 let rest = line.split_off(sp + 1);
                 line.pop(); // retire l'espace de coupure
                 out.push(rebuild(&line));
                 line = rest;
+                line_w = line.iter().map(|(_, _, w)| *w).sum();
             } else {
                 let overflow = line.pop();
                 out.push(rebuild(&line));
                 line.clear();
                 if let Some(lc) = overflow {
+                    line_w = lc.2;
                     line.push(lc);
+                } else {
+                    line_w = 0;
                 }
             }
             last_space = None;
@@ -722,19 +767,19 @@ fn wrap_content(spans: &[Span], width: usize) -> Vec<Vec<Span<'static>>> {
     out
 }
 
-/// Recompose une suite `(char, style)` en spans, en fusionnant les runs de même style.
-fn rebuild(chars: &[(char, Style)]) -> Vec<Span<'static>> {
+/// Recompose une suite `(grapheme, style)` en spans, en fusionnant les runs de même style.
+fn rebuild(units: &[(String, Style, usize)]) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut buf = String::new();
     let mut cur: Option<Style> = None;
-    for (c, st) in chars {
+    for (g, st, _) in units {
         if cur != Some(*st) {
             if let Some(prev) = cur {
                 spans.push(Span::styled(std::mem::take(&mut buf), prev));
             }
             cur = Some(*st);
         }
-        buf.push(*c);
+        buf.push_str(g);
     }
     if let Some(prev) = cur {
         spans.push(Span::styled(buf, prev));
@@ -895,7 +940,10 @@ fn gutter(lineno: Option<usize>, gw: usize, theme: &Theme) -> Span<'static> {
 /// en tête, donc préservée) ; sinon remplit la fin avec `bg` (bande de couleur en
 /// truecolor ; sans effet visible en 16 couleurs).
 fn fill(spans: Vec<Span<'static>>, bg: Style, width: usize) -> Line<'static> {
-    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let total: usize = spans
+        .iter()
+        .map(|s| measure::width(s.content.as_ref()))
+        .sum();
     if total >= width {
         let first = wrap_content(&spans, width)
             .into_iter()
@@ -911,7 +959,10 @@ fn fill(spans: Vec<Span<'static>>, bg: Style, width: usize) -> Line<'static> {
 
 /// Tronque une ligne (sans fond) à `width` colonnes, gouttière conservée.
 fn clip(spans: Vec<Span<'static>>, width: usize) -> Line<'static> {
-    let total: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let total: usize = spans
+        .iter()
+        .map(|s| measure::width(s.content.as_ref()))
+        .sum();
     if total > width {
         let first = wrap_content(&spans, width)
             .into_iter()
@@ -1034,11 +1085,12 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     spans.extend(input_spans(&state.input, &state.skills, theme));
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
-    // Curseur réel à la position char `state.cursor` (largeur ≈ nombre de chars).
+    // Curseur réel : offset byte logique → colonne terminale Unicode.
+    let cursor_prefix = state.input.get(..state.cursor).unwrap_or(&state.input);
     let col = inner
         .x
         .saturating_add(2) // largeur du prompt `› `
-        .saturating_add(state.cursor as u16)
+        .saturating_add(measure::width(cursor_prefix) as u16)
         .min(inner.right().saturating_sub(1));
     frame.set_cursor_position((col, inner.y));
 
@@ -1103,7 +1155,7 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     // plutôt que d'évincer la colonne gauche (workspace/modèle).
     let right_w = (right
         .iter()
-        .map(|s| s.content.chars().count())
+        .map(|s| measure::width(s.content.as_ref()))
         .sum::<usize>() as u16
         + INDENT.len() as u16)
         .min(area.width.saturating_sub(1));
@@ -1160,17 +1212,21 @@ fn render_permission(frame: &mut Frame, area: Rect, prompt: &PermissionPrompt, t
     // Assaini ICI (point de rendu) : le titre porte un `path`/nom d'outil
     // model-controlled qui ne passe PAS par le moteur de diff — sans ça, un `path`
     // contenant de l'OSC/CSI injecterait le terminal (le diff, lui, est déjà assaini).
-    lines.push(clip(
-        vec![
-            Span::styled("⟐ ", theme.accent()),
-            Span::styled(
-                sanitize(&prompt.title),
-                theme.fg().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  - {}", sanitize(&prompt.reason)), theme.dim()),
-        ],
-        width,
-    ));
+    let mut title = vec![
+        Span::styled("⟐ ", theme.accent()),
+        Span::styled(
+            sanitize(&prompt.title),
+            theme.fg().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  - {}", sanitize(&prompt.reason)), theme.dim()),
+    ];
+    if let Some(mode) = &prompt.mode {
+        title.push(Span::styled(format!(" · {mode}"), theme.faint()));
+    }
+    if prompt.taint_forced {
+        title.push(Span::styled(" · sortie non fiable", theme.error()));
+    }
+    lines.push(clip(title, width));
 
     // Aperçu : MÊME moteur/rendu que le diff inline (US-039). Borné à la place
     // restante (titre + actions réservés) pour que [o]/[n] restent TOUJOURS visibles.
@@ -1207,12 +1263,7 @@ fn permission_height(prompt: &PermissionPrompt, _width: u16) -> u16 {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() > max {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}…")
-    } else {
-        s.to_string()
-    }
+    measure::truncate(s, max)
 }
 
 #[cfg(test)]
@@ -1325,12 +1376,12 @@ mod tests {
             }),
         )
         .unwrap();
-        s.pending = Some(PermissionPrompt {
-            title: "edit src/main.rs".into(),
-            reason: "mutation".into(),
+        s.pending = Some(PermissionPrompt::new(
+            "edit src/main.rs",
+            "mutation",
             preview,
-        });
-        let out = draw(&s, 50, 14);
+        ));
+        let out = draw(&s, 90, 14);
         assert!(
             out.contains("autoriser") && out.contains("refuser"),
             "{out}"
@@ -1348,11 +1399,11 @@ mod tests {
     #[test]
     fn permission_title_is_sanitized() {
         let mut s = AppState::new("gpt-5", true);
-        s.pending = Some(PermissionPrompt {
-            title: "edit \x1b]0;pwned\x07evil.rs".into(),
-            reason: "motif\x1b[31m".into(),
-            preview: crate::diff::Diff::default(),
-        });
+        s.pending = Some(PermissionPrompt::new(
+            "edit \x1b]0;pwned\x07evil.rs",
+            "motif\x1b[31m",
+            crate::diff::Diff::default(),
+        ));
         let out = draw(&s, 50, 8);
         assert!(
             !out.contains('\u{1b}'),
@@ -1410,16 +1461,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn command_menu_is_windowed_when_items_overflow() {
+        let mut s = AppState::new("gpt-5", true);
+        s.skills = (0..20).map(|i| format!("skill-{i:02}")).collect();
+        s.set_input("/skills ".into());
+
+        let out = draw(&s, 90, 14);
+        assert!(out.contains("skill-00"), "{out}");
+        assert!(out.contains("1-8/20"), "range absent:\n{out}");
+
+        for _ in 0..10 {
+            s.on_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        let out = draw(&s, 50, 14);
+        assert!(out.contains("skill-10"), "{out}");
+        assert!(out.contains("4-11/20"), "fenêtre non scrollée:\n{out}");
+    }
+
     // Refus de permission interrompt proprement (état nettoyé) — AC3.
     #[test]
     fn refusing_permission_clears_prompt() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut s = AppState::new("gpt-5", true);
-        s.pending = Some(PermissionPrompt {
-            title: "bash".into(),
-            reason: "sensible".into(),
-            preview: crate::diff::Diff::default(),
-        });
+        s.pending = Some(PermissionPrompt::new(
+            "bash",
+            "sensible",
+            crate::diff::Diff::default(),
+        ));
         let action = s.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert_eq!(action, crate::state::InputAction::Permission(false));
         assert!(s.pending.is_none());
@@ -1619,11 +1691,7 @@ mod tests {
             &serde_json::json!({ "path": "big.rs", "content": content }),
         )
         .unwrap();
-        s.pending = Some(PermissionPrompt {
-            title: "write big.rs".into(),
-            reason: "création".into(),
-            preview,
-        });
+        s.pending = Some(PermissionPrompt::new("write big.rs", "création", preview));
         let out = draw(&s, 50, 20);
         assert!(
             out.contains("autoriser") && out.contains("refuser"),

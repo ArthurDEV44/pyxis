@@ -102,18 +102,46 @@ pub fn from_tool(name: &str, input: &Value) -> Option<Diff> {
     use crate::render::sanitize;
     match name {
         "edit" => {
-            let old = sanitize(input.get("old_string")?.as_str()?);
-            let new = sanitize(input.get("new_string")?.as_str()?);
+            let old_raw = input.get("old_string")?.as_str()?;
+            let new_raw = input.get("new_string")?.as_str()?;
+            if raw_too_large(old_raw) || raw_too_large(new_raw) {
+                return Some(too_large_note(old_raw, new_raw));
+            }
+            let old = sanitize(old_raw);
+            let new = sanitize(new_raw);
             let d = from_edit(&old, &new);
             (!d.is_empty()).then_some(d)
         }
         "write" => {
-            let content = sanitize(input.get("content")?.as_str()?);
+            let raw = input.get("content")?.as_str()?;
+            if raw_too_large(raw) {
+                return Some(note([format!(
+                    "(write trop volumineux pour l'aperçu : {} lignes min.)",
+                    bounded_line_count(raw)
+                )]));
+            }
+            let content = sanitize(raw);
             let d = from_write(&content);
             (!d.is_empty()).then_some(d)
         }
         _ => None,
     }
+}
+
+fn raw_too_large(s: &str) -> bool {
+    s.len() > MAX_DIFF_BYTES || s.lines().take(MAX_DIFF_LINES + 1).count() > MAX_DIFF_LINES
+}
+
+fn bounded_line_count(s: &str) -> usize {
+    s.lines().take(MAX_DIFF_LINES + 1).count()
+}
+
+fn too_large_note(old: &str, new: &str) -> Diff {
+    note([format!(
+        "(diff trop volumineux pour l'aperçu : {} → {} lignes min.)",
+        bounded_line_count(old),
+        bounded_line_count(new)
+    )])
 }
 
 /// Vrai diff interligne old → new, avec emphase intra-ligne (word-diff).

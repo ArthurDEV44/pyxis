@@ -47,9 +47,11 @@ walkdir = "2"
 # expose `Paragraph::line_count` pour borner le scroll au nombre de lignes APRÈS
 # wrap (sinon impossible de remonter tout en haut quand des lignes wrappent).
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
 # rendu markdown des réponses (CommonMark + GFM) → spans ratatui.
 pulldown-cmark = { version = "0.12", default-features = false }
+unicode-width = "0.2"
+unicode-segmentation = "1"
 # diff inline des éditions (EP-011) : lignes + emphase intra-ligne (word-diff). La
 # feature `inline` expose `iter_inline_changes` ; `unicode` aligne la segmentation
 # des mots sur les graphèmes.

@@ -160,9 +160,11 @@ impl Registry {
             Resolved::Ask => {
                 let taint_forced = pctx.taint_recent && tool.is_taint_sensitive();
                 let req = PermissionRequest {
+                    call_id: id.clone(),
                     tool: call.name.clone(),
                     reason: ask_reason(taint_forced),
                     taint_forced,
+                    mode: format!("{:?}", self.mode),
                     input_summary: summarize(&call.input),
                     input: call.input.clone(),
                 };
@@ -173,7 +175,7 @@ impl Registry {
                     taint_forced: req.taint_forced,
                     input_summary: req.input_summary.clone(),
                     input: req.input.clone(),
-                    mode: format!("{:?}", self.mode),
+                    mode: req.mode.clone(),
                 }));
                 if !self.approver.approve(&req).await {
                     return err_outcome(

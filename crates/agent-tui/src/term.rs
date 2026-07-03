@@ -3,7 +3,9 @@
 
 use std::io::{self, Stdout};
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -19,16 +21,56 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 pub fn enter() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
-    Terminal::new(CrosstermBackend::new(out))
+    if let Err(e) = execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    ) {
+        let _ = disable_raw_mode();
+        return Err(e);
+    }
+    match Terminal::new(CrosstermBackend::new(out)) {
+        Ok(tui) => Ok(tui),
+        Err(e) => {
+            let mut out = io::stdout();
+            let _ = execute!(
+                out,
+                DisableBracketedPaste,
+                DisableMouseCapture,
+                LeaveAlternateScreen
+            );
+            let _ = disable_raw_mode();
+            Err(e)
+        }
+    }
 }
 
 /// Restaure le terminal (à appeler en sortie, y compris sur erreur).
 pub fn leave(tui: &mut Tui) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(tui.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
-    tui.show_cursor()?;
-    Ok(())
+    let mut first_err: Option<io::Error> = None;
+    if let Err(e) = execute!(
+        tui.backend_mut(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    ) {
+        first_err = Some(e);
+    }
+    if let Err(e) = disable_raw_mode()
+        && first_err.is_none()
+    {
+        first_err = Some(e);
+    }
+    if let Err(e) = tui.show_cursor()
+        && first_err.is_none()
+    {
+        first_err = Some(e);
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Détection truecolor → choix de la dégradation monochrome (US-019 AC4).

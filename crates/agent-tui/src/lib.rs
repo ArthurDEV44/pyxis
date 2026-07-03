@@ -14,6 +14,7 @@ mod cache;
 pub mod diff;
 mod highlight;
 mod markdown;
+mod measure;
 pub mod render;
 mod spinner;
 pub mod state;

@@ -56,10 +56,10 @@ fn main() {
     let mut p = AppState::new("gpt-5", true);
     p.push_user("corrige le bug");
     p.apply(&AgentEvent::Text("J'applique le correctif.".into()));
-    p.pending = Some(PermissionPrompt {
-        title: "edit src/lexer.rs".into(),
-        reason: "action sensible nécessitant confirmation".into(),
-        preview: diff::from_tool(
+    p.pending = Some(PermissionPrompt::new(
+        "edit src/lexer.rs",
+        "action sensible nécessitant confirmation",
+        diff::from_tool(
             "edit",
             &serde_json::json!({
                 "path": "src/lexer.rs",
@@ -68,7 +68,7 @@ fn main() {
             }),
         )
         .unwrap_or_default(),
-    });
+    ));
     dump(&p, 64, 14, "permission + diff");
 
     // Scène 3 : dégradation monochrome (sans truecolor).

@@ -9,6 +9,7 @@
 //! *comment* on demande (TUI, `-p`, auto) — il appelle `approve()`. Testable
 //! headless via un approbateur scripté.
 
+use agent_core::message::ToolCallId;
 use async_trait::async_trait;
 
 /// Les 5 modes de permission (ARCHITECTURE §4.4).
@@ -127,10 +128,12 @@ pub fn resolve_permission(
 /// Demande de confirmation présentée à l'utilisateur (via l'`Approver`).
 #[derive(Debug, Clone)]
 pub struct PermissionRequest {
+    pub call_id: ToolCallId,
     pub tool: String,
     pub reason: String,
     /// Vrai si la demande est forcée par du contenu non fiable récent.
     pub taint_forced: bool,
+    pub mode: String,
     /// Résumé court de l'entrée (ex. la commande Bash, le chemin écrit).
     pub input_summary: String,
     /// Entrée structurée brute — permet au frontend de rendre un aperçu riche

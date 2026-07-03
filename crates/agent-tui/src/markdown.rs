@@ -13,13 +13,23 @@ use pulldown_cmark::{Alignment, CodeBlockKind, Event, Options, Parser, Tag, TagE
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::measure;
 use crate::theme::Theme;
 
 /// Convertit un bloc markdown en lignes prêtes à rendre (SANS gouttière : le
 /// transcript ajoute son préfixe). `width` = largeur de CONTENU disponible (après la
 /// gouttière), utilisée pour dimensionner les tables. Le texte est supposé nettoyé.
 pub fn render_markdown(text: &str, theme: &Theme, width: usize) -> Vec<Line<'static>> {
-    let mut r = Renderer::new(theme, width);
+    render_markdown_with_highlight(text, theme, width, true)
+}
+
+pub(crate) fn render_markdown_with_highlight(
+    text: &str,
+    theme: &Theme,
+    width: usize,
+    highlight_code: bool,
+) -> Vec<Line<'static>> {
+    let mut r = Renderer::new(theme, width, highlight_code);
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     for ev in Parser::new_ext(text, opts) {
         r.event(ev);
@@ -54,13 +64,14 @@ struct Renderer<'t> {
     in_code: bool,
     code_lang: String,
     code_buf: String,
+    highlight_code: bool,
     /// Pile de listes : `None` = puces, `Some(n)` = prochain numéro ordonné.
     list_stack: Vec<Option<u64>>,
     table: Option<TableState>,
 }
 
 impl<'t> Renderer<'t> {
-    fn new(theme: &'t Theme, width: usize) -> Self {
+    fn new(theme: &'t Theme, width: usize, highlight_code: bool) -> Self {
         Self {
             theme,
             width,
@@ -74,6 +85,7 @@ impl<'t> Renderer<'t> {
             in_code: false,
             code_lang: String::new(),
             code_buf: String::new(),
+            highlight_code,
             list_stack: Vec::new(),
             table: None,
         }
@@ -207,14 +219,18 @@ impl<'t> Renderer<'t> {
             TagEnd::TableRow => {
                 if let Some(t) = self.table.as_mut() {
                     let row = std::mem::take(&mut t.cur_row);
-                    t.rows.push(row);
+                    if t.rows.len() < MAX_ROWS {
+                        t.rows.push(row);
+                    }
                 }
             }
             TagEnd::TableCell => {
                 if let Some(t) = self.table.as_mut() {
                     t.in_cell = false;
                     let cell = std::mem::take(&mut t.cur_cell);
-                    t.cur_row.push(cell);
+                    if t.cur_row.len() < MAX_COLS {
+                        t.cur_row.push(cell);
+                    }
                 }
             }
             _ => {}
@@ -246,8 +262,10 @@ impl<'t> Renderer<'t> {
     /// Dans une table mais hors cellule (malformé), le span est ignoré (best-effort).
     fn emit(&mut self, span: Span<'static>) {
         if let Some(t) = self.table.as_mut() {
-            if t.in_cell {
-                t.cur_cell.push(span);
+            if t.in_cell && t.cur_row.len() < MAX_COLS && cell_width(&t.cur_cell) < MAX_CELL_WIDTH {
+                let remaining = MAX_CELL_WIDTH.saturating_sub(cell_width(&t.cur_cell));
+                let text = measure::truncate(span.content.as_ref(), remaining);
+                t.cur_cell.push(Span::styled(text, span.style));
             }
             return;
         }
@@ -280,7 +298,11 @@ impl<'t> Renderer<'t> {
         self.in_code = false;
         let code = std::mem::take(&mut self.code_buf);
         let lang = std::mem::take(&mut self.code_lang);
-        match crate::highlight::code_block(&code, &lang, self.theme) {
+        match self
+            .highlight_code
+            .then(|| crate::highlight::code_block(&code, &lang, self.theme))
+            .flatten()
+        {
             Some(rows) => {
                 for spans in rows {
                     let mut line = vec![Span::raw("  ")];
@@ -343,7 +365,9 @@ impl<'t> Renderer<'t> {
 /// Largeur d'affichage d'une cellule (somme des largeurs de ses spans, en chars —
 /// cohérent avec le reste du wrap du transcript).
 fn cell_width(cell: &[Span<'static>]) -> usize {
-    cell.iter().map(|s| s.content.chars().count()).sum()
+    cell.iter()
+        .map(|s| measure::width(s.content.as_ref()))
+        .sum()
 }
 
 /// Met en gras les spans d'une cellule (en-tête de table mis en évidence).
@@ -363,6 +387,8 @@ const MAX_NEST: usize = 24;
 /// une table adverse à des milliers de colonnes. Au-delà → colonnes excédentaires
 /// ignorées (best-effort, comme une cellule manquante).
 const MAX_COLS: usize = 64;
+const MAX_ROWS: usize = 256;
+const MAX_CELL_WIDTH: usize = 4096;
 
 /// Rend une table : grille alignée si elle tient dans `width`, sinon repli en paires
 /// `clé: valeur` (chaque cellule sur sa ligne, préfixée de son en-tête). Best-effort

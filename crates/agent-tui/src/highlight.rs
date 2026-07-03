@@ -41,6 +41,8 @@ use crate::theme::Theme as UiTheme;
 /// évite de lancer le moteur regex sur une ligne minifiée géante (coût linéaire par
 /// règle de grammaire). Généreux : les vraies lignes de code sont bien en deçà.
 const MAX_HL_BYTES: usize = 16 * 1024;
+const MAX_CODE_BLOCK_BYTES: usize = 128 * 1024;
+const MAX_CODE_BLOCK_LINES: usize = 2_000;
 
 /// Grammaires (two-face : Rust/TS-JS/JSON/TOML/Markdown…), chargées une seule fois.
 fn syntaxes() -> &'static SyntaxSet {
@@ -90,6 +92,12 @@ fn to_color(c: syntect::highlighting::Color) -> Color {
 /// ou langage non couvert → l'appelant retombe sur le rendu neutre (dim).
 pub fn code_block(code: &str, lang: &str, ui: &UiTheme) -> Option<Vec<Vec<Span<'static>>>> {
     if !ui.truecolor() {
+        return None;
+    }
+    if code.len() > MAX_CODE_BLOCK_BYTES
+        || code.lines().take(MAX_CODE_BLOCK_LINES + 1).count() > MAX_CODE_BLOCK_LINES
+        || code.lines().any(|line| line.len() > MAX_HL_BYTES)
+    {
         return None;
     }
     let ss = syntaxes();
@@ -244,6 +252,16 @@ mod tests {
             line_colors(&giant, "rust", &ui).is_none(),
             "ligne géante ne doit pas être colorée"
         );
+    }
+
+    #[test]
+    fn code_block_skips_giant_input() {
+        let ui = UiTheme::new(true);
+        let giant_block = "a\n".repeat(MAX_CODE_BLOCK_LINES + 1);
+        assert!(code_block(&giant_block, "rust", &ui).is_none());
+
+        let giant_line = "a".repeat(MAX_HL_BYTES + 1);
+        assert!(code_block(&giant_line, "rust", &ui).is_none());
     }
 
     #[test]

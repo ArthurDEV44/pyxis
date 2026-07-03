@@ -7,6 +7,7 @@
 //!   utilisateur (le dialog ne fige PAS la boucle : le select continue de rendre
 //!   et de lire le clavier).
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -365,6 +366,7 @@ async fn event_loop(
         0
     };
     let mut pending_resp: Option<oneshot::Sender<bool>> = None;
+    let mut queued_prompts: VecDeque<String> = VecDeque::new();
 
     // Tick d'animation du spinner (US-044). 100 ms ≈ 10 fps : fluide et quasi gratuit
     // (le cache de rendu sert les blocs bakés). `Skip` évite tout burst de redraw au
@@ -406,6 +408,12 @@ async fn event_loop(
                         }
                         continue;
                     }
+                    Some(Event::Paste(p)) => {
+                        if state.pending.is_none() {
+                            state.insert_str(&p);
+                        }
+                        continue;
+                    }
                     // frappe normale ; on ignore les répétitions de relâche.
                     Some(Event::Key(k)) if k.kind != KeyEventKind::Release => k,
                     Some(_) => continue, // key release, resize… → simple redraw
@@ -416,6 +424,13 @@ async fn event_loop(
                         goal_iters = 0;
                         launch_turn(&conversation, &cfg, &deps, &agent_tx, &prompt, true);
                         running = true;
+                    }
+                    InputAction::Submit(prompt) => {
+                        state.push_user(prompt.clone());
+                        state.blocks.push(Block::Notice(
+                            "Message ajouté à la file d'attente.".into(),
+                        ));
+                        queued_prompts.push_back(prompt);
                     }
                     InputAction::Command(line) => {
                         let mut it = line.splitn(2, ' ');
@@ -701,7 +716,7 @@ async fn event_loop(
                         // Boucle d'objectif : sur un EndTurn « propre » avec un goal
                         // actif, on relance tant que le marqueur de complétion n'est
                         // pas émis (le modèle ne décide pas seul de s'arrêter).
-                        if endturn && cfg.goal.is_some() {
+                        if endturn && cfg.goal.is_some() && queued_prompts.is_empty() {
                             if take_goal_done(&mut state) {
                                 cfg.goal = None;
                                 if let Err(e) = remove_if_exists(&goal_path) {
@@ -742,6 +757,13 @@ async fn event_loop(
                             }
                         } else {
                             running = false;
+                        }
+                        if !running
+                            && let Some(next) = queued_prompts.pop_front()
+                        {
+                            goal_iters = 0;
+                            launch_turn(&conversation, &cfg, &deps, &agent_tx, &next, true);
+                            running = true;
                         }
                     }
                 }

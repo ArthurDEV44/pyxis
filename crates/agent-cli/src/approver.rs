@@ -63,11 +63,11 @@ pub fn to_prompt(req: &PermissionRequest) -> PermissionPrompt {
         ),
     };
 
-    PermissionPrompt {
-        title,
-        reason: req.reason.clone(),
-        preview,
-    }
+    let mut prompt = PermissionPrompt::new(title, req.reason.clone(), preview);
+    prompt.call_id = Some(req.call_id.clone());
+    prompt.mode = Some(req.mode.clone());
+    prompt.taint_forced = req.taint_forced;
+    prompt
 }
 
 #[cfg(test)]
@@ -76,9 +76,11 @@ mod tests {
 
     fn req(tool: &str, input: serde_json::Value) -> PermissionRequest {
         PermissionRequest {
+            call_id: "c1".into(),
             tool: tool.into(),
             reason: "test".into(),
             taint_forced: false,
+            mode: "Default".into(),
             input_summary: input.to_string(),
             input,
         }
@@ -92,6 +94,9 @@ mod tests {
             serde_json::json!({ "path": "a.rs", "old_string": "x", "new_string": "y" }),
         ));
         assert_eq!(p.title, "edit a.rs");
+        assert_eq!(p.call_id.as_deref(), Some("c1"));
+        assert_eq!(p.mode.as_deref(), Some("Default"));
+        assert!(!p.taint_forced);
         assert!(
             p.preview
                 .rows

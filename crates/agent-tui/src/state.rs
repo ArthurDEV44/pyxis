@@ -9,6 +9,7 @@ use std::time::Duration;
 use agent_core::AgentEvent;
 use agent_core::message::{ContentBlock, Message, Role, ToolCallId, ToolErrorKind};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Un élément du transcript. Le rendu choisit poids/teinte ; aucune couleur ici.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +27,7 @@ pub enum Block {
         id: ToolCallId,
         name: String,
         input: serde_json::Value,
+        input_hash: u64,
     },
     /// Résultat d'un outil (taint + erreur portés pour le rendu). `call_id` pointe
     /// vers le `ToolCall` correspondant (US-033) pour le résumé `⎿`.
@@ -222,6 +224,7 @@ pub fn blocks_from_messages(messages: &[Message]) -> Vec<Block> {
                             id: id.clone(),
                             name: name.clone(),
                             input: input.clone(),
+                            input_hash: crate::cache::value_hash(input),
                         });
                     }
                 }
@@ -271,24 +274,45 @@ pub struct PermissionPrompt {
     pub title: String,
     pub reason: String,
     pub preview: crate::diff::Diff,
+    pub call_id: Option<ToolCallId>,
+    pub mode: Option<String>,
+    pub taint_forced: bool,
+}
+
+impl PermissionPrompt {
+    pub fn new(
+        title: impl Into<String>,
+        reason: impl Into<String>,
+        preview: crate::diff::Diff,
+    ) -> Self {
+        Self {
+            title: title.into(),
+            reason: reason.into(),
+            preview,
+            call_id: None,
+            mode: None,
+            taint_forced: false,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub blocks: Vec<Block>,
     pub input: String,
-    /// Position du curseur dans l'input, en nombre de CHARS avant lui
-    /// (0..=chars). Le rendu place le vrai curseur terminal à cette colonne.
+    /// Position du curseur dans l'input, en offset byte UTF-8 valide.
+    /// Les mouvements/suppressions suivent les graphèmes ; le rendu convertit cet
+    /// offset en largeur terminale via `unicode-width`.
     pub cursor: usize,
     pub status: Status,
     pub pending: Option<PermissionPrompt>,
     pub truecolor: bool,
     /// Décalage de scroll vers le HAUT (0 = collé en bas, suit le live).
-    pub scroll: u16,
+    pub scroll: usize,
     /// Borne max du scroll, recalculée à chaque frame par le rendu (lignes APRÈS
     /// wrap − hauteur visible). Cache de feedback rendu→entrée : permet de clamper
     /// le scroll sans dupliquer le calcul de wrap hors de `render`.
-    pub scroll_max: Cell<u16>,
+    pub scroll_max: Cell<usize>,
     /// Cache des lignes stylées par bloc (US-041) : ne reconstruire que le bloc en
     /// stream, servir les autres depuis le cache. Interior mutability (même patron
     /// que `scroll_max`) pour que `render` reste pur (signature `&AppState`).
@@ -385,22 +409,31 @@ impl AppState {
 
     // ── Édition de l'input avec curseur positionnable ──────────────────────────
 
-    fn input_chars(&self) -> usize {
-        self.input.chars().count()
+    fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.input.len());
+        while self.cursor > 0 && !self.input.is_char_boundary(self.cursor) {
+            self.cursor -= 1;
+        }
     }
 
-    /// Index byte du `n`-ième char (ou fin de chaîne).
-    fn byte_at(&self, char_idx: usize) -> usize {
-        self.input
-            .char_indices()
-            .nth(char_idx)
-            .map(|(b, _)| b)
-            .unwrap_or(self.input.len())
+    fn prev_grapheme_boundary(&self) -> Option<usize> {
+        self.input[..self.cursor]
+            .grapheme_indices(true)
+            .next_back()
+            .map(|(idx, _)| idx)
+    }
+
+    fn next_grapheme_boundary(&self) -> Option<usize> {
+        self.input[self.cursor..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map(|(idx, _)| self.cursor + idx)
+            .or_else(|| (self.cursor < self.input.len()).then_some(self.input.len()))
     }
 
     /// Remplace l'input et place le curseur en fin (recall, complétion, insertion).
-    fn set_input(&mut self, value: String) {
-        self.cursor = value.chars().count();
+    pub fn set_input(&mut self, value: String) {
+        self.cursor = value.len();
         self.input = value;
     }
 
@@ -411,16 +444,16 @@ impl AppState {
 
     /// Insère un char à la position du curseur.
     pub fn insert_char(&mut self, c: char) {
-        let at = self.byte_at(self.cursor);
-        self.input.insert(at, c);
-        self.cursor += 1;
+        self.clamp_cursor();
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
     }
 
     /// Insère une chaîne à la position du curseur (le curseur la suit).
     pub fn insert_str(&mut self, s: &str) {
-        let at = self.byte_at(self.cursor);
-        self.input.insert_str(at, s);
-        self.cursor += s.chars().count();
+        self.clamp_cursor();
+        self.input.insert_str(self.cursor, s);
+        self.cursor += s.len();
     }
 
     /// Supprime le char AVANT le curseur (Backspace).
@@ -428,33 +461,64 @@ impl AppState {
         if self.cursor == 0 {
             return;
         }
-        let start = self.byte_at(self.cursor - 1);
-        let end = self.byte_at(self.cursor);
-        self.input.replace_range(start..end, "");
-        self.cursor -= 1;
+        self.clamp_cursor();
+        if let Some(start) = self.prev_grapheme_boundary() {
+            self.input.replace_range(start..self.cursor, "");
+            self.cursor = start;
+        }
     }
 
     /// Supprime le char SOUS le curseur (Delete).
     pub fn delete(&mut self) {
-        if self.cursor >= self.input_chars() {
+        self.clamp_cursor();
+        if self.cursor >= self.input.len() {
             return;
         }
-        let start = self.byte_at(self.cursor);
-        let end = self.byte_at(self.cursor + 1);
-        self.input.replace_range(start..end, "");
+        let end = self.next_grapheme_boundary().unwrap_or(self.input.len());
+        self.input.replace_range(self.cursor..end, "");
     }
 
     fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.clamp_cursor();
+        if let Some(prev) = self.prev_grapheme_boundary() {
+            self.cursor = prev;
+        }
     }
     fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.input_chars());
+        self.clamp_cursor();
+        if let Some(next) = self.next_grapheme_boundary() {
+            self.cursor = next;
+        }
     }
     fn move_home(&mut self) {
         self.cursor = 0;
     }
     fn move_end(&mut self) {
-        self.cursor = self.input_chars();
+        self.cursor = self.input.len();
+    }
+
+    fn delete_prev_word(&mut self) {
+        self.clamp_cursor();
+        while self.cursor > 0 {
+            let Some(prev) = self.prev_grapheme_boundary() else {
+                break;
+            };
+            if !self.input[prev..self.cursor].trim().is_empty() {
+                break;
+            }
+            self.input.replace_range(prev..self.cursor, "");
+            self.cursor = prev;
+        }
+        while self.cursor > 0 {
+            let Some(prev) = self.prev_grapheme_boundary() else {
+                break;
+            };
+            if self.input[prev..self.cursor].trim().is_empty() {
+                break;
+            }
+            self.input.replace_range(prev..self.cursor, "");
+            self.cursor = prev;
+        }
     }
 
     /// Range un `AgentEvent` du cœur dans le transcript.
@@ -492,6 +556,7 @@ impl AppState {
                     id: view.id.clone(),
                     name: view.name.clone(),
                     input: view.input.clone(),
+                    input_hash: crate::cache::value_hash(&view.input),
                 });
             }
             AgentEvent::ToolResult(view) => {
@@ -633,12 +698,15 @@ impl AppState {
         if self.scroll == 0 {
             self.unseen = 0;
         }
-        self.scroll = self.scroll.saturating_add(n).min(self.scroll_max.get());
+        self.scroll = self
+            .scroll
+            .saturating_add(n as usize)
+            .min(self.scroll_max.get());
     }
 
     /// Redescend de `n` lignes (0 = collé en bas, suit le live).
     pub fn scroll_down(&mut self, n: u16) {
-        self.scroll = self.scroll.saturating_sub(n);
+        self.scroll = self.scroll.saturating_sub(n as usize);
         // Retour au bas → l'auto-follow reprend, plus de « nouveaux messages » (US-046).
         if self.scroll == 0 {
             self.unseen = 0;
@@ -726,15 +794,23 @@ impl AppState {
                 .collect(),
             Menu::Models => {
                 let q = self.input.strip_prefix("/models ").unwrap_or("");
-                MODELS
+                let mut items = MODELS
                     .iter()
                     .filter(|(slug, _)| slug.starts_with(q))
                     .map(|(slug, tag)| MenuItem::new(slug, slug, tag, true))
-                    .collect()
+                    .collect::<Vec<_>>();
+                if !q.trim().is_empty() && !MODELS.iter().any(|(slug, _)| *slug == q) {
+                    items.push(MenuItem::new(q, q, "custom", true));
+                }
+                items
             }
             Menu::Resume => self
                 .sessions
                 .iter()
+                .filter(|s| {
+                    let q = self.input.strip_prefix("/resume ").unwrap_or("");
+                    q.is_empty() || s.id.starts_with(q) || s.label.contains(q)
+                })
                 .map(|s| MenuItem {
                     id: s.id.clone(),
                     label: s.label.clone(),
@@ -1003,6 +1079,29 @@ impl AppState {
             self.should_quit = true;
             return InputAction::Quit;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('a') => {
+                    self.move_home();
+                    InputAction::None
+                }
+                KeyCode::Char('e') => {
+                    self.move_end();
+                    InputAction::None
+                }
+                KeyCode::Char('u') => {
+                    self.clear_input();
+                    self.completion_index = 0;
+                    InputAction::None
+                }
+                KeyCode::Char('w') => {
+                    self.delete_prev_word();
+                    self.completion_index = 0;
+                    InputAction::None
+                }
+                _ => InputAction::None,
+            };
+        }
 
         if self.pending.is_some() {
             return match key.code {
@@ -1201,6 +1300,7 @@ mod tests {
                 id: "c1".into(),
                 name: "bash".into(),
                 input: serde_json::json!({ "command": "ls -la" }),
+                input_hash: crate::cache::value_hash(&serde_json::json!({ "command": "ls -la" })),
             }
         );
     }
@@ -1428,7 +1528,7 @@ mod tests {
         s.skills = vec!["frontend-design".into(), "meta-code".into()];
         // Ouvre le sous-menu skills, filtre par sous-chaîne.
         s.input = "/skills front".into();
-        s.cursor = s.input.chars().count();
+        s.cursor = s.input.len();
         let items = s.menu_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, "frontend-design");
@@ -1436,7 +1536,7 @@ mod tests {
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, InputAction::None);
         assert_eq!(s.input, "/frontend-design ");
-        assert_eq!(s.cursor, s.input.chars().count());
+        assert_eq!(s.cursor, s.input.len());
         // Soumis avec un message → part à l'AGENT (pas une commande Pyxis).
         for c in "refais l'UI".chars() {
             s.on_key(key(c));
@@ -1466,6 +1566,37 @@ mod tests {
         // Delete supprime le char sous le curseur ('h').
         s.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
         assert_eq!(s.input, "ello");
+    }
+
+    #[test]
+    fn unicode_cursor_moves_and_deletes_graphemes() {
+        let mut s = AppState::new("gpt-5", false);
+        s.insert_str("aé🙂");
+        assert_eq!(s.cursor, "aé🙂".len());
+
+        s.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(s.cursor, "aé".len());
+
+        s.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(s.input, "a🙂");
+        assert_eq!(s.cursor, "a".len());
+    }
+
+    #[test]
+    fn ctrl_shortcuts_edit_without_inserting_control_chars() {
+        let mut s = AppState::new("gpt-5", false);
+        s.insert_str("hello world");
+
+        s.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        s.on_key(key('>'));
+        assert_eq!(s.input, ">hello world");
+
+        s.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        s.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(s.input, ">hello ");
+
+        s.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(s.input.is_empty());
     }
 
     #[test]
@@ -1588,6 +1719,35 @@ mod tests {
     }
 
     #[test]
+    fn resume_submenu_filters_or_falls_back_to_manual_id() {
+        let mut s = AppState::new("gpt-5", false);
+        s.sessions = vec![
+            SessionMeta {
+                id: "111.jsonl".into(),
+                label: "Alpha".into(),
+                hint: "".into(),
+            },
+            SessionMeta {
+                id: "222.jsonl".into(),
+                label: "Beta".into(),
+                hint: "".into(),
+            },
+        ];
+
+        s.set_input("/resume 222".into());
+        let items = s.menu_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "222.jsonl");
+
+        s.set_input("/resume missing.jsonl".into());
+        assert!(!s.menu_open());
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::Command("/resume missing.jsonl".into())
+        );
+    }
+
+    #[test]
     fn blocks_from_messages_rebuilds_transcript() {
         let msgs = vec![
             Message::user("salut"),
@@ -1630,6 +1790,18 @@ mod tests {
     }
 
     #[test]
+    fn models_submenu_accepts_custom_slug() {
+        let mut s = AppState::new("gpt-5", false);
+        s.set_input("/models gpt-6-preview".into());
+        let items = s.menu_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "gpt-6-preview");
+        assert_eq!(items[0].hint, "custom");
+        let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, InputAction::Command("/models gpt-6-preview".into()));
+    }
+
+    #[test]
     fn tab_completes_command_name() {
         let mut s = AppState::new("gpt-5", false);
         s.on_key(key('/'));
@@ -1644,11 +1816,11 @@ mod tests {
     #[test]
     fn permission_mode_routes_keys() {
         let mut s = AppState::new("gpt-5", false);
-        s.pending = Some(PermissionPrompt {
-            title: "bash".into(),
-            reason: "sensible".into(),
-            preview: crate::diff::Diff::default(),
-        });
+        s.pending = Some(PermissionPrompt::new(
+            "bash",
+            "sensible",
+            crate::diff::Diff::default(),
+        ));
         // une frappe normale ne tape PAS dans l'input pendant la confirmation
         assert_eq!(s.on_key(key('x')), InputAction::None);
         assert!(s.input.is_empty());

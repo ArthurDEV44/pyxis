@@ -12,6 +12,7 @@ use ratatui::style::Modifier;
 use ratatui::text::Span;
 use serde_json::Value;
 
+use crate::measure;
 use crate::render::sanitize;
 use crate::theme::Theme;
 
@@ -202,11 +203,7 @@ fn count(
 
 /// Tronque à `max` colonnes (char-aware, ellipse `…`).
 fn trunc(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{cut}…")
+    measure::truncate(s, max)
 }
 
 /// 1re ligne non vide, tronquée (pour bash/commande multi-lignes).

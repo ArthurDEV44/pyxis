@@ -92,7 +92,7 @@ impl RenderCache {
 pub(crate) fn fingerprint(
     block: &Block,
     is_last: bool,
-    calls: &HashMap<&str, (&str, &Value)>,
+    calls: &HashMap<&str, (&str, &Value, u64)>,
 ) -> u64 {
     let mut h = DefaultHasher::new();
     match block {
@@ -111,10 +111,12 @@ pub(crate) fn fingerprint(
             // L'aperçu des dernières lignes n'apparaît que sur le dernier bloc.
             is_last.hash(&mut h);
         }
-        Block::ToolCall { name, input, .. } => {
+        Block::ToolCall {
+            name, input_hash, ..
+        } => {
             3u8.hash(&mut h);
             name.hash(&mut h);
-            hash_value(input, &mut h);
+            input_hash.hash(&mut h);
         }
         Block::ToolResult {
             call_id,
@@ -133,9 +135,9 @@ pub(crate) fn fingerprint(
             // Le résumé `⎿` et le diff dérivent de l'appel apparié : un id orphelin
             // (résultat sans call) dégrade en empreinte sur l'id seul.
             match calls.get(call_id.as_str()) {
-                Some((name, input)) => {
+                Some((name, _, input_hash)) => {
                     name.hash(&mut h);
-                    hash_value(input, &mut h);
+                    input_hash.hash(&mut h);
                 }
                 None => call_id.as_str().hash(&mut h),
             }
@@ -149,6 +151,12 @@ pub(crate) fn fingerprint(
             t.hash(&mut h);
         }
     }
+    h.finish()
+}
+
+pub(crate) fn value_hash(v: &Value) -> u64 {
+    let mut h = DefaultHasher::new();
+    hash_value(v, &mut h);
     h.finish()
 }
 
@@ -192,7 +200,7 @@ mod tests {
     use ratatui::text::Line;
     use serde_json::json;
 
-    fn calls() -> HashMap<&'static str, (&'static str, &'static Value)> {
+    fn calls() -> HashMap<&'static str, (&'static str, &'static Value, u64)> {
         HashMap::new()
     }
 
@@ -245,8 +253,8 @@ mod tests {
     #[test]
     fn tool_result_fingerprint_tracks_paired_call() {
         let input = json!({"path": "a.rs", "old_string": "x", "new_string": "y"});
-        let mut with_call: HashMap<&str, (&str, &Value)> = HashMap::new();
-        with_call.insert("c1", ("edit", &input));
+        let mut with_call: HashMap<&str, (&str, &Value, u64)> = HashMap::new();
+        with_call.insert("c1", ("edit", &input, value_hash(&input)));
         let res = Block::ToolResult {
             call_id: "c1".into(),
             content: "ok".into(),

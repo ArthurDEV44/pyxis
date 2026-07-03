@@ -136,13 +136,13 @@ fn main() {
     let mut m = base();
     m.context_pct = Some(15);
     m.input = "/frontend-design refais l'input".into();
-    m.cursor = m.input.chars().count();
+    m.cursor = m.input.len();
     dump(&m, w, 8, "skill inséré (surbrillance en vrai terminal)");
 
     // 12. Commande /goal → le `/goal` est surligné (comme un skill).
     let mut n = base();
     n.context_pct = Some(15);
     n.input = "/goal vivre de mes produits".into();
-    n.cursor = n.input.chars().count();
+    n.cursor = n.input.len();
     dump(&n, w, 8, "/goal (commande surlignée)");
 }
