@@ -1446,7 +1446,7 @@ async fn default_registry_exposes_six_tool_specs() {
 }
 
 #[tokio::test]
-async fn optional_tool_schema_fields_are_not_required() {
+async fn nullable_tool_schema_fields_are_required_for_strict_mode() {
     let reg = crate::default_registry("/tmp", PermissionMode::Default, allow_approver());
     let specs = reg.tool_specs();
     let required = |name: &str| {
@@ -1463,9 +1463,9 @@ async fn optional_tool_schema_fields_are_not_required() {
             })
             .unwrap()
     };
-    assert_eq!(required("read"), vec!["path"]);
-    assert_eq!(required("glob"), vec!["pattern"]);
-    assert_eq!(required("grep"), vec!["pattern"]);
+    assert_eq!(required("read"), vec!["path", "offset", "limit"]);
+    assert_eq!(required("glob"), vec!["pattern", "path"]);
+    assert_eq!(required("grep"), vec!["pattern", "path", "glob"]);
 }
 
 #[tokio::test]

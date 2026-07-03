@@ -51,7 +51,7 @@ impl Tool for Read {
                 "offset": { "type": ["integer", "null"], "minimum": 1, "description": "Ligne de départ (1-indexée), ou null." },
                 "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Nombre de lignes maximum, ou null." }
             },
-            "required": ["path"],
+            "required": ["path", "offset", "limit"],
             "additionalProperties": false
         })
     }

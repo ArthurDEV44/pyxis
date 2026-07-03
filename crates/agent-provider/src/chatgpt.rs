@@ -5,13 +5,14 @@
 //! contexte complet reconstruit côté client à chaque tour → mappe proprement le
 //! canonique (PROVIDERS §4.1, le piège WebSocket+state est explicitement évité).
 //!
-//! Le backend est un modèle à raisonnement et reçoit `include:
-//! ["reasoning.encrypted_content"]`. Les reasoning items chiffrés sont capturés
-//! puis réémis avant leurs `function_call` pour préserver la continuité stateless.
+//! Le backend peut recevoir `include: ["reasoning.encrypted_content"]` quand le
+//! replay reasoning est activé explicitement. Par défaut, ce chemin reste OFF
+//! jusqu'à validation live du wire post-rename.
 
 use std::time::Duration;
 
 use agent_auth::OAuthCredential;
+use agent_auth::oauth::openai_chatgpt;
 use agent_core::message::ContentBlock;
 use agent_core::provider::{
     AuthError, CacheCapabilities, CanonicalRequest, CanonicalResponse, Capabilities,
@@ -25,7 +26,7 @@ use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
 
 use crate::chatgpt_events::CodexEventMapper;
-use crate::chatgpt_request::{build_responses_body, inject_cache_key};
+use crate::chatgpt_request::{ResponsesBodyOptions, build_responses_body, inject_cache_key};
 use crate::credential::CredentialManager;
 
 /// Clé keyring de la credential abonnement ChatGPT (refresh rotatif réécrit ici).
@@ -45,6 +46,34 @@ pub const DEFAULT_REASONING_EFFORT: &str = "medium";
 /// a ChatGPT account"). **Valeur volatile** — surchargeable via `--model` ou la
 /// commande `/models` en session (voir `agent_tui::MODELS`).
 pub const DEFAULT_MODEL: &str = "gpt-5.5";
+
+#[derive(Debug, Clone, Copy)]
+struct ModelProfile {
+    max_context: u32,
+    supports_reasoning: bool,
+    parallel_tool_calls: bool,
+    text_verbosity: &'static str,
+}
+
+fn model_profile(model: &str, fallback_max_context: u32) -> ModelProfile {
+    let model = model.trim();
+    let is_gpt5_family = matches!(model, "gpt-5.4" | "gpt-5.5") || model.starts_with("gpt-5.");
+    if is_gpt5_family {
+        ModelProfile {
+            max_context: DEFAULT_MAX_CONTEXT,
+            supports_reasoning: true,
+            parallel_tool_calls: true,
+            text_verbosity: "low",
+        }
+    } else {
+        ModelProfile {
+            max_context: fallback_max_context,
+            supports_reasoning: false,
+            parallel_tool_calls: false,
+            text_verbosity: "low",
+        }
+    }
+}
 
 /// Borne du corps d'erreur HTTP capturé (évite un message géant en log).
 const MAX_ERR_BODY: usize = 2000;
@@ -137,7 +166,7 @@ impl OpenAiChatGptProvider {
                     strict_json_schema: true,
                 },
                 reasoning_options: ReasoningCapabilities {
-                    encrypted_replay: true,
+                    encrypted_replay: false,
                 },
                 cache: CacheCapabilities {
                     prompt_cache_key: true,
@@ -146,7 +175,7 @@ impl OpenAiChatGptProvider {
             reasoning_effort,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             session_id: new_session_id(),
-            reasoning_replay: true,
+            reasoning_replay: false,
         }
     }
 
@@ -222,6 +251,44 @@ async fn send_with_header_timeout(
         .await
         .map_err(|_elapsed| ProviderError::Stream("header timeout".to_string()))?
         .map_err(|e| ProviderError::Transport(e.to_string()))
+}
+
+async fn http_error_from_response(resp: reqwest::Response) -> ProviderError {
+    let code = resp.status().as_u16();
+    if code == 413 {
+        return ProviderError::ContextLengthExceeded;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let retry_after_ms = parse_retry_after_ms(resp.headers(), now_ms);
+    let mut text = sanitize_error_body(&resp.text().await.unwrap_or_default());
+    text.truncate(MAX_ERR_BODY);
+    ProviderError::Http {
+        status: code,
+        message: text,
+        retry_after_ms,
+    }
+}
+
+fn should_retry_with_originator_fallback(status: u16, message: &str) -> bool {
+    should_retry_with_originator_fallback_env(
+        status,
+        message,
+        std::env::var_os("PYXIS_ORIGINATOR").is_some(),
+    )
+}
+
+fn should_retry_with_originator_fallback_env(
+    status: u16,
+    message: &str,
+    originator_forced: bool,
+) -> bool {
+    if originator_forced {
+        return false;
+    }
+    matches!(status, 400 | 403) && message.to_ascii_lowercase().contains("originator")
 }
 
 /// Marqueurs d'un 429 TERMINAL (quota d'abonnement épuisé), dérivés de Pi
@@ -438,6 +505,10 @@ impl Provider for OpenAiChatGptProvider {
         &self.capabilities
     }
 
+    fn max_context_for_model(&self, model: &str) -> u32 {
+        model_profile(model, self.capabilities.max_context).max_context
+    }
+
     async fn stream(
         &self,
         req: CanonicalRequest,
@@ -445,48 +516,71 @@ impl Provider for OpenAiChatGptProvider {
         // 1. credential fraîche (refresh + keyring si besoin) → URL + en-têtes.
         let spec = self.creds.request_spec().await?;
         // 2. corps Responses (SSE stateless).
-        let mut body = build_responses_body(&req, self.reasoning_effort.as_deref());
+        let profile = model_profile(&req.model, self.capabilities.max_context);
+        let reasoning_effort = if profile.supports_reasoning {
+            self.reasoning_effort.as_deref()
+        } else {
+            None
+        };
+        let mut body = build_responses_body(
+            &req,
+            ResponsesBodyOptions {
+                reasoning_effort,
+                include_encrypted_reasoning: self.reasoning_replay && profile.supports_reasoning,
+                parallel_tool_calls: profile.parallel_tool_calls,
+                text_verbosity: profile.text_verbosity,
+            },
+        );
         // US-029 : clé de cache stable par session → réutilisation du cache backend.
         inject_cache_key(&mut body, &self.session_id);
 
         // 3. POST. `.json()` pose content-type ; on ajoute les en-têtes propriétaires
         //    (Authorization, chatgpt-account-id, originator, OpenAI-Beta, accept).
-        let mut rb = self.http.post(&spec.url).json(&body);
-        for (k, v) in &spec.headers {
-            if !k.eq_ignore_ascii_case("content-type") {
+        let build_request = |originator_override: Option<&str>| {
+            let mut rb = self.http.post(&spec.url).json(&body);
+            for (k, v) in &spec.headers {
+                if k.eq_ignore_ascii_case("content-type") {
+                    continue;
+                }
+                if originator_override.is_some() && k.eq_ignore_ascii_case("originator") {
+                    continue;
+                }
                 rb = rb.header(k, v);
             }
-        }
+            if let Some(originator) = originator_override {
+                rb = rb.header("originator", originator);
+            }
+            rb
+        };
         // US-022 (durcissement) : borne la phase HEADERS. `connect_timeout` couvre
         // l'établissement TCP/TLS et `idle_guarded` le stream OUVERT, mais entre les
         // deux `send()` attend les headers de réponse sans borne : un backend qui
         // handshake puis retient ses headers (proxy bloqué, queue) gèlerait la boucle
         // sans signal. `send()` se résout à la réception des headers → ce timeout NE
         // coupe PAS le long stream SSE qui suit.
-        let resp = send_with_header_timeout(rb, CONNECT_TIMEOUT).await?;
+        let mut resp = send_with_header_timeout(build_request(None), CONNECT_TIMEOUT).await?;
 
         // 4. statut. 413 → erreur de contexte (withholding/compaction réactive).
-        let status = resp.status();
-        if !status.is_success() {
-            let code = status.as_u16();
-            if code == 413 {
-                return Err(ProviderError::ContextLengthExceeded);
+        if !resp.status().is_success() {
+            let first_err = http_error_from_response(resp).await;
+            if let ProviderError::Http {
+                status, message, ..
+            } = &first_err
+                && should_retry_with_originator_fallback(*status, message)
+            {
+                let retry = send_with_header_timeout(
+                    build_request(Some(openai_chatgpt::ORIGINATOR_FALLBACK)),
+                    CONNECT_TIMEOUT,
+                )
+                .await?;
+                if retry.status().is_success() {
+                    resp = retry;
+                } else {
+                    return Err(http_error_from_response(retry).await);
+                }
+            } else {
+                return Err(first_err);
             }
-            // US-023 : capter `Retry-After` AVANT de consommer le corps (les
-            // headers sont droppés sinon). `now_ms` local (le provider fait des
-            // I/O réelles, pas besoin de l'horloge injectée du cœur).
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let retry_after_ms = parse_retry_after_ms(resp.headers(), now_ms);
-            let mut text = sanitize_error_body(&resp.text().await.unwrap_or_default());
-            text.truncate(MAX_ERR_BODY);
-            return Err(ProviderError::Http {
-                status: code,
-                message: text,
-                retry_after_ms,
-            });
         }
 
         // 5. flux SSE → StreamEvent canoniques (jamais d'ANSI, jamais de panic).
@@ -608,16 +702,68 @@ mod tests {
         let c = p.capabilities();
         assert!(!c.server_side_state, "SSE stateless → mappe le canonique");
         assert!(c.tools && c.reasoning);
-        assert!(c.reasoning_options.encrypted_replay);
+        assert!(!c.reasoning_options.encrypted_replay);
         assert_eq!(p.kind(), ProviderKind::OpenAiChatGpt);
     }
 
     #[test]
     fn reasoning_replay_flag_updates_capabilities() {
-        let p = provider().with_reasoning_replay(false);
+        let p = provider();
         assert!(!p.capabilities().reasoning_options.encrypted_replay);
         let p = p.with_reasoning_replay(true);
         assert!(p.capabilities().reasoning_options.encrypted_replay);
+    }
+
+    #[test]
+    fn model_profile_controls_context_and_features() {
+        let p = provider();
+        assert_eq!(p.max_context_for_model("gpt-5.5"), DEFAULT_MAX_CONTEXT);
+        assert_eq!(p.max_context_for_model("gpt-5.4"), DEFAULT_MAX_CONTEXT);
+
+        let fallback = OpenAiChatGptProvider::new(
+            OAuthCredential {
+                provider: agent_auth::ProviderId::OpenAiChatGpt,
+                access: agent_auth::Secret::new("AT"),
+                refresh: agent_auth::Secret::new("RT"),
+                expires_at: u64::MAX,
+                account_id: Some("acct".into()),
+            },
+            12_345,
+            None,
+        );
+        assert_eq!(fallback.max_context_for_model("unknown-model"), 12_345);
+        let unknown = model_profile("unknown-model", 12_345);
+        assert!(!unknown.supports_reasoning);
+        assert!(!unknown.parallel_tool_calls);
+    }
+
+    #[test]
+    fn originator_fallback_only_retries_targeted_rejections() {
+        assert!(should_retry_with_originator_fallback_env(
+            400,
+            "unknown originator pyxis",
+            false
+        ));
+        assert!(should_retry_with_originator_fallback_env(
+            403,
+            "originator is not allowed",
+            false
+        ));
+        assert!(!should_retry_with_originator_fallback_env(
+            400,
+            "bad schema",
+            false
+        ));
+        assert!(!should_retry_with_originator_fallback_env(
+            500,
+            "originator",
+            false
+        ));
+        assert!(!should_retry_with_originator_fallback_env(
+            403,
+            "originator is not allowed",
+            true
+        ));
     }
 
     // US-029 : session_id = UUID v4 bien formé, stable par instance, unique.

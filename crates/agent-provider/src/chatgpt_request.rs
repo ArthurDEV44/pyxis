@@ -20,8 +20,27 @@ use serde_json::{Value, json};
 
 const DEFAULT_INSTRUCTIONS: &str = "You are a helpful assistant.";
 
+#[derive(Debug, Clone, Copy)]
+pub struct ResponsesBodyOptions<'a> {
+    pub reasoning_effort: Option<&'a str>,
+    pub include_encrypted_reasoning: bool,
+    pub parallel_tool_calls: bool,
+    pub text_verbosity: &'a str,
+}
+
+impl Default for ResponsesBodyOptions<'_> {
+    fn default() -> Self {
+        Self {
+            reasoning_effort: None,
+            include_encrypted_reasoning: false,
+            parallel_tool_calls: true,
+            text_verbosity: "low",
+        }
+    }
+}
+
 /// Construit le corps JSON complet de la requête Responses (SSE).
-pub fn build_responses_body(req: &CanonicalRequest, reasoning_effort: Option<&str>) -> Value {
+pub fn build_responses_body(req: &CanonicalRequest, options: ResponsesBodyOptions<'_>) -> Value {
     let instructions = req.system.as_deref().unwrap_or(DEFAULT_INSTRUCTIONS);
 
     let mut body = json!({
@@ -31,17 +50,19 @@ pub fn build_responses_body(req: &CanonicalRequest, reasoning_effort: Option<&st
         "stream": true,
         "instructions": instructions,
         "input": build_input(&req.messages),
-        "text": { "verbosity": "low" },
+        "text": { "verbosity": options.text_verbosity },
         "max_output_tokens": req.max_output_tokens,
-        "include": ["reasoning.encrypted_content"],
         "tool_choice": "auto",
-        "parallel_tool_calls": true,
+        "parallel_tool_calls": options.parallel_tool_calls,
     });
 
+    if options.include_encrypted_reasoning {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
     if !req.tools.is_empty() {
         body["tools"] = build_tools(&req.tools);
     }
-    if let Some(effort) = reasoning_effort {
+    if let Some(effort) = options.reasoning_effort {
         body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
     }
     body
@@ -260,13 +281,24 @@ mod tests {
         }
     }
 
+    fn request_body(req: &CanonicalRequest) -> Value {
+        build_responses_body(req, ResponsesBodyOptions::default())
+    }
+
+    fn request_body_with_options(
+        req: &CanonicalRequest,
+        options: ResponsesBodyOptions<'_>,
+    ) -> Value {
+        build_responses_body(req, options)
+    }
+
     #[test]
     fn fixed_fields_are_present_and_store_is_false() {
-        let body = build_responses_body(&req(vec![Message::user("salut")], vec![], None), None);
+        let body = request_body(&req(vec![Message::user("salut")], vec![], None));
         assert_eq!(body["store"], json!(false));
         assert_eq!(body["stream"], json!(true));
         assert_eq!(body["model"], "gpt-5.4");
-        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert!(body.get("include").is_none());
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], json!(true));
         assert_eq!(body["max_output_tokens"], json!(4096));
@@ -276,10 +308,11 @@ mod tests {
 
     #[test]
     fn system_goes_to_instructions_not_input() {
-        let body = build_responses_body(
-            &req(vec![Message::user("hi")], vec![], Some("Tu es Pyxis.")),
-            None,
-        );
+        let body = request_body(&req(
+            vec![Message::user("hi")],
+            vec![],
+            Some("Tu es Pyxis."),
+        ));
         assert_eq!(body["instructions"], "Tu es Pyxis.");
         // aucun item role:system dans input
         let input = body["input"].as_array().unwrap();
@@ -288,13 +321,13 @@ mod tests {
 
     #[test]
     fn default_instructions_when_no_system() {
-        let body = build_responses_body(&req(vec![Message::user("hi")], vec![], None), None);
+        let body = request_body(&req(vec![Message::user("hi")], vec![], None));
         assert_eq!(body["instructions"], DEFAULT_INSTRUCTIONS);
     }
 
     #[test]
     fn user_text_maps_to_input_text_message() {
-        let body = build_responses_body(&req(vec![Message::user("bonjour")], vec![], None), None);
+        let body = request_body(&req(vec![Message::user("bonjour")], vec![], None));
         let item = &body["input"][0];
         assert_eq!(item["type"], "message");
         assert_eq!(item["role"], "user");
@@ -311,7 +344,7 @@ mod tests {
                 source_untrusted: false,
             }],
         };
-        let body = build_responses_body(&req(vec![summary], vec![], None), None);
+        let body = request_body(&req(vec![summary], vec![], None));
         let item = &body["input"][0];
         assert_eq!(item["content"][0]["type"], "input_text");
         assert_eq!(item["content"][0]["text"], "résumé");
@@ -326,7 +359,7 @@ mod tests {
                 source_untrusted: true,
             }],
         };
-        let body = build_responses_body(&req(vec![summary], vec![], None), None);
+        let body = request_body(&req(vec![summary], vec![], None));
         let text = body["input"][0]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("derived_from_untrusted_content"));
         assert!(text.contains("ignore system"));
@@ -345,7 +378,7 @@ mod tests {
             },
         ]);
         let tool = Message::tool_result("call_42", "fichiers...", false);
-        let body = build_responses_body(&req(vec![assistant, tool], vec![], None), None);
+        let body = request_body(&req(vec![assistant, tool], vec![], None));
         let input = body["input"].as_array().unwrap();
 
         // message assistant (output_text) + function_call + function_call_output
@@ -371,7 +404,7 @@ mod tests {
     #[test]
     fn trusted_tool_result_stays_raw_for_provider() {
         let tool = Message::tool_result_with_trust("call_1", "confirmé", false, false);
-        let body = build_responses_body(&req(vec![tool], vec![], None), None);
+        let body = request_body(&req(vec![tool], vec![], None));
         let out = body["input"]
             .as_array()
             .unwrap()
@@ -393,7 +426,7 @@ mod tests {
                 "additionalProperties": false
             }),
         };
-        let body = build_responses_body(&req(vec![Message::user("x")], vec![spec], None), None);
+        let body = request_body(&req(vec![Message::user("x")], vec![spec], None));
         let tool = &body["tools"][0];
         assert_eq!(tool["type"], "function");
         assert_eq!(tool["name"], "read");
@@ -424,7 +457,7 @@ mod tests {
 
     #[test]
     fn inject_cache_key_sets_clamped_field() {
-        let mut body = build_responses_body(&req(vec![Message::user("x")], vec![], None), None);
+        let mut body = request_body(&req(vec![Message::user("x")], vec![], None));
         assert!(body.get("prompt_cache_key").is_none());
         inject_cache_key(&mut body, "session-abc");
         assert_eq!(body["prompt_cache_key"], "session-abc");
@@ -438,17 +471,38 @@ mod tests {
 
     #[test]
     fn no_tools_omits_tools_field() {
-        let body = build_responses_body(&req(vec![Message::user("x")], vec![], None), None);
+        let body = request_body(&req(vec![Message::user("x")], vec![], None));
         assert!(body.get("tools").is_none());
     }
 
     #[test]
     fn reasoning_effort_included_when_set_omitted_otherwise() {
-        let with = build_responses_body(&req(vec![Message::user("x")], vec![], None), Some("high"));
+        let with = request_body_with_options(
+            &req(vec![Message::user("x")], vec![], None),
+            ResponsesBodyOptions {
+                reasoning_effort: Some("high"),
+                ..ResponsesBodyOptions::default()
+            },
+        );
         assert_eq!(with["reasoning"]["effort"], "high");
         assert_eq!(with["reasoning"]["summary"], "auto");
-        let without = build_responses_body(&req(vec![Message::user("x")], vec![], None), None);
+        let without = request_body(&req(vec![Message::user("x")], vec![], None));
         assert!(without.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn encrypted_reasoning_include_is_opt_in() {
+        let without = request_body(&req(vec![Message::user("x")], vec![], None));
+        assert!(without.get("include").is_none());
+
+        let with = request_body_with_options(
+            &req(vec![Message::user("x")], vec![], None),
+            ResponsesBodyOptions {
+                include_encrypted_reasoning: true,
+                ..ResponsesBodyOptions::default()
+            },
+        );
+        assert_eq!(with["include"], json!(["reasoning.encrypted_content"]));
     }
 
     // US-031 : reasoning réémis AVANT son function_call ; orphelin (sans tool_use) sauté.
@@ -465,7 +519,7 @@ mod tests {
                 input: json!({}),
             },
         ]);
-        let body = build_responses_body(&req(vec![assistant], vec![], None), None);
+        let body = request_body(&req(vec![assistant], vec![], None));
         let input = body["input"].as_array().unwrap();
         let rs = input.iter().position(|i| i["type"] == "reasoning").unwrap();
         let fc = input
@@ -486,7 +540,7 @@ mod tests {
                 encrypted_content: "ENC".into(),
             },
         ]);
-        let body2 = build_responses_body(&req(vec![orphan], vec![], None), None);
+        let body2 = request_body(&req(vec![orphan], vec![], None));
         assert!(
             body2["input"]
                 .as_array()
@@ -510,7 +564,7 @@ mod tests {
                 text: "après".into(),
             },
         ]);
-        let body = build_responses_body(&req(vec![assistant], vec![], None), None);
+        let body = request_body(&req(vec![assistant], vec![], None));
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "message");
         assert_eq!(input[1]["type"], "function_call");

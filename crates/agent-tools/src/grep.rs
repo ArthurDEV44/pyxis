@@ -57,7 +57,7 @@ impl Tool for Grep {
                 "path": { "type": ["string", "null"], "description": "Base de recherche (relative au workspace), ou null." },
                 "glob": { "type": ["string", "null"], "description": "Filtre glob sur les noms de fichiers, ex. *.rs, ou null." }
             },
-            "required": ["pattern"],
+            "required": ["pattern", "path", "glob"],
             "additionalProperties": false
         })
     }

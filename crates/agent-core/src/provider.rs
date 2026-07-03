@@ -154,57 +154,107 @@ impl ToolSpec {
                 tool: self.name.clone(),
             });
         };
-        if schema
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|kind| kind != "object")
-        {
+        if !schema_has_object_type(schema) {
             return Err(ToolSpecValidationError::SchemaMustBeObject {
                 tool: self.name.clone(),
             });
         }
-        if schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
+        validate_strict_schema_object(&self.name, &self.input_schema)?;
+        Ok(())
+    }
+}
+
+fn schema_has_object_type(schema: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match schema.get("type") {
+        Some(serde_json::Value::String(kind)) => kind == "object",
+        Some(serde_json::Value::Array(kinds)) => {
+            kinds.iter().any(|kind| kind.as_str() == Some("object"))
+        }
+        _ => false,
+    }
+}
+
+fn validate_strict_schema_object(
+    tool: &str,
+    schema: &serde_json::Value,
+) -> Result<(), ToolSpecValidationError> {
+    let Some(obj) = schema.as_object() else {
+        return Ok(());
+    };
+
+    if schema_has_object_type(obj) {
+        if obj.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
             return Err(
                 ToolSpecValidationError::SchemaMustDenyAdditionalProperties {
-                    tool: self.name.clone(),
+                    tool: tool.to_string(),
                 },
             );
         }
-        let property_names: HashSet<String> = match schema.get("properties") {
+        let property_names: HashSet<String> = match obj.get("properties") {
             None => HashSet::new(),
             Some(serde_json::Value::Object(props)) => props.keys().cloned().collect(),
             Some(_) => {
                 return Err(ToolSpecValidationError::SchemaPropertiesMustBeObject {
-                    tool: self.name.clone(),
+                    tool: tool.to_string(),
                 });
             }
         };
-        let required_names: HashSet<String> = match schema.get("required") {
-            None => HashSet::new(),
-            Some(serde_json::Value::Array(items)) => {
-                let mut names = HashSet::new();
-                for item in items {
-                    let Some(name) = item.as_str() else {
-                        return Err(ToolSpecValidationError::SchemaRequiredMustBeStringArray {
-                            tool: self.name.clone(),
-                        });
-                    };
-                    names.insert(name.to_string());
-                }
-                names
-            }
-            Some(_) => {
-                return Err(ToolSpecValidationError::SchemaRequiredMustBeStringArray {
-                    tool: self.name.clone(),
-                });
-            }
-        };
-        if !required_names.is_subset(&property_names) {
+        let required_names = required_names(tool, obj)?;
+        if required_names != property_names {
             return Err(ToolSpecValidationError::RequiredMustMatchProperties {
-                tool: self.name.clone(),
+                tool: tool.to_string(),
             });
         }
-        Ok(())
+    }
+
+    if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
+        for schema in props.values() {
+            validate_strict_schema_object(tool, schema)?;
+        }
+    }
+    for key in ["items", "additionalItems", "contains"] {
+        if let Some(schema) = obj.get(key) {
+            validate_strict_schema_object(tool, schema)?;
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(serde_json::Value::Array(items)) = obj.get(key) {
+            for schema in items {
+                validate_strict_schema_object(tool, schema)?;
+            }
+        }
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(serde_json::Value::Object(defs)) = obj.get(key) {
+            for schema in defs.values() {
+                validate_strict_schema_object(tool, schema)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn required_names(
+    tool: &str,
+    schema: &serde_json::Map<String, serde_json::Value>,
+) -> Result<HashSet<String>, ToolSpecValidationError> {
+    match schema.get("required") {
+        None => Ok(HashSet::new()),
+        Some(serde_json::Value::Array(items)) => {
+            let mut names = HashSet::new();
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return Err(ToolSpecValidationError::SchemaRequiredMustBeStringArray {
+                        tool: tool.to_string(),
+                    });
+                };
+                names.insert(name.to_string());
+            }
+            Ok(names)
+        }
+        Some(_) => Err(ToolSpecValidationError::SchemaRequiredMustBeStringArray {
+            tool: tool.to_string(),
+        }),
     }
 }
 
@@ -222,7 +272,7 @@ pub enum ToolSpecValidationError {
     SchemaPropertiesMustBeObject { tool: String },
     #[error("tool {tool} input_schema required must be an array of strings")]
     SchemaRequiredMustBeStringArray { tool: String },
-    #[error("tool {tool} required fields must match properties for strict schema mode")]
+    #[error("tool {tool} required fields must include every property for strict schema mode")]
     RequiredMustMatchProperties { tool: String },
 }
 
@@ -509,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_required_may_be_subset_of_properties() {
+    fn strict_tool_schema_requires_all_properties() {
         let spec = ToolSpec {
             name: "read".into(),
             description: "lit".into(),
@@ -520,6 +570,27 @@ mod tests {
                     "offset": { "type": ["integer", "null"] }
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+        };
+        assert!(matches!(
+            spec.validate(),
+            Err(ToolSpecValidationError::RequiredMustMatchProperties { tool }) if tool == "read"
+        ));
+    }
+
+    #[test]
+    fn strict_tool_schema_accepts_nullable_required_optionals() {
+        let spec = ToolSpec {
+            name: "read".into(),
+            description: "lit".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "offset": { "type": ["integer", "null"] }
+                },
+                "required": ["path", "offset"],
                 "additionalProperties": false
             }),
         };

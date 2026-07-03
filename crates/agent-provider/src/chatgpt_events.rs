@@ -176,10 +176,10 @@ impl CodexEventMapper {
             .and_then(|i| i.get("arguments"))
             .and_then(Value::as_str);
         let Some(key) = self.event_item_key(v, "output_item.done")? else {
-            return Ok(Vec::new());
+            return self.reconstruct_done_function_call(v);
         };
         let Some(active) = self.active.remove(&key) else {
-            return Ok(Vec::new());
+            return self.reconstruct_done_function_call(v);
         };
         if self.last_active_item.as_deref() == Some(key.as_str()) {
             self.last_active_item = None;
@@ -197,6 +197,46 @@ impl CodexEventMapper {
             });
         }
         out.push(StreamEvent::ToolCallEnd { id: active.call_id });
+        Ok(out)
+    }
+
+    fn reconstruct_done_function_call(
+        &mut self,
+        v: &Value,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let Some(item) = v.get("item") else {
+            return Err(ProviderError::Decode(
+                "function_call done without active call or item".to_string(),
+            ));
+        };
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+        if call_id.trim().is_empty() || name.trim().is_empty() {
+            return Err(ProviderError::Decode(
+                "function_call done without active call id or name".to_string(),
+            ));
+        }
+        let args = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.saw_tool_call = true;
+        let mut out = vec![StreamEvent::ToolCallStart {
+            id: call_id.to_string(),
+            name: name.to_string(),
+        }];
+        if !args.is_empty() {
+            out.push(StreamEvent::ToolCallDelta {
+                id: call_id.to_string(),
+                args_json: args.to_string(),
+            });
+        }
+        out.push(StreamEvent::ToolCallEnd {
+            id: call_id.to_string(),
+        });
         Ok(out)
     }
 
@@ -306,7 +346,7 @@ fn failed_error(v: &Value) -> ProviderError {
         .and_then(|e| e.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("response.failed");
-    classify_message(code, message)
+    classify_failed_message(code, message)
 }
 
 /// Distingue un dépassement de contexte (→ withholding/compaction réactive) d'une
@@ -317,6 +357,63 @@ fn classify_message(code: &str, message: &str) -> ProviderError {
         ProviderError::ContextLengthExceeded
     } else {
         ProviderError::Stream(format!("{code}: {message}"))
+    }
+}
+
+fn classify_failed_message(code: &str, message: &str) -> ProviderError {
+    let hay = format!("{code} {message}").to_lowercase();
+    let detail = format!("{code}: {message}");
+    if hay.contains("context") && (hay.contains("length") || hay.contains("long")) {
+        ProviderError::ContextLengthExceeded
+    } else if hay.contains("rate_limit")
+        || hay.contains("rate limit")
+        || hay.contains("too many requests")
+        || hay.contains("quota")
+    {
+        ProviderError::Http {
+            status: 429,
+            message: detail,
+            retry_after_ms: None,
+        }
+    } else if hay.contains("auth")
+        || hay.contains("unauthorized")
+        || hay.contains("invalid token")
+        || hay.contains("expired")
+    {
+        ProviderError::Http {
+            status: 401,
+            message: detail,
+            retry_after_ms: None,
+        }
+    } else if hay.contains("permission") || hay.contains("forbidden") {
+        ProviderError::Http {
+            status: 403,
+            message: detail,
+            retry_after_ms: None,
+        }
+    } else if hay.contains("overload") {
+        ProviderError::Http {
+            status: 529,
+            message: detail,
+            retry_after_ms: None,
+        }
+    } else if hay.contains("server")
+        || hay.contains("internal")
+        || hay.contains("temporarily")
+        || hay.contains("unavailable")
+        || hay.contains("timeout")
+    {
+        ProviderError::Http {
+            status: 503,
+            message: detail,
+            retry_after_ms: None,
+        }
+    } else {
+        ProviderError::Http {
+            status: 400,
+            message: detail,
+            retry_after_ms: None,
+        }
     }
 }
 
@@ -532,6 +629,44 @@ mod tests {
     }
 
     #[test]
+    fn function_call_done_without_added_reconstructs_call() {
+        let ev = ingest_all(&[
+            r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}"#,
+            r#"{"type":"response.completed","response":{"status":"completed"}}"#,
+        ]);
+        assert!(ev.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::ToolCallStart { id, name } if id == "c1" && name == "read"
+            )
+        }));
+        assert!(ev.iter().any(|e| {
+            matches!(
+                e,
+                StreamEvent::ToolCallDelta { id, args_json }
+                if id == "c1" && args_json == "{\"path\":\"Cargo.toml\"}"
+            )
+        }));
+        assert_eq!(
+            ev.last(),
+            Some(&StreamEvent::Done {
+                stop: StopReason::ToolUse
+            })
+        );
+    }
+
+    #[test]
+    fn function_call_done_without_added_or_name_fails_closed() {
+        let mut m = CodexEventMapper::new();
+        let err = m
+            .ingest(
+                r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","arguments":"{}"}}"#,
+            )
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Decode(_)));
+    }
+
+    #[test]
     fn incomplete_status_maps_to_maxtokens() {
         let ev =
             ingest_all(&[r#"{"type":"response.incomplete","response":{"status":"incomplete"}}"#]);
@@ -562,6 +697,42 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ProviderError::ContextLengthExceeded));
         assert!(err.is_context_error());
+    }
+
+    #[test]
+    fn response_failed_invalid_request_is_not_stream_retryable() {
+        let mut m = CodexEventMapper::new();
+        let err = m
+            .ingest(
+                r#"{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"bad schema"}}}"#,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::Http {
+                status: 400,
+                retry_after_ms: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn response_failed_rate_limit_keeps_rate_limited_status() {
+        let mut m = CodexEventMapper::new();
+        let err = m
+            .ingest(
+                r#"{"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"too many requests"}}}"#,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ProviderError::Http {
+                status: 429,
+                retry_after_ms: None,
+                ..
+            }
+        ));
     }
 
     // US-031 : reasoning item chiffré capturé uniquement si replay actif.

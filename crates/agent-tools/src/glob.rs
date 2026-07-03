@@ -46,7 +46,7 @@ impl Tool for Glob {
                 "pattern": { "type": "string", "description": "Motif glob, ex. **/*.rs" },
                 "path": { "type": ["string", "null"], "description": "Sous-dossier de base (relatif au workspace), ou null." }
             },
-            "required": ["pattern"],
+            "required": ["pattern", "path"],
             "additionalProperties": false
         })
     }
