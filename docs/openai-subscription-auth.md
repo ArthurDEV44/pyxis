@@ -4,7 +4,7 @@
 >
 > Source extraite : repo `pi` (TypeScript, `/home/arthur/dev/pi`), packages `ai` + `coding-agent`. **Constantes vérifiées adversarialement : 45/45 claims confirmés contre le code réel** (3 corrections de précision intégrées ci-dessous, marquées ⚠️). Toutes les valeurs sont littérales (recopiables verbatim en Rust). Croisé avec `docs/PROVIDERS.md` et `tasks/prd-pyxis.md` (US-015/016/017/018, EP-004).
 >
-> **Décision induite à acter en ADR-10** : l'auth abonnement ChatGPT force la **Responses API sur le backend ChatGPT** (pas Chat Completions) → un `ProviderKind::OpenAiChatGpt` distinct, gated, SSE stateless. Voir §2.
+> **Décision actée par ADR-10 puis recentrée par ADR-11** : l'auth abonnement ChatGPT force la **Responses API sur le backend ChatGPT** (pas Chat Completions) → un `ProviderKind::OpenAiChatGpt` distinct, SSE stateless. Depuis ADR-11, ce provider n'est plus une option gated future : c'est le MVP courant livré en premier. Voir §2.
 
 ---
 
@@ -162,16 +162,16 @@ Retourne un **nouveau** `{access_token, refresh_token, expires_in}` → **refres
 - En **SSE**, le backend Codex est **stateless** (pas de `previous_response_id`) → contexte complet dans `input[]` à chaque tour → **mappe proprement** sur le transcript client-side. Bonne nouvelle.
 - En **WebSocket** avec réutilisation de connexion, bascule sur `previous_response_id` (state server-side connection-scoped) = exactement le piège **`PROVIDERS.md §4.1`** (« OpenAI Responses API ne mappe pas sur le canonique »).
 
-**Conclusion : conflit réel mais contournable.** `ProviderKind::OpenAiChat` (cible MVP) ne peut **pas** servir l'abonnement ChatGPT — endpoint et wire format diffèrent.
+**Conclusion : conflit réel mais contournable.** `ProviderKind::OpenAiChat` ne peut **pas** servir l'abonnement ChatGPT : endpoint et wire format diffèrent.
 
-**Recommandation : adapter dédié, gated, séparé du Chat Completions BYOK.**
+**Recommandation : adapter dédié, séparé du Chat Completions BYOK.**
 
 Introduire `ProviderKind::OpenAiChatGpt` (subscription), **et non** réutiliser `OpenAiResponses` générique ni `OpenAiChat` :
-1. `OpenAiChat` (US-017) reste pur : `api.openai.com/v1/chat/completions`, API key BYOK, mapping client-side, **cible MVP intacte**.
+1. `OpenAiChat` (US-017) reste pur : `api.openai.com/v1/chat/completions`, API key BYOK, mapping client-side, adapter futur depuis ADR-11.
 2. `OpenAiResponses` (déjà prévu gated) cible `api.openai.com/v1/responses` au token (API publique). Le backend ChatGPT en diverge (base URL, headers, `store:false` forcé). Mélanger = branches conditionnelles fragiles.
 3. Le nouvel adapter `openai-chatgpt` **force le mode SSE stateless** (seul qui mappe le canonique client-side) et **renonce au WebSocket+`previous_response_id`** pour le MVP. `capabilities().server_side_state = false`.
 
-**Lien US-017** : son AC dit « la Responses API est hors scope ». L'abonnement ChatGPT *est* de la Responses API → **US-017 ne le couvre pas** (il couvre OpenAI au token, Chat Completions). L'auth abonnement ChatGPT est une **US séparée gated**, pas du P0.
+**Lien US-017** : son AC dit « la Responses API est hors scope ». L'abonnement ChatGPT *est* de la Responses API → **US-017 ne le couvre pas** (il couvre OpenAI au token, Chat Completions). L'auth abonnement ChatGPT est une US séparée, devenue le chemin MVP courant par ADR-11.
 
 ---
 
@@ -361,14 +361,14 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 
 ### Verdict
 
-**Oui, l'implémenter pour le dogfood d'Arthur — mais strictement comme credential optionnelle étiquetée « fragile », derrière BYOK, jamais en P0.**
+**Oui, l'implémenter pour le dogfood d'Arthur. ADR-11 a depuis promu ce chemin au MVP courant, tout en gardant l'étiquette « fragile » et le plan de sortie BYOK.**
 
 1. **Arthur a rejeté Ollama comme défaut perso et veut son abonnement OpenAI.** Le verdict spike acte Ollama comme premier dogfood « officiel » (gratuit/local), mais l'abonnement ChatGPT couvre le confort quotidien réel qu'Arthur veut.
-2. **Le MVP ne doit pas en dépendre** (`FR-11`, verdict US-001). P0 = OpenAI Chat **au token** (US-017) + le provider non-bloqué. L'abonnement ChatGPT = **US séparée gated**, hors chemin critique.
-3. **Forme concrète** : `ProviderKind::OpenAiChatGpt`, derrière un flag/credential labellisé `# fragile: réutilise le client Codex, révocable par OpenAI`, en **SSE stateless uniquement** (mappe le canonique, évite le piège WS/`previous_response_id`). `originator=pyxis`.
-4. **Coût d'opportunité** : ~150-250 lignes (`openai_chatgpt.rs` + `pkce.rs`), réutilise l'infra `agent-auth`/keyring déjà nécessaire pour Anthropic OAuth. ROI dogfood élevé, blast radius nul (gated). Pire scénario (OpenAI révoque) déjà couvert par l'archi multi-provider.
+2. **Le MVP courant en dépend volontairement** (`ADR-11`) pour maximiser le dogfood. C'est un risque assumé de séquence, pas un abandon de l'architecture model-agnostic.
+3. **Forme concrète** : `ProviderKind::OpenAiChatGpt`, credential labellisé fragile, en **SSE stateless uniquement** (mappe le canonique, évite le piège WS/`previous_response_id`). `originator=pyxis`.
+4. **Coût d'opportunité** : ~150-250 lignes (`openai_chatgpt.rs` + `pkce.rs`), réutilise l'infra `agent-auth`/keyring déjà nécessaire pour OAuth. ROI dogfood élevé, blast radius borné par l'architecture provider. Pire scénario (OpenAI révoque) : ajouter un adapter BYOK sans refondre le cœur.
 
-**À ne pas faire** : en faire le défaut, le mettre en AC P0, ou shipper WebSocket+`previous_response_id` (casserait compaction/resume). **À faire** : credential opt-in, SSE stateless, étiquette fragile, fallback (OpenAI-token) toujours présent.
+**À ne pas faire** : shipper WebSocket+`previous_response_id` (casserait compaction/resume) ou confondre `OpenAiChatGpt` avec `OpenAiResponses` public. **À faire** : SSE stateless, étiquette fragile, fallback BYOK à ajouter en priorité si le canal subscription casse.
 
 ---
 
@@ -377,4 +377,4 @@ Conséquence : **deux adapters / deux `ProviderKind`** (`OpenAiChat` vs `OpenAiC
 - Le wording exact d'un éventuel message de blocage côté OpenAI (équivalent du « only authorized for use with Claude Code ») est **inconnu** : Pi ne le capture pas. À sonder en live.
 - La validation `originator` côté backend ChatGPT (rejette-t-il un originator inconnu ?) est **non vérifiée** — à tester avec `"pyxis"` au premier run.
 
-> **ADR-10 à écrire** (input pour `docs/DECISIONS.md`) : « Auth abonnement ChatGPT via `ProviderKind::OpenAiChatGpt` (Responses API sur backend ChatGPT, SSE stateless, gated, fragile) — distinct de `OpenAiChat` (Chat Completions BYOK, P0) ». Acte aussi la clarification de scope US-017 (ne couvre pas l'abonnement).
+> **ADR-10/ADR-11 actées** : « Auth abonnement ChatGPT via `ProviderKind::OpenAiChatGpt` (Responses API sur backend ChatGPT, SSE stateless, fragile) », distinct de `OpenAiChat` (Chat Completions BYOK futur). US-017 ne couvre pas l'abonnement.

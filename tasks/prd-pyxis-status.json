@@ -155,7 +155,7 @@
       "started_at": "2026-06-15",
       "completed_at": "2026-06-15",
       "reviewed_at": null,
-      "verdict": "DONE — ContextBudget calculé 1x/modèle (seuils micro 70%/auto 80%), consomme Usage du stream, fallback agent-tokenizer (HeuristicCounter) quand usage absent (Ollama). Testé en isolation + au niveau boucle."
+      "verdict": "DONE — ContextBudget calculé 1x/modèle (seuils micro 70%/auto 80%), consomme Usage du stream, fallback agent-tokenizer (HeuristicCounter) quand usage absent. Motivation historique : Ollama ; statut courant : fallback provider-agnostique. Testé en isolation + au niveau boucle."
     },
     {
       "id": "US-008",

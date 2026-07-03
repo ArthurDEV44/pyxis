@@ -1,6 +1,8 @@
 # Couche multi-provider
 
-> La couche multi-provider est le cœur de Pyxis. C'est elle qui justifie le projet : « qualité Claude Code, **tous** les modèles frontier ». Là où Claude Code est Anthropic-only, Pyxis est multi-provider first-class. Ce document est la source de vérité de cette couche.
+> La couche multi-provider est le cœur architectural de Pyxis. C'est elle qui justifie le projet : « qualité Claude Code, **tous** les modèles frontier ». Là où Claude Code est Anthropic-only, Pyxis est multi-provider first-class. Ce document est la source de vérité du contrat provider. L'état livré courant vit dans [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md).
+
+**État courant après ADR-11.** Un seul adapter est livré aujourd'hui : `OpenAiChatGpt`, c'est-à-dire l'abonnement ChatGPT via le backend Codex en SSE stateless. `OpenAiChat`, `OpenAiResponses`, `Anthropic`, `Gemini`, `OpenRouter` et les clouds sont des adapters futurs. `Ollama` a été retiré du scope et n'existe plus dans `ProviderKind`.
 
 **Docs liées.** Décisions : [`docs/DECISIONS.md`](./DECISIONS.md) (ADR-4 = couche provider, ADR-7 = roadmap/risque). Architecture transverse : [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md). Plan d'exécution : [`docs/ROADMAP.md`](./ROADMAP.md). Ce document est la version détaillée d'ADR-4 ; toute divergence de signature entre ADR-4 et ce fichier se résout en faveur de ce fichier (taxonomie d'erreurs notamment, cf. §5.1).
 
@@ -71,10 +73,10 @@ pub trait Provider: Send + Sync {
 
 pub enum ProviderKind {
     Anthropic,
-    OpenAiChat,        // Chat Completions  — CIBLE MVP
-    OpenAiResponses,   // Responses API     — gated, opt-in
+    OpenAiChat,        // Chat Completions BYOK, futur
+    OpenAiChatGpt,     // Abonnement ChatGPT via backend Codex, MVP courant
+    OpenAiResponses,   // Responses API publique, future/gated
     Gemini,
-    Ollama,
     OpenRouter,
     // Bedrock / Vertex / Azure ne sont PAS des kinds : ce sont des
     // injections d'auth/endpoint au-dessus d'Anthropic/OpenAi/Gemini.
@@ -90,7 +92,7 @@ pub enum StreamEvent {
     ToolCallStart  { id: ToolCallId, name: String },
     ToolCallDelta  { id: ToolCallId, args_json: String },  // arguments incrémentaux
     ToolCallEnd    { id: ToolCallId },                      // call complet & parseable
-    Usage          { usage: TokenUsage },                  // peut ne jamais arriver (Ollama)
+    Usage          { usage: TokenUsage },                  // peut ne jamais arriver selon provider
     Done           { stop: StopReason },
 }
 
@@ -161,7 +163,15 @@ pub enum AuthError {
 
 Chaque cellule décrit ce que l'**adapter** doit faire pour ramener le provider au canonique Anthropic-like. Tout ce qui n'est pas « identité » est du code localisé dans l'adapter.
 
-| Axe | Anthropic | OpenAI **Chat** (MVP) | OpenAI **Responses** (gated) | Gemini | Ollama | OpenRouter | Bedrock / Vertex / Azure |
+**Adapter livré aujourd'hui.**
+
+| Kind | Statut | Surface | Auth | État conversation |
+|---|---|---|---|---|
+| `OpenAiChatGpt` | MVP courant | `chatgpt.com/backend-api/codex/responses`, SSE stateless | OAuth PKCE abonnement ChatGPT, keyring | Client-side : transcript complet dans `input[]`, pas de `previous_response_id` |
+
+Le tableau ci-dessous couvre les adapters publics/BYOK futurs et conserve Ollama comme contexte historique retiré du scope, pas comme promesse de livraison.
+
+| Axe | Anthropic | OpenAI **Chat** (BYOK futur) | OpenAI **Responses** public (future/gated) | Gemini | Ollama (retiré du scope) | OpenRouter | Bedrock / Vertex / Azure |
 |---|---|---|---|---|---|---|---|
 | **Surface** | Messages API | `/chat/completions` | `/responses` | `generateContent` (stream) | OpenAI-compat | OpenAI-compat (méta) | Réutilise l'adapter sous-jacent |
 | **Tool schema** | `tools[].input_schema` (JSON Schema) — **canonique** | `tools[].function.parameters` | idem Chat mais sous `tools` Responses | `functionDeclarations[].parameters` (sous-ensemble OpenAPI) | comme Chat | comme Chat | hérité de l'adapter de base |
@@ -177,19 +187,22 @@ Chaque cellule décrit ce que l'**adapter** doit faire pour ramener le provider 
 | **Multimodal** | `image` content block | `image_url` parts | input items image | `inlineData` parts | selon modèle | selon modèle | hérité |
 | **Betas** | en-têtes `anthropic-beta` (gated `kind==Anthropic`) | — | — | — | — | — | n/a |
 
-**Lecture clé.** L'adapter Anthropic est une quasi-identité. OpenAI Chat est la **cible MVP** parce que le mapping est propre (état client-side, tool result trivial). Bedrock/Vertex/Azure ne sont **pas des adapters complets** : ce sont des couches d'auth/endpoint au-dessus d'Anthropic/OpenAI/Gemini — toutes les creds passent par `agent-auth`.
+**Lecture clé.** L'adapter Anthropic est une quasi-identité. OpenAI Chat Completions reste un adapter BYOK propre à ajouter plus tard (état client-side, tool result trivial), mais il n'est plus la cible MVP depuis ADR-11. Bedrock/Vertex/Azure ne sont **pas des adapters complets** : ce sont des couches d'auth/endpoint au-dessus d'Anthropic/OpenAI/Gemini — toutes les creds passent par `agent-auth`.
 
 ---
 
 ## 4. Pièges explicites
 
-### 4.1 OpenAI Responses API ne mappe pas sur le canonique
+### 4.1 OpenAI Responses public ne mappe pas sur le canonique
 
-La Responses API maintient l'**état conversationnel côté serveur** (`previous_response_id`). Notre canonique repose sur un **transcript client-side** (on reconstruit l'historique à chaque tour, indispensable pour la compaction, le resume JSONL, le replay des sessions). Les deux modèles sont **incompatibles par design**.
+La Responses API publique peut maintenir l'**état conversationnel côté serveur** (`previous_response_id`). Notre canonique repose sur un **transcript client-side** (on reconstruit l'historique à chaque tour, indispensable pour la compaction, le resume JSONL, le replay des sessions). Les deux modèles sont **incompatibles par design**.
+
+`OpenAiChatGpt` est un cas distinct : il utilise un endpoint `responses` sur le backend ChatGPT/Codex, mais Pyxis l'emploie en SSE stateless avec `store:false` et transcript complet dans `input[]`. Il ne doit pas être confondu avec `OpenAiResponses` public.
 
 Décision :
-- **Chat Completions = cible MVP** d'OpenAI. Transcript client-side → mapping propre vers le canonique.
-- **Responses API = mode gated optionnel**, exposé via `capabilities().server_side_state == true`. **Jamais le défaut.** `agent-core` ne l'active que sur opt-in explicite, et la compaction / le resume sont alors dégradés (l'état vit côté OpenAI).
+- **`OpenAiChatGpt` = cible MVP courante.** Transcript client-side → mapping propre vers le canonique.
+- **Chat Completions BYOK = adapter futur.** Transcript client-side → mapping propre vers le canonique.
+- **Responses API publique = mode gated optionnel**, exposé via `capabilities().server_side_state == true`. **Jamais le défaut.** `agent-core` ne l'active que sur opt-in explicite, et la compaction / le resume sont alors dégradés (l'état vit côté OpenAI).
 
 ```rust
 // agent-core, avant d'envoyer : ne PAS supposer le server-side state.
@@ -216,18 +229,18 @@ let mut pending: HashMap<ToolCallId, PartialCall> = HashMap::new();
 // Ne JAMAIS émettre ToolCallEnd tant que pending[id] n'est pas un JSON valide.
 ```
 
-### 4.3 Ollama : usage absent → fallback tokenizer obligatoire
+### 4.3 Usage absent : fallback tokenizer obligatoire
 
-Ollama (OpenAI-compat) **n'émet souvent pas** d'`usage` dans le stream. Sans comptage de tokens, la compaction est cassée (`ContextBudget` ne sait pas quand déclencher microcompact/autocompact).
+Certains providers ou routes **n'émettent pas** d'`usage` fiable dans le stream. Historiquement, le spike l'a documenté via Ollama ; aujourd'hui Ollama est retiré du scope, mais le problème reste valable pour des providers futurs et pour certains modèles routés.
 
-`agent-core::update_budget` lit le `Usage` du stream **si présent**, sinon **retombe sur `agent-tokenizer`** (tiktoken-rs / tokenizers) pour compter localement input + output. C'est non négociable pour tout provider sans usage fiable (Ollama, certains modèles via OpenRouter).
+`agent-core::update_budget` lit le `Usage` du stream **si présent**, sinon **retombe sur `agent-tokenizer`** (tiktoken-rs / tokenizers) pour compter localement input + output. C'est non négociable pour tout provider sans usage fiable.
 
 ```rust
 fn update_budget(&mut self, ev: &StreamEvent, transcript: &Transcript) {
     match ev {
         StreamEvent::Usage { usage } => self.budget.apply(usage),   // chemin nominal
         StreamEvent::Done { .. } if !self.saw_usage => {
-            // fallback : comptage local, sinon compaction cassée sur Ollama
+            // fallback : comptage local, sinon compaction cassée
             let counted = self.tokenizer.count(transcript);
             self.budget.apply_estimated(counted);
         }
@@ -312,11 +325,12 @@ Déployé en **janvier 2026**, **durci en avril 2026** : Anthropic bloque les ou
 
 C'est précisément **pourquoi la couche multi-provider est le cœur du projet**. Le positionnement est **model-agnostic** :
 
-- **Provider MVP non-bloqué** : **Ollama local** (aucune auth, aucun blocage possible) + **OpenAI Chat Completions au token** (API key, hors abonnement). Anthropic est **conditionnel**, jamais requis.
-- Si Anthropic bloque, Pyxis **fonctionne quand même** — il bascule sur les autres providers. La valeur du produit ne repose sur aucun provider unique.
+- **Scope MVP courant après ADR-11** : `OpenAiChatGpt` livré en premier pour dogfood immédiat, avec le risque de révocation explicitement accepté.
+- **Mitigation durable** : le trait `Provider`, le canonique Anthropic-like et l'isolation des adapters permettent d'ajouter un chemin BYOK si le canal subscription casse.
+- **Ancien chemin non-bloqué** : Ollama local + OpenAI Chat Completions au token était le cadrage Phase 0. Il reste un verdict historique, pas l'état livré.
 
 ### 6.3 Le go/no-go : spike auth de Phase 0
 
-Le **spike auth Anthropic** (`agent-auth`, ~1 jour) est le **go/no-go de Phase 0** (voir [`docs/ROADMAP.md`](./ROADMAP.md), Phase 0) : il détermine si Pyxis peut s'authentifier contre Anthropic dans des conditions acceptables. Quelle que soit son issue, le MVP avance — parce que le chemin non-bloqué (Ollama + OpenAI) ne dépend pas de ce verdict. Le résultat du spike décide seulement du **statut d'Anthropic** comme provider (first-class, dégradé, ou différé), pas de la viabilité du produit.
+Le **spike auth Anthropic** (`agent-auth`, ~1 jour) est le **go/no-go historique de Phase 0** (voir [`docs/ROADMAP.md`](./ROADMAP.md), Phase 0) : il détermine si Pyxis peut s'authentifier contre Anthropic dans des conditions acceptables. Depuis ADR-11, son issue ne définit plus le provider MVP livré ; elle définit seulement le statut futur d'Anthropic comme adapter.
 
-> En une phrase : la couche multi-provider n'est pas une feature, c'est l'**assurance** contre le risque N°1. Tant qu'un seul provider frontier reste accessible, Pyxis tourne.
+> En une phrase : la couche multi-provider n'est pas une feature, c'est l'**assurance** contre le risque N°1. Tant qu'un provider accessible existe et qu'un adapter est branché, Pyxis peut survivre à la révocation d'un canal.

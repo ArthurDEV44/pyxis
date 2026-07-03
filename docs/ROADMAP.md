@@ -1,10 +1,12 @@
 # Roadmap Pyxis
 
+> Statut courant : cette roadmap conserve les décisions historiques de Phase 0 et du premier cadrage Phase 1. Depuis ADR-11, le MVP livré est recentré sur `OpenAiChatGpt` (abonnement ChatGPT) en premier. Ollama, OpenAI Chat Completions BYOK, Anthropic, Gemini et OpenRouter sont des providers futurs ou historiques, pas le scope livré. Voir [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md).
+
 **Principe directeur : le dur et le risque en premier.** On n'écrit pas une ligne d'architecture confortable avant d'avoir tué les inconnues qui peuvent invalider le projet. Chaque phase descend d'un cran dans le risque résiduel. La Phase 0 n'est pas un sprint de fondation : c'est une série de spikes jetables dont la seule fonction est de produire un verdict go/no-go.
 
 Le risque d'exécution N1 est connu et assumé : Rust en solo = vélocité plus lente que TS/Bun. La roadmap compense en concentrant l'incertitude technique le plus tôt possible, pour que le coût de pivot reste faible tant qu'aucune dette d'archi n'est posée.
 
-**Documents liés.** Décisions de fond et providers : [`docs/DECISIONS.md`](./DECISIONS.md) (ADRs), [`docs/PROVIDERS.md`](./PROVIDERS.md) (couche multi-provider), [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) (workspace, boucle, événements). Les correspondances clés : ADR-7 (de-risquage) ↔ ce document ; ADR-4 ↔ `docs/PROVIDERS.md` (taxonomie d'erreurs, retry) ; ADR-2/ADR-3 ↔ `docs/ARCHITECTURE.md` (crates, boucle) ; `docs/PROVIDERS.md` §6 ↔ Phase 0 ci-dessous (spike provider).
+**Documents liés.** État courant : [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md). Décisions de fond et providers : [`docs/DECISIONS.md`](./DECISIONS.md) (ADRs), [`docs/PROVIDERS.md`](./PROVIDERS.md) (couche multi-provider), [`docs/ARCHITECTURE.md`](./ARCHITECTURE.md) (workspace, boucle, événements). Les correspondances clés : ADR-7 (de-risquage) ↔ ce document ; ADR-4 ↔ `docs/PROVIDERS.md` (taxonomie d'erreurs, retry) ; ADR-2/ADR-3 ↔ `docs/ARCHITECTURE.md` (crates, boucle) ; `docs/PROVIDERS.md` §6 ↔ Phase 0 ci-dessous (spike provider).
 
 ---
 
@@ -44,6 +46,8 @@ Deux divergences de nommage sont **actées explicitement** ici pour éviter tout
 
 **Objectif.** Un agent de code utilisable en terminal, full Rust/Linux, sur un provider **non bloqué** par le risque N1. C'est le premier artefact qui doit survivre : on pose ici le workspace de crates définitif et les contrats internes.
 
+**Mise à jour de scope (ADR-11).** L'objectif d'un provider non bloqué décrit le cadrage historique. Le MVP courant livre d'abord `OpenAiChatGpt` pour le dogfood réel ; les adapters BYOK restent l'assurance architecturale et le backlog provider.
+
 **Livrables.**
 - Workspace de crates en place avec la règle d'or respectée : `agent-core` ne dépend ni de `agent-tui` ni de `agent-provider`, testable headless (`-p`) sans Ratatui ni API.
 - Boucle d'agent complète :
@@ -52,10 +56,10 @@ Deux divergences de nommage sont **actées explicitement** ici pour éviter tout
   - deps injectables (boucle testable sans API) ;
   - `ContextBudget` calculé une fois par modèle (source unique de vérité) ;
   - circuit breaker sur autocompact consécutifs.
-- Couche provider maison sur **Ollama** + **OpenAI Chat Completions**, **Anthropic conditionnel** au verdict Phase 0.
+- Couche provider maison avec `OpenAiChatGpt` livré en premier ; OpenAI Chat Completions BYOK, Anthropic, Gemini, OpenRouter et autres adapters sont différés.
 - Système d'outils : trait `Tool` à defaults fail-closed (`is_concurrency_safe=false`, `is_read_only=false`, `returns_untrusted=true`), object-safety via `DynTool`, dispatch concurrent (`buffer_unordered(10)`) / sériel, pipeline strict par outil (parse → `validate_input` → `PreToolUse` → permissions + règles globales → `call()` sous `tokio::time::timeout` → taint untrusted → `PostToolUse`).
 - Permissions 5 modes (Default / AcceptEdits / DontAsk / BypassPermissions / Plan) + **taint untrusted** (OWASP LLM01) : tout output d'outil est untrusted par défaut, propagé ; une action destructive/réseau dans un turn contenant du taint récent force `Ask`.
-- Tokenizer local (`agent-tokenizer`) pour le comptage quand le provider n'émet pas de `Usage` en stream (Ollama). `update_budget` lit le `Usage` du stream sinon retombe sur `agent-tokenizer` (sans quoi la compaction casse sur Ollama).
+- Tokenizer local (`agent-tokenizer`) pour le comptage quand le provider n'émet pas de `Usage` fiable en stream. `update_budget` lit le `Usage` du stream sinon retombe sur `agent-tokenizer`.
 - Compaction en cascade : micro + auto + full (fork de l'agent via `tokio::spawn` en mode resume, images strippées). `snip`/`collapse` reste feature-gated et hors scope MVP.
 - Sandbox Landlock FS + proxy réseau.
 - TUI streaming + diff brut + dialogs de permission.
@@ -65,23 +69,23 @@ Deux divergences de nommage sont **actées explicitement** ici pour éviter tout
 
 Distinction explicite pour lever l'ambiguïté « keyring vs OAuth » :
 
-| Au MVP (Phase 1) | Reporté (Phase 2) |
+| Au MVP courant (Phase 1) | Reporté |
 |---|---|
 | Stockage de credentials via keyring / Secret Service (`agent-auth`). | OAuth **PKCE par serveur MCP** (chaque serveur a son flux). |
-| Flux **OAuth + refresh token pour Anthropic** si — et seulement si — Anthropic entre au MVP (verdict Phase 0). C'est le strict nécessaire pour un seul provider OAuth. | Gestion **multi-serveurs** de tokens, orchestration de refresh complexe au-delà du cas single-provider. |
-| `401 → refresh OAuth` pour le provider Anthropic. | — |
+| Flux **OAuth PKCE + refresh token pour ChatGPT subscription** (`OpenAiChatGpt`). | Gestion **multi-serveurs** de tokens, orchestration de refresh complexe au-delà du cas single-provider. |
+| `401 → refresh OAuth` pour le provider ChatGPT subscription. | OAuth provider Anthropic ou autre BYOK quand ces adapters seront priorisés. |
 
-Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) ; l'OAuth single-provider d'Anthropic, lui, est dans le MVP dès lors qu'Anthropic y est conditionnellement inclus.
+Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) et providers futurs. L'OAuth single-provider livré aujourd'hui est celui de l'abonnement ChatGPT.
 
 ### Inclus / Exclu
 
-| Inclus dans le MVP | Explicitement HORS scope (reporté) |
+| Inclus dans le MVP courant | Explicitement HORS scope (reporté) |
 |---|---|
-| Ollama (local), OpenAI Chat Completions | OpenAI Responses API (server-side state, gated) |
-| Anthropic **conditionnel** au go/no-go auth | Gemini, OpenRouter, Bedrock, Vertex, Azure |
-| Outils Bash, Read, Edit, Write, Glob, Grep | MCP (`agent-mcp` / rmcp) |
+| `OpenAiChatGpt` (abonnement ChatGPT, SSE stateless via backend Codex) | OpenAI Chat Completions BYOK, OpenAI Responses public API |
+| Architecture multi-provider (`Provider` trait) | Anthropic, Gemini, OpenRouter, Ollama, Bedrock, Vertex, Azure |
+| Outils Bash, Read, Edit, Write, Glob, Grep | MCP tools exposés au modèle |
 | Permissions 5 modes + taint untrusted | Skills / commands / hooks utilisateur |
-| Auth keyring + OAuth single-provider (Anthropic, conditionnel) | OAuth PKCE multi-serveur (MCP), refresh multi-serveur |
+| Auth keyring + OAuth single-provider ChatGPT subscription | OAuth PKCE multi-serveur (MCP), refresh multi-serveur |
 | Tokenizer local (fallback `Usage`) | — |
 | Compaction micro + auto + full | `snip`/`collapse` (feature-gated) |
 | Sandbox Landlock FS + proxy réseau | macOS Seatbelt |
@@ -98,12 +102,14 @@ Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) ;
 **Objectif.** Couvrir l'ensemble des providers frontier et faire de Pyxis un agent complet, avec la première amorce de l'intégration profonde Paneflow.
 
 **Livrables.**
-- **Tous les providers** :
+- **Adapters BYOK et providers publics** :
+  - **OpenAI Chat Completions** : adapter BYOK futur, distinct de `OpenAiChatGpt`.
+  - **Anthropic** : adapter futur, avec `Auth(ThirdPartyBlocked)` pour le cas abonnement tiers bloqué.
   - **OpenAI Responses** : état server-side via `previous_response_id`, ne mappe **pas** sur le canonique → mode **gated** sur `capabilities.server_side_state`, jamais le défaut.
   - **Gemini** : réassemblage des function calls **fragmentées en stream** avant d'émettre `ToolCallEnd`, `systemInstruction`, context cache.
   - **OpenRouter** : méta-routeur OpenAI-compat (un seul adapter, 200+ modèles, perte des features natives).
   - **Bedrock / Vertex / Azure** : auth injectable (SigV4 / OAuth Google / endpoint custom), **pas** des adapters complets — ils réutilisent l'adapter Anthropic/OpenAI/Gemini sous-jacent. Toutes les creds via `agent-auth`.
-- **Transverses provider durcis.** `classify_error -> ErrorClass` avec, au minimum, les variantes `Retryable | Overloaded(529) | Auth | InvalidRequest` (taxonomie de référence : `docs/PROVIDERS.md`). Backoff exponentiel + jitter, `Overloaded(529)` = backoff agressif, honore `Retry-After`, fallback modèle après 3×529, `401 → refresh OAuth`. Le message Anthropic « This credential is only authorized for use with Claude Code… » → classifié `Auth` avec raison `ThirdPartyBlocked`. Stratégie cache-hit : ordre stable (system → tools → CLAUDE.md → historique), blocs cacheables en tête, jamais de contenu volatile avant un bloc cache. `cache_control` ephemeral TTL 1h et thinking adaptive côté Anthropic. Betas Anthropic gated sur `kind == Anthropic`. Multimodal canonique via `ContentBlock::Image`.
+- **Transverses provider durcis.** `classify_error -> ErrorClass` avec les variantes canoniques `Retryable | RateLimited | Overloaded(529) | Auth(AuthError) | InvalidRequest` (taxonomie de référence : `docs/PROVIDERS.md`). Backoff exponentiel + jitter, `Overloaded(529)` = backoff agressif, honore `Retry-After`, fallback modèle après 3×529, `401 → refresh OAuth`. Le message Anthropic « This credential is only authorized for use with Claude Code… » → classifié `Auth(ThirdPartyBlocked)`. Stratégie cache-hit : ordre stable (system → tools → CLAUDE.md → historique), blocs cacheables en tête, jamais de contenu volatile avant un bloc cache. `cache_control` ephemeral TTL 1h et thinking adaptive côté Anthropic. Betas Anthropic gated sur `kind == Anthropic`. Multimodal canonique via `ContentBlock::Image`.
 - **MCP** via rmcp officiel : état en enum discriminé (client accessible uniquement dans `Connected`), description cappée 2048 chars, **OAuth PKCE par serveur**, outils MCP enregistrés comme `DynTool` (uniformité), tous `returns_untrusted=true`.
 - Skills / commands + hooks utilisateur.
 - Sous-agents / teams : `tokio::spawn(run_agent)` avec transcript séparé, comm via `mpsc` ; InProcessTeammate via `tokio::task_local`.
@@ -132,11 +138,13 @@ Autrement dit, « OAuth/refresh complexe » reporté = **multi-serveur** (MCP) ;
 
 ## Note go/no-go — l'auth provider avant toute archi
 
+> Note historique : cette section explique le cadrage Phase 0. ADR-11 a depuis recentré le MVP sur `OpenAiChatGpt` pour dogfood immédiat. Le raisonnement de risque reste utile, mais le provider set décrit ici n'est plus le scope livré.
+
 Le risque N1 produit du projet est externe et hors de notre contrôle : depuis janvier 2026 (durci en avril 2026), Anthropic bloque les outils tiers qui s'authentifient via un abonnement Pro/Max. Un agent tiers ne peut plus consommer un abonnement Max.
 
 **Conséquence opérationnelle stricte : on répond à la question auth provider avant d'écrire une ligne d'architecture.** Le spike auth Anthropic est le `[P0 ABSOLU]` de la Phase 0 — la première chose qu'on fait, en 1 jour, dans `agent-auth`. Son verdict conditionne tout le reste :
 
 - **Si Anthropic est exploitable (token au minimum)** → il entre dans le provider set MVP en mode conditionnel ; on garde le cache-hit, les betas gated `kind == Anthropic`, et l'OAuth single-provider + refresh associé.
-- **Si Anthropic est inexploitable** → le MVP est conçu **non bloqué par design**. Ollama (local) + OpenAI (au token) suffisent à livrer un agent fonctionnel, et le positionnement reste **model-agnostic**. Pyxis ne dépend d'aucun provider unique pour exister.
+- **Si Anthropic est inexploitable** → le cadrage historique gardait un chemin non bloqué via Ollama local + OpenAI au token. Après ADR-11, ce chemin devient backlog provider ; l'assurance durable reste le trait `Provider` et l'isolation des adapters.
 
 La mitigation est structurelle, pas réactive : le différenciateur (**full Rust natif ultra-perf + multi-provider first-class + cœur partagé avec Paneflow**) tient indépendamment du sort d'Anthropic. Le spike auth ne décide pas si le projet vit — il décide seulement quels providers sont dans le MVP. Mais il se tranche **en premier**, avant tout engagement d'architecture.

@@ -7,6 +7,8 @@
 |---------|------|--------|---------|
 | 1.0 | 2026-06-15 | Arthur Jean | Draft initial — cadre le MVP (Phase 0 spikes + Phase 1) |
 
+> **Statut : PRD historique pré-ADR-11.** Ce document conserve le cadrage initial du MVP (Ollama, OpenAI Chat Completions BYOK, Anthropic conditionnel). Le scope courant livré est supersedé par ADR-11 : `OpenAiChatGpt` d'abord, autres providers différés. Pour l'état actuel, voir `docs/CURRENT_STATUS.md`, `docs/DECISIONS.md` ADR-11 et `tasks/prd-pyxis-status.json`.
+
 ## Problem Statement
 
 1. **Les CLI agents de codage de qualité sont enfermés sur un seul vendor.** Claude Code, le meilleur en UX, ne parle qu'aux modèles Anthropic. Les développeurs qui veulent cette qualité avec OpenAI, Gemini ou un modèle local doivent changer d'outil — et perdent la cohérence d'expérience.
@@ -431,7 +433,7 @@ IMPORTANT: chiffres mesurables uniquement.
 
 | # | Risk | Probability | Impact | Mitigation |
 |---|------|------------|--------|------------|
-| 1 | Accès provider (ban Anthropic tiers, 04/04/2026) | High | High | BYOK model-agnostic ; provider MVP non-bloqué (Ollama/OpenAI) ; spike US-001 en go/no-go |
+| 1 | Accès provider (ban Anthropic tiers, 04/04/2026) | High | High | Historique : BYOK model-agnostic avec provider MVP non-bloqué (Ollama/OpenAI). Supersedé par ADR-11 : MVP courant `OpenAiChatGpt`, plan de sortie BYOK futur. |
 | 2 | Vélocité Rust en solo (temps fragmenté) | High | High | Scope MVP serré + spikes d'abord ; `mold`+`sccache`+`nextest` ; réévaluer après Phase 0 |
 | 3 | Boucles d'outils runaway | Med | High | Loop guardrails déterministes (US-014), override de la logique modèle |
 | 4 | Coûts runaway (facture surprise) | Med | High | Budgets + kill-switch + estimation pré-tour (US-014) |
@@ -454,11 +456,11 @@ Frontières explicites — ce que le MVP ne fait PAS :
 
 ## Files NOT to Modify
 
-Pas de code Rust existant (projet pré-implémentation). Les documents suivants sont la **source de vérité architecturale** et ne doivent pas être contredits par l'implémentation sans une décision explicite (ADR) :
-- `docs/ARCHITECTURE.md` — workspace de crates, boucle, système d'outils, invariant cœur headless.
-- `docs/PROVIDERS.md` — format canonique, divergences par provider, retry/cache.
-- `docs/DECISIONS.md` — ADR-1→7 (langage, frontend, couche réseau, nom, risques).
-- `docs/ROADMAP.md` — découpage en phases.
+Section historique. Au moment du draft, aucun code Rust n'existait ; ce n'est plus vrai. Les surfaces de référence actuelles sont :
+- `docs/CURRENT_STATUS.md` : état livré, risques vivants et features différées.
+- `tasks/prd-pyxis-status.json` : suivi machine-readable des stories.
+- `docs/DECISIONS.md` : ADR, en particulier ADR-10 et ADR-11.
+- `docs/ARCHITECTURE.md`, `docs/PROVIDERS.md`, `docs/ROADMAP.md` : invariants et trajectoire, avec notes de supersession quand le scope a changé.
 
 ## Technical Considerations
 

@@ -7,6 +7,8 @@
 |---------|------|--------|---------|
 | 1.0 | 2026-06-17 | Arthur Jean | Initial draft — leviers calibrés Codex issus de l'audit Claude Code + Pi + Codex CLI + run live |
 
+> **Statut : PRD implémenté, avec deux nuances postérieures.** Le run live cité dans ce document est pré-rename ; `originator=pyxis` reste à revalider. L'écart AC3 sur l'estimation tokens a été corrigé ensuite par EP-009/US-030 (`estimate_static_input` + `static_input_tokens`). Voir `docs/codex-wire-spike.md`, `tasks/prd-codex-orchestration-status.json` et `docs/CURRENT_STATUS.md`.
+
 ## Problem Statement
 
 Le MVP de Pyxis (PRD `prd-pyxis.md`, EP-001→EP-005) livre un agent de code fonctionnel : la boucle, la compaction en cascade, les garde-fous, le sandbox et le wire Responses API (backend ChatGPT/Codex, SSE stateless) tournent et ont été validés en live le 2026-06-17. Mais Pyxis **sous-exploite GPT-5.5 par rapport à Codex App et Codex CLI**, et c'est exactement le pain point que le projet vise (orchestrer Codex mieux que les autres harness). Un audit en deux passes (Claude Code comme référence de qualité, puis dissection de Pi et du Codex CLI officiel comme références Codex) a isolé des écarts concrets :

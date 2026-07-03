@@ -1,8 +1,8 @@
 # Architecture de référence — Pyxis
 
-> Statut : étude / design, pré-implémentation. Aucun code écrit. Ce document est la source de vérité architecturale. Il fixe les invariants ; il ne fige pas chaque signature.
+> Statut : architecture de référence avec implémentation MVP en cours. Ce document fixe les invariants ; il ne fige pas chaque signature ni l'état livré exact.
 >
-> Documents liés : [`docs/PROVIDERS.md`](./PROVIDERS.md) (couche multi-provider, taxonomie d'erreurs, stratégie cache-hit), [`docs/ROADMAP.md`](./ROADMAP.md) (phases, spike Phase 0), [`docs/DECISIONS.md`](./DECISIONS.md) (ADR — décisions structurantes).
+> État livré courant : [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md). Documents liés : [`docs/PROVIDERS.md`](./PROVIDERS.md) (couche multi-provider, taxonomie d'erreurs, stratégie cache-hit), [`docs/ROADMAP.md`](./ROADMAP.md) (phases, spike Phase 0), [`docs/DECISIONS.md`](./DECISIONS.md) (ADR, décisions structurantes).
 
 Pyxis est une CLI agent IA en terminal, écrite en Rust natif, multi-provider first-class, conçue pour partager son cœur avec Paneflow (GPUI). La commande est `pyxis`. L'inspiration vient de l'architecture interne de Claude Code, mais transposée à un binaire Rust ultra-performant et agnostique au modèle.
 
@@ -65,12 +65,12 @@ Le projet est un workspace Cargo. Chaque crate a une responsabilité unique et u
 | `agent-core` | Boucle d'agent, state machine, types canoniques (messages, content blocks, transcript, budget). | Aucune dépendance TUI / HTTP. Ne connaît ni Ratatui ni reqwest. |
 | `agent-provider` | Trait `Provider` + adapters (reqwest + eventsource-stream). Normalisation vers le format canonique, émission de `StreamEvent`. | Ne dépend pas de `agent-tui`. |
 | `agent-tools` | `Registry`, trait `Tool`, dispatch concurrent/série, permissions, hooks, taint. | — |
-| `agent-mcp` | Wrapper autour de `rmcp` (SDK MCP Rust officiel). Expose les outils MCP comme `DynTool`. Dépend de `agent-tools` pour le trait. | — |
+| `agent-mcp` | Wrapper autour de `rmcp` (SDK MCP Rust officiel). Charge la config, suit le lifecycle stdio et liste les outils. L'exposition des outils MCP comme `DynTool` est le contrat cible, pas encore l'état livré. | — |
 | `agent-tui` | Frontend Ratatui + crossterm. **Découplé du core via canaux.** | **Jamais importé par le core.** |
 | `agent-session` | Persistance JSONL append-only, compaction, resume. | — |
 | `agent-sandbox` | Landlock FS + proxy réseau local + `PolicyEngine`. | — |
-| `agent-auth` | Stockage de credentials (Secret Service / keyring), OAuth, refresh token. **C'est ici que se joue le go/no-go auth Anthropic.** | — |
-| `agent-tokenizer` | Comptage de tokens local (tiktoken-rs / tokenizers). Indispensable pour la compaction sur les providers sans usage en stream (Ollama). Headless. | Aucune dépendance TUI / HTTP. |
+| `agent-auth` | Stockage de credentials (Secret Service / keyring), OAuth PKCE ChatGPT, refresh token. Les futurs flows BYOK/OAuth provider restent isolés ici. | — |
+| `agent-tokenizer` | Comptage de tokens local (tiktoken-rs / tokenizers). Indispensable pour la compaction sur les providers sans usage fiable en stream. Headless. | Aucune dépendance TUI / HTTP. |
 | `agent-cli` | Binaire `pyxis`, wiring. **Seul crate qui dépend de tout.** | — |
 
 ### Graphe de dépendances (sens des flèches = « dépend de »)
@@ -126,9 +126,9 @@ L'API consommateur est un **stream** via `async-stream` : `run_agent` renvoie un
 - **Withholding** retient une erreur de **contexte** (PTL, max-tokens, `413`) dans `PendingError`, tente une **compaction réactive** (§5), et ne propage qu'en cas d'échec du recovery.
 - **Le retry transverse** gère les erreurs **transitoires** (`Retryable`, `Overloaded`/`529`, `RateLimited`/`429`) via backoff exponentiel + jitter, dans la couche provider (cf. [`docs/PROVIDERS.md`](./PROVIDERS.md) §retry). Ces erreurs **ne passent jamais** par `PendingError`.
 
-### 3.3 Comptage de tokens et fallback Ollama
+### 3.3 Comptage de tokens et fallback local
 
-`update_budget` lit le `Usage` émis par le `StreamEvent` du provider **si présent**. Sinon (cas Ollama, usage souvent absent en stream), fallback obligatoire sur `agent-tokenizer` (comptage local). Sans ce fallback, **la compaction est cassée** sur les providers qui ne renvoient pas d'usage.
+`update_budget` lit le `Usage` émis par le `StreamEvent` du provider **si présent**. Sinon, fallback obligatoire sur `agent-tokenizer` (comptage local). Sans ce fallback, **la compaction est cassée** sur les providers qui ne renvoient pas d'usage fiable.
 
 ### 3.4 Taxonomie d'erreurs canonique — `ErrorClass`
 
@@ -237,7 +237,7 @@ fn run_agent(mut ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                 pending = Some(PendingError::from(ctx_err));
             }
 
-            // Fallback usage : si le stream n'a pas émis d'Usage (Ollama), compter en local.
+            // Fallback usage : si le stream n'a pas émis d'Usage, compter en local.
             if !budget.usage_seen() {
                 budget.update_budget(deps.tokenizer.count(&ctx, &acc));
             }
@@ -403,7 +403,7 @@ Articulation withholding ↔ reactive (rappel explicite) : seules les erreurs **
 
 ## 6. MCP via `rmcp`
 
-Pyxis consomme MCP via le SDK Rust officiel `rmcp` (wrappé dans `agent-mcp`).
+Pyxis consomme MCP via le SDK Rust officiel `rmcp` (wrappé dans `agent-mcp`). État livré courant : config, lifecycle stdio et listing d'outils. Le modèle ci-dessous est le contrat cible pour l'intégration complète des outils MCP dans la boucle agent.
 
 L'état d'un serveur MCP est un **enum discriminé** : le `client` n'est **accessible que dans la variante `Connected`.** Impossible d'appeler un serveur non connecté — le compilateur l'interdit.
 
@@ -419,9 +419,9 @@ enum McpServer {
 Règles MCP :
 
 - **Description cappée à 2048 caractères** (un serveur ne peut pas polluer le prompt).
-- **OAuth PKCE par serveur** (creds via `agent-auth`).
-- Outils MCP enregistrés comme `DynTool` (uniformité §4.1).
-- **Tous** les outils MCP ont `returns_untrusted() == true` — le taint (§4.6) s'applique intégralement à leurs sorties.
+- **OAuth PKCE par serveur** (creds via `agent-auth`) : cible Phase 2, pas livré dans le MVP courant.
+- Outils MCP enregistrés comme `DynTool` (uniformité §4.1) : cible Phase 2, pas encore exposé au modèle.
+- **Tous** les outils MCP auront `returns_untrusted() == true` une fois câblés dans la boucle agent ; le taint (§4.6) devra s'appliquer intégralement à leurs sorties.
 
 ---
 
@@ -547,6 +547,6 @@ Tant que Phase 2 n'est pas ouverte, la mémoire vectorielle est **explicitement 
 4. Les defaults du trait `Tool` sont **fail-closed.**
 5. `ContextBudget` est calculé **une seule fois par modèle** et reste la source unique de vérité de la compaction.
 6. transcript persisté **avant** l'appel API.
-7. La compaction se cassera sur Ollama si le fallback `agent-tokenizer` n'est pas branché : `update_budget` lit le `Usage` du stream **sinon** compte en local.
+7. La compaction se cassera sur tout provider sans `Usage` fiable si le fallback `agent-tokenizer` n'est pas branché : `update_budget` lit le `Usage` du stream **sinon** compte en local.
 8. **Withholding ≠ retry.** Seules les erreurs de contexte (PTL / max-tokens / `413`) alimentent `PendingError` et la compaction réactive ; les transitoires (`Retryable` / `Overloaded` / `RateLimited`) sont absorbées par le backoff transverse et n'entrent jamais dans `PendingError`.
 9. Le type d'erreur classifiée est **`ErrorClass`** (5 variantes), nommé identiquement dans tout le code et toute la doc — jamais `ErrClass`.

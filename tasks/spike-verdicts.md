@@ -4,6 +4,8 @@
 > d'accès provider (US-001) est tranché. Code jetable, isolé dans `spikes/` — **rien
 > de ceci n'est du MVP** et rien ne doit être porté tel quel en Phase 1 (cf.
 > `docs/ROADMAP.md` Phase 0 : « aucune dette à porter, aucune API à figer hormis le verdict auth »).
+>
+> **Note ADR-11.** Le provider set issu de ces verdicts est historique. Ollama comme premier dogfood et le duo Ollama + OpenAI Chat au token ne sont plus le scope livré ; le MVP courant livre `OpenAiChatGpt` d'abord. Les spikes restent des preuves de faisabilité, pas une promesse produit actuelle.
 
 | Date | 2026-06-15 |
 |---|---|

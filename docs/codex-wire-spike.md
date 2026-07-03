@@ -5,7 +5,8 @@ rename Pyxis.** EP-006 a câblé tout ce qui rend le spike exécutable et réver
 Le run réseau réel ci-dessous prouvait le cycle multi-tour et l'ancien originator
 du projet. Depuis le rename, `originator=pyxis` doit être retesté. AC3 a révélé
 une sous-estimation structurelle du `HeuristicCounter` (omission system prompt +
-tools), tracée pour EP-009/US-030.
+tools), désormais corrigée par l'estimation statique `system + tools` livrée dans
+EP-009/US-030.
 
 ## Ce que le code livre déjà
 
@@ -18,6 +19,9 @@ tools), tracée pour EP-009/US-030.
   whitelistée). Couvert par `originator_fallback_selection`.
 - **Point post-rename.** Le verdict live `originator` doit être refait pour Pyxis.
   Tant que ce n'est pas fait, garder le fallback `codex_cli_rs` comme plan de sortie.
+- **AC3 corrigé côté code.** `estimate_static_input(...)` compte le system prompt,
+  le contexte statique et les schémas d'outils ; `agent.rs` ajoute
+  `static_input_tokens` aux projections pré-tour et mid-turn.
 - **Wire durci autour du spike** (US-022/023/024) : connect timeout 20 s, idle timeout
   60 s, 429 terminaux non retryés, `Retry-After` honoré, dernier tour assistant persisté.
 
@@ -84,10 +88,11 @@ Décision marge compaction :
     (US-030 `force_compact`, agent.rs:462) reposent sur `estimate_input` → trop
     optimistes de 1300+ tokens sur les tours froids → compaction/arrêt déclenchés
     trop tard.
-  → Action (suivi EP-009/US-030, hors scope EP-006) : ajouter un offset fixe
-    `system_tokens + tools_tokens` (≈1300 ici) au baseline d'estimation, OU étendre
-    `estimate_input` pour intégrer `system` + `tools`. Tant que non fait : marge de
-    sécurité sur le seuil d'auto-compaction ≥ poids(system+tools) mesuré au démarrage.
+  Suite livrée (EP-009/US-030) :
+    `estimate_static_input(...)` compte le system prompt, le contexte statique et les
+    schémas d'outils. `agent.rs` ajoute `static_input_tokens` aux projections pré-tour
+    et mid-turn. Le ratio historique ci-dessus reste une preuve du bug initial, pas une
+    action ouverte.
 ```
 
 ## Reasoning replay (US-031, P2) — validation live requise

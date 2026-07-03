@@ -1,8 +1,8 @@
 # Registre des décisions d'architecture (ADR léger)
 
-Ce registre consigne les décisions structurantes de **Pyxis** (CLI agent IA multi-provider, écrite en Rust, liée à Paneflow). Commande : `pyxis`. Format par décision : **Contexte / Décision / Justification / Alternatives écartées / Conséquences & risques**. Statut du projet : phase d'étude/design, pré-implémentation, aucun code écrit. Ces ADR sont la source de vérité ; toute proposition contradictoire doit d'abord amender un ADR.
+Ce registre consigne les décisions structurantes de **Pyxis** (CLI agent IA multi-provider, écrite en Rust, liée à Paneflow). Commande : `pyxis`. Format par décision : **Contexte / Décision / Justification / Alternatives écartées / Conséquences & risques**. Statut du projet : implémentation MVP en cours, avec un provider livré (`OpenAiChatGpt`). Les ADR fixent les décisions ; l'état réellement livré est suivi par le code, les fichiers de statut JSON et [`docs/CURRENT_STATUS.md`](./CURRENT_STATUS.md).
 
-Documents détaillés (versions longues des mêmes décisions) : `docs/ARCHITECTURE.md` (boucle, cœur, crates, pipeline d'outils), `docs/PROVIDERS.md` (couche multi-provider, adapters, taxonomie d'erreurs), `docs/ROADMAP.md` (phases, spike de de-risquage). Les ADR pointent vers ces fichiers là où le détail vit.
+Documents détaillés (versions longues des mêmes décisions) : `docs/CURRENT_STATUS.md` (état livré courant), `docs/ARCHITECTURE.md` (boucle, cœur, crates, pipeline d'outils), `docs/PROVIDERS.md` (couche multi-provider, adapters, taxonomie d'erreurs), `docs/ROADMAP.md` (phases, spike de de-risquage). Les ADR pointent vers ces fichiers là où le détail vit.
 
 | ADR | Sujet | Statut |
 |---|---|---|
@@ -16,6 +16,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/ARCHITECT
 | ADR-8 | Nommage des crates : `pyxis*` publié, `agent-*` interne | Accepté |
 | ADR-9 | Taxonomie d'erreurs canonique : `ErrorClass` | Accepté |
 | ADR-10 | Auth abonnement ChatGPT = `ProviderKind::OpenAiChatGpt` (Responses API backend ChatGPT, SSE stateless, gated) | Accepté (2026-06-15) |
+| ADR-11 | Scope MVP recentré : abonnement ChatGPT d'abord, Ollama retiré, autres providers différés | Accepté (2026-06-15) |
 
 ---
 
@@ -121,9 +122,9 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/ARCHITECT
 
 **Divergences par provider (résumé ; détail dans `docs/PROVIDERS.md` §3).**
 - **Anthropic** : adapter quasi-identité. `cache_control` ephemeral TTL 1h, thinking adaptatif. Betas gated sur `kind == Anthropic`.
-- **OpenAI** : **deux surfaces**. *Chat Completions* (transcript client → mappe proprement, **cible MVP**). *Responses API* (état server-side via `previous_response_id` → **ne mappe pas** sur le canonique → mode **gated** sur `capabilities.server_side_state`, **jamais par défaut**).
+- **OpenAI** : **trois surfaces à ne pas confondre**. `OpenAiChatGpt` (backend ChatGPT/Codex, SSE stateless) est le provider MVP courant depuis ADR-11. *Chat Completions* (transcript client) reste un adapter BYOK futur. *Responses API publique* (état server-side via `previous_response_id`) ne mappe pas sur le canonique et reste un mode gated sur `capabilities.server_side_state`, jamais par défaut.
 - **Gemini** : function calls potentiellement **fragmentées** en stream → **réassembler côté adapter** avant `ToolCallEnd`. `systemInstruction`, context cache.
-- **Ollama** : OpenAI-compat, **usage souvent absent** en stream → fallback `agent-tokenizer` **obligatoire** (sinon compaction cassée — cf. ContextBudget, `docs/ARCHITECTURE.md`).
+- **Ollama** : contexte historique retiré du scope par ADR-11. Le risque d'`usage` absent reste utile comme justification provider-agnostique du fallback `agent-tokenizer`.
 - **OpenRouter** : méta-routeur OpenAI-compat (200+ modèles, perd les features natives).
 - **Bedrock / Vertex / Azure** : **pas des adapters complets** — auth injectable (SigV4 / OAuth Google / endpoint custom), réutilisent l'adapter Anthropic/OpenAI/Gemini sous-jacent. Toutes les creds via `agent-auth`.
 
@@ -196,7 +197,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/ARCHITECT
 
 | # | Risque | Nature | Mitigation décidée | Point de décision |
 |---|---|---|---|---|
-| **R1** | **Blocage Anthropic des outils tiers** s'authentifiant via abonnement Pro/Max (déployé jan 2026, durci avr 2026). Un agent tiers ne peut plus utiliser un abonnement Max. | Produit — **risque N°1** | **Provider MVP non-bloqué** (Ollama local + OpenAI au token), positionnement **model-agnostic**. Anthropic conditionnel. Message « This credential is only authorized for use with Claude Code... » → classifié `Auth(ThirdPartyBlocked)` (cf. ADR-4, ADR-9). | **Spike auth Anthropic = go/no-go de Phase 0** (1 jour, dans `agent-auth`). Cf. `docs/ROADMAP.md` Phase 0 et `docs/PROVIDERS.md` §6. |
+| **R1** | **Blocage Anthropic des outils tiers** s'authentifiant via abonnement Pro/Max (déployé jan 2026, durci avr 2026). Un agent tiers ne peut plus utiliser un abonnement Max. | Produit : **risque N°1** | Mitigation durable : architecture **model-agnostic** et adapters BYOK isolés. Scope actuel après ADR-11 : `OpenAiChatGpt` livré d'abord, autres providers différés ; l'ancien chemin Ollama + OpenAI token reste un verdict historique, pas le scope livré. Message « This credential is only authorized for use with Claude Code... » → classifié `Auth(ThirdPartyBlocked)` (cf. ADR-4, ADR-9). | **Spike auth Anthropic = go/no-go de Phase 0** (1 jour, dans `agent-auth`). Cf. `docs/ROADMAP.md` Phase 0 et `docs/PROVIDERS.md` §6. |
 | **R2** | **Vélocité de développement Rust en solo** plus lente que TS/Bun. | Exécution — **risque N°1 d'exécution** | Coût **assumé** (cf. ADR-1). Périmètre MVP serré, dur en premier, crates découplées et testables sans I/O. | Suivi continu sur la roadmap. |
 | **R3** | **Sandbox cross-platform** : Landlock filtre le FS au niveau kernel mais **ne filtre pas par hostname** ; pas d'équivalent Linux/macOS uniforme. | Sécurité / portabilité | Landlock **FS** (vrai, kernel-level) + **réseau filtré best-effort via proxy local** (PAS Landlock). macOS Seatbelt en durcissement. | Phase 0 : Landlock FS + 1 appel réseau filtré par proxy. macOS Seatbelt en Phase 3 (`docs/ROADMAP.md`). |
 | **R4** | **Pas de SDK Anthropic Rust officiel** — wire format à maintenir à la main, dérive possible. | Maintenance | Couche maison (cf. ADR-4), SDK communautaires (`anthropic-sdk-rs`) comme **référence de wire format**. **Tests VCR** sur payloads providers en **CI obligatoire** = filet sans SDK officiel. | VCR en CI dès Phase 3 (durcissement). |
@@ -205,7 +206,7 @@ Documents détaillés (versions longues des mêmes décisions) : `docs/ARCHITECT
 **Justification.** Concentrer ces risques en un seul ADR force la roadmap à attaquer le risqué d'abord (Phase 0 de de-risquage) et donne un point go/no-go explicite (R1) avant d'investir dans l'implémentation complète.
 
 **Conséquences & risques (méta).**
-- **R1 est bloquant** : si le spike auth échoue, le positionnement model-agnostic (Ollama + OpenAI) reste valide mais Anthropic devient indisponible via abonnement — d'où l'importance que le **MVP ne dépende pas d'Anthropic**.
+- **R1 reste structurant** : après ADR-11, le MVP dépend volontairement du canal ChatGPT subscription pour accélérer le dogfood, mais le positionnement model-agnostic reste l'assurance. Si un canal subscription tombe, le plan de sortie est un adapter BYOK isolé, pas une refonte du cœur.
 - Ce registre est **vivant** : tout nouveau risque structurant (ex. évolution de la politique d'un provider, breaking change wire format) s'ajoute ici, pas dans un document ad hoc.
 - Les mitigations R3/R4 ont un coût de CI/infra (proxy réseau, harness VCR) à provisionner en Phase 3.
 
@@ -231,7 +232,7 @@ Les noms réservés n'étaient jamais utilisés par les crates effectivement dé
 Autrement dit : **la surface publiée porte le nom `pyxis` ; les crates internes gardent le préfixe `agent-*`.** La divergence est intentionnelle et documentée ici.
 
 **Justification.**
-- Conserver `agent-*` en interne évite un renommage massif de tout le workspace (ADR-1, ARCHITECTURE, ROADMAP) à un stade pré-implémentation où la valeur d'un tel churn est nulle.
+- Conserver `agent-*` en interne évite un renommage massif de tout le workspace (ADR-1, ARCHITECTURE, ROADMAP) pour un gain cosmétique faible.
 - Réserver `pyxis`, `pyxis-cli`, `pyxis-core` protégera l'identité produit sur crates.io si les noms sont disponibles.
 - Le binaire et la façade publiée portant `pyxis` : l'utilisateur et l'écosystème ne voient que `pyxis`. Le préfixe `agent-*` n'est visible que dans le repo.
 
