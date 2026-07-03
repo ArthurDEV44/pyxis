@@ -297,13 +297,28 @@ fn record_attempt_usage(
     }
 }
 
+fn rebuild_budget_after_model_switch(
+    model: &str,
+    config: &RunConfig,
+    messages: &[Message],
+    static_input_tokens: u32,
+    deps: &Deps,
+) -> Result<ContextBudget, String> {
+    let mut budget = ContextBudget::try_for_model(
+        deps.provider.max_context_for_model(model),
+        config.max_output_tokens,
+    )?;
+    budget.observe_estimated(estimate_current_input(messages, static_input_tokens, deps));
+    Ok(budget)
+}
+
 /// Lance l'agent. Renvoie un `Stream<AgentEvent>` à consommer (TUI, `-p`, Paneflow).
 pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent> + Send {
     async_stream::stream! {
         let AgentContext { mut model, system, mut messages, tools, config, context_messages } = ctx;
 
-        // ContextBudget calculé UNE FOIS pour ce modèle (invariant 5).
-        let max_context = deps.provider.capabilities().max_context;
+        // ContextBudget calculé pour le modèle actif (recalculé si fallback overload).
+        let max_context = deps.provider.max_context_for_model(&model);
         let mut budget = match ContextBudget::try_for_model(max_context, config.max_output_tokens) {
             Ok(budget) => budget,
             Err(e) => {
@@ -384,6 +399,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     if budget.should_microcompact() {
                         let pruned = microcompact(&mut messages, config.micro_keep_recent);
                         if pruned > 0 {
+                            compaction.record_success();
                             budget.observe_estimated(estimate_current_input(&messages, static_input_tokens, &deps));
                             yield AgentEvent::Compacted(CompactKind::Micro);
                         }
@@ -434,6 +450,19 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     &mut overload_fallback_used,
                                     class,
                                 ) {
+                                    match rebuild_budget_after_model_switch(
+                                        &model,
+                                        &config,
+                                        &messages,
+                                        static_input_tokens,
+                                        &deps,
+                                    ) {
+                                        Ok(next_budget) => budget = next_budget,
+                                        Err(e) => {
+                                            yield AgentEvent::Error(AgentError::InvalidRequest(e));
+                                            return;
+                                        }
+                                    }
                                     transient_retries = 0;
                                     continue;
                                 }
@@ -560,6 +589,19 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                                     if acc.has_visible_output() {
                                         yield AgentEvent::StreamReset;
                                     }
+                                    match rebuild_budget_after_model_switch(
+                                        &model,
+                                        &config,
+                                        &messages,
+                                        static_input_tokens,
+                                        &deps,
+                                    ) {
+                                        Ok(next_budget) => budget = next_budget,
+                                        Err(e) => {
+                                            yield AgentEvent::Error(AgentError::InvalidRequest(e));
+                                            return;
+                                        }
+                                    }
                                     transient_retries = 0;
                                     continue;
                                 }
@@ -643,6 +685,9 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                         messages.push(acc.to_assistant_message());
                     } else if acc.has_visible_output() {
                         yield AgentEvent::StreamReset;
+                    }
+                    if commits_assistant {
+                        compaction.record_success();
                     }
 
                     transition
@@ -780,7 +825,14 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     }
                 }
                 Transition::Compact(kind) => {
-                    match full_compact(&mut messages, &model, deps.provider.as_ref()).await {
+                    match full_compact(
+                        &mut messages,
+                        &model,
+                        deps.provider.as_ref(),
+                        config.max_output_tokens,
+                    )
+                    .await
+                    {
                         Ok(usage) => {
                             usage_budget.record_usage(usage);
                             compaction.record_success();
@@ -805,19 +857,28 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             }
                             // anti error-loop : microcompact structurel pour baisser
                             // la pression avant de reboucler.
-                            let _ = microcompact(&mut messages, config.micro_keep_recent);
+                            let pruned = microcompact(&mut messages, config.micro_keep_recent);
+                            if pruned > 0 {
+                                compaction.record_success();
+                                yield AgentEvent::Compacted(CompactKind::Micro);
+                            }
                             budget.observe_estimated(estimate_current_input(&messages, static_input_tokens, &deps));
                         }
                     }
                 }
                 Transition::Recover(_) => {
                     // withholding : compaction REACTIVE ; échec confirmé → propagation.
-                    match full_compact(&mut messages, &model, deps.provider.as_ref()).await {
+                    match full_compact(
+                        &mut messages,
+                        &model,
+                        deps.provider.as_ref(),
+                        config.max_output_tokens,
+                    )
+                    .await
+                    {
                         Ok(usage) => {
                             usage_budget.record_usage(usage);
-                            // PAS de record_success() ici : le succès d'une compaction
-                            // réactive ne doit pas réinitialiser le compteur d'échecs
-                            // PROACTIFS du circuit breaker (#4/#7).
+                            compaction.record_success();
                             if let Err(e) =
                                 deps.session.checkpoint(CompactKind::Reactive, &messages).await
                             {

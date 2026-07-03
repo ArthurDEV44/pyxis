@@ -28,8 +28,8 @@ const PRUNED_PLACEHOLDER: &str = "[résultat d'outil élagué pour économiser l
 /// gardé verbatim, pour ne pas dégrader le résumé en le re-résumant.
 pub const SUMMARY_PREFIX: &str = "[Résumé de la conversation précédente]\n";
 
-/// Budget de sortie du summarizer (US-030 : porté de 1024 à 4096 — un résumé
-/// dense d'une longue session ne tient pas en 1024 tokens).
+/// Plafond de sortie du summarizer (US-030 : porté de 1024 à 4096, puis borné
+/// par la géométrie active du modèle au moment de l'appel).
 const SUMMARY_MAX_OUTPUT: u32 = 4096;
 
 /// Borne d'octets du résumé combiné (US-030) : empêche la croissance illimitée du
@@ -106,6 +106,7 @@ pub async fn full_compact(
     messages: &mut Vec<Message>,
     model: &str,
     provider: &dyn Provider,
+    max_output_tokens: u32,
 ) -> Result<TokenUsage, AgentError> {
     // On conserve le dernier message utilisateur (l'ask courant) hors résumé.
     // IMPORTANT : on ne mute PAS `messages` de façon destructive avant que le
@@ -158,7 +159,10 @@ pub async fn full_compact(
         system: Some(SUMMARY_SYSTEM.to_string()),
         messages: to_summarize,
         tools: Vec::new(),
-        max_output_tokens: SUMMARY_MAX_OUTPUT,
+        max_output_tokens: summary_output_limit(
+            provider.max_context_for_model(model),
+            max_output_tokens,
+        ),
     };
     // `?` ici laisse `messages` intact en cas d'échec (From<ProviderError>).
     let resp = provider.complete(req).await?;
@@ -209,6 +213,13 @@ pub async fn full_compact(
         messages.push(u);
     }
     Ok(usage)
+}
+
+fn summary_output_limit(max_context: u32, requested_max_output: u32) -> u32 {
+    SUMMARY_MAX_OUTPUT
+        .min(requested_max_output)
+        .min(max_context.saturating_sub(1))
+        .max(1)
 }
 
 /// Garde la QUEUE de `s` sur `max` octets (frontière de caractère), préfixée d'un
@@ -347,7 +358,7 @@ mod tests {
             ]),
         ];
         let before = messages.clone();
-        let res = full_compact(&mut messages, "m", &provider).await;
+        let res = full_compact(&mut messages, "m", &provider, 4096).await;
         assert!(res.is_err(), "résumé vide doit échouer");
         assert_eq!(
             messages, before,
@@ -361,7 +372,7 @@ mod tests {
         let provider = StubProvider::with_summary("résumé");
         let mut messages = vec![Message::user("seul message")];
         let before = messages.clone();
-        let res = full_compact(&mut messages, "m", &provider).await;
+        let res = full_compact(&mut messages, "m", &provider, 4096).await;
         assert!(res.is_err());
         assert_eq!(messages, before);
     }
@@ -375,7 +386,9 @@ mod tests {
             Message::assistant_text("a1"),
             Message::user("q2 courant"),
         ];
-        full_compact(&mut messages, "m", &provider).await.unwrap();
+        full_compact(&mut messages, "m", &provider, 4096)
+            .await
+            .unwrap();
         assert_eq!(messages.len(), 2, "[résumé] + dernier message user");
         assert!(messages[0].text().contains("RÉSUMÉ"));
         assert_eq!(messages[1].text(), "q2 courant");
@@ -396,7 +409,9 @@ mod tests {
             Message::assistant_text("travail récent"),
             Message::user("question courante"),
         ];
-        full_compact(&mut messages, "m", &provider).await.unwrap();
+        full_compact(&mut messages, "m", &provider, 4096)
+            .await
+            .unwrap();
 
         // le summarizer n'a PAS reçu l'ancien résumé.
         let seen = provider.last_req.lock().unwrap().clone().unwrap();
@@ -433,7 +448,9 @@ mod tests {
             Message::assistant_text("travail"),
             Message::user("courant"),
         ];
-        full_compact(&mut messages, "m", &provider).await.unwrap();
+        full_compact(&mut messages, "m", &provider, 4096)
+            .await
+            .unwrap();
         let txt = messages[0].text();
         assert!(txt.contains("UN") && txt.contains("DEUX") && txt.contains("TROIS"));
     }
@@ -462,7 +479,9 @@ mod tests {
             ]),
             Message::user("courant"),
         ];
-        full_compact(&mut messages, "m", &provider).await.unwrap();
+        full_compact(&mut messages, "m", &provider, 4096)
+            .await
+            .unwrap();
         let seen = provider.last_req.lock().unwrap().clone().unwrap();
         assert_eq!(seen.max_output_tokens, 4096, "summarizer max porté à 4096");
         // US-030/US-031 : Image, Thinking ET reasoning chiffré strippés avant le summarizer
@@ -493,6 +512,14 @@ mod tests {
         assert!(out.len() < long.len());
         assert!(out.contains("élidé"));
         assert!(out.ends_with("FIN_RÉCENTE"), "la queue récente est gardée");
+    }
+
+    #[test]
+    fn summary_output_limit_respects_request_and_context_geometry() {
+        assert_eq!(summary_output_limit(100_000, 8_000), 4096);
+        assert_eq!(summary_output_limit(100_000, 200), 200);
+        assert_eq!(summary_output_limit(1000, 4096), 999);
+        assert_eq!(summary_output_limit(0, 4096), 1);
     }
 
     #[test]

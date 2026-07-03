@@ -8,6 +8,8 @@ use crate::compaction::CompactKind;
 use crate::message::Message;
 
 /// Entrée de log discriminée (ARCHITECTURE §7). Sérialisée une par ligne JSONL.
+/// `CompactBoundary` reste lisible pour les anciens logs ; les nouveaux
+/// checkpoints de compaction passent par `CompactCheckpoint`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "entry", rename_all = "snake_case")]
 pub enum SessionEntry {
@@ -18,6 +20,11 @@ pub enum SessionEntry {
     CompactBoundary {
         kind: CompactKind,
     },
+    CompactCheckpoint {
+        kind: CompactKind,
+        messages: Vec<Message>,
+    },
+    EncryptedReasoningRedacted,
     FileHistorySnapshot(FileSnapshot),
     #[serde(other)]
     Unknown,
@@ -44,14 +51,16 @@ pub trait Session: Send + Sync {
     /// dernier `sync` (l'implémentation tient un curseur).
     async fn sync(&self, messages: &[Message]) -> Result<(), SessionError>;
 
-    /// Checkpoint de compaction **full** (auto/reactive) : écrit la frontière
-    /// `CompactBoundary` ET le transcript post-compaction de façon **atomique**
-    /// (même opération), puis resynchronise le curseur sur `messages.len()`.
-    /// Évite une frontière orpheline (un crash entre la frontière et le résumé
-    /// rendrait un transcript vide au resume). La microcompaction, elle, est
-    /// purement en mémoire et n'appelle PAS ceci.
+    /// Checkpoint de compaction **full** (auto/reactive) : écrit le transcript
+    /// post-compaction comme une entrée replayable unique, puis resynchronise le
+    /// curseur sur `messages.len()`. La microcompaction, elle, est purement en
+    /// mémoire et n'appelle PAS ceci.
     async fn checkpoint(&self, kind: CompactKind, messages: &[Message])
     -> Result<(), SessionError>;
+
+    /// Enregistre une redaction durable des blocs de reasoning chiffrés déjà
+    /// persistés. Le replay applique cette redaction aux messages reconstruits.
+    async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError>;
 
     /// Écrit un snapshot de fichier (entrée discriminée `FileHistorySnapshot`).
     async fn record_file_snapshot(&self, snapshot: FileSnapshot) -> Result<(), SessionError>;

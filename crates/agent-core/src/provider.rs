@@ -275,6 +275,13 @@ pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
     fn capabilities(&self) -> &Capabilities;
 
+    /// Fenêtre de contexte à utiliser pour un slug précis. Les providers sans
+    /// table par modèle peuvent conserver la valeur globale des capabilities.
+    fn max_context_for_model(&self, model: &str) -> u32 {
+        let _ = model;
+        self.capabilities().max_context
+    }
+
     /// Chemin chaud : flux d'événements canoniques.
     async fn stream(
         &self,

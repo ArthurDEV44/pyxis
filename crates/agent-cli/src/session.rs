@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agent_core::compaction::CompactKind;
-use agent_core::message::Message;
+use agent_core::message::{ContentBlock, Message};
 use agent_core::session::{FileSnapshot, Session, SessionError};
 use agent_session::JsonlSession;
 use async_trait::async_trait;
@@ -39,6 +39,16 @@ impl SharedSession {
         }
     }
 
+    fn redact_snapshot(&self) {
+        if let Ok(mut s) = self.snapshot.lock() {
+            for message in &mut *s {
+                message
+                    .content
+                    .retain(|block| !matches!(block, ContentBlock::EncryptedReasoning { .. }));
+            }
+        }
+    }
+
     /// Bascule le fichier de persistance vers une session reprise (`/resume`).
     /// `cursor` = nombre de messages déjà présents dans la session (les prochains
     /// `sync` n'écriront que la suite). Le snapshot mémoire est mis à jour à part
@@ -62,6 +72,12 @@ impl Session for SharedSession {
     ) -> Result<(), SessionError> {
         self.capture(messages);
         self.inner.checkpoint(kind, messages).await
+    }
+
+    async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError> {
+        self.inner.redact_encrypted_reasoning().await?;
+        self.redact_snapshot();
+        Ok(())
     }
 
     async fn record_file_snapshot(&self, snapshot: FileSnapshot) -> Result<(), SessionError> {

@@ -11,10 +11,10 @@
 //!   au niveau octet, mais « toute ligne incomplète en queue est ignorée ».
 //! - **resume** : on rejoue le log ; une dernière ligne tronquée par un crash en
 //!   plein écrit est ignorée (AC3), la session reprend au dernier état valide.
-//! - une `CompactBoundary` réinitialise le transcript reconstruit (les messages
-//!   d'avant ont été compactés). Le `clear` est **différé** jusqu'au premier
-//!   `Message` suivant : une frontière orpheline (crash entre frontière et
-//!   résumé) n'efface alors PAS le transcript antérieur.
+//! - un `CompactCheckpoint` récent réinitialise le transcript en une entrée
+//!   replayable unique. Les anciens logs `CompactBoundary` restent supportés :
+//!   leur `clear` est différé jusqu'au premier `Message` suivant, donc une
+//!   frontière orpheline n'efface pas le transcript antérieur.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::fs::{File, OpenOptions};
@@ -24,7 +24,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use agent_core::CompactKind;
-use agent_core::message::{Message, Role};
+use agent_core::compaction::is_summary_message;
+use agent_core::message::{ContentBlock, Message, Role};
 use agent_core::session::{FileSnapshot, Session, SessionEntry, SessionError};
 
 /// Nom du fichier de session dans un dossier de travail.
@@ -36,6 +37,35 @@ fn io_err(e: impl std::fmt::Display) -> SessionError {
 }
 fn serde_err(e: impl std::fmt::Display) -> SessionError {
     SessionError::Serde(e.to_string())
+}
+
+fn invalid_session(e: impl std::fmt::Display) -> SessionError {
+    SessionError::Serde(e.to_string())
+}
+
+fn validate_checkpoint(messages: &[Message]) -> Result<(), SessionError> {
+    if messages.is_empty() {
+        return Err(invalid_session("checkpoint de compaction vide"));
+    }
+    if !is_summary_message(&messages[0]) {
+        return Err(invalid_session(
+            "checkpoint de compaction sans résumé en premier message",
+        ));
+    }
+    for (i, message) in messages.iter().enumerate() {
+        message
+            .validate()
+            .map_err(|e| invalid_session(format!("checkpoint message {i} invalide: {e}")))?;
+    }
+    Ok(())
+}
+
+fn redact_encrypted_reasoning(messages: &mut [Message]) {
+    for message in messages {
+        message
+            .content
+            .retain(|block| !matches!(block, ContentBlock::EncryptedReasoning { .. }));
+    }
 }
 
 /// Session JSONL append-only. Tient un curseur du nombre de messages déjà écrits
@@ -166,24 +196,20 @@ impl Session for JsonlSession {
         kind: CompactKind,
         messages: &[Message],
     ) -> Result<(), SessionError> {
-        // Frontière + transcript post-compaction écrits en UN SEUL write_locked :
-        // pas de fenêtre où une frontière existe sans son résumé (#9).
-        let mut buf = format!(
-            "{}\n",
-            serde_json::to_string(&SessionEntry::CompactBoundary { kind }).map_err(serde_err)?
-        );
-        for m in messages {
-            buf.push_str(
-                &serde_json::to_string(&SessionEntry::Message(m.clone())).map_err(serde_err)?,
-            );
-            buf.push('\n');
-        }
-        self.write_locked(&buf)?;
+        validate_checkpoint(messages)?;
+        self.append(&SessionEntry::CompactCheckpoint {
+            kind,
+            messages: messages.to_vec(),
+        })?;
         *self
             .cursor
             .lock()
             .map_err(|_| SessionError::Io("verrou curseur empoisonné".into()))? = messages.len();
         Ok(())
+    }
+
+    async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError> {
+        self.append(&SessionEntry::EncryptedReasoningRedacted)
     }
 
     async fn record_file_snapshot(&self, snapshot: FileSnapshot) -> Result<(), SessionError> {
@@ -239,6 +265,15 @@ pub fn resume_file(path: &Path) -> Result<ResumedSession, SessionError> {
             Ok(SessionEntry::CompactBoundary { .. }) => {
                 pending_clear = true;
                 out.compactions += 1;
+            }
+            Ok(SessionEntry::CompactCheckpoint { messages, .. }) => {
+                validate_checkpoint(&messages)?;
+                out.messages = messages;
+                pending_clear = false;
+                out.compactions += 1;
+            }
+            Ok(SessionEntry::EncryptedReasoningRedacted) => {
+                redact_encrypted_reasoning(&mut out.messages);
             }
             Ok(SessionEntry::FileHistorySnapshot(_)) => {}
             Ok(SessionEntry::Meta { .. } | SessionEntry::Unknown) => {}
@@ -377,6 +412,13 @@ mod tests {
         dir
     }
 
+    fn summary(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::Summary { text: text.into() }],
+        }
+    }
+
     #[tokio::test]
     async fn write_then_resume_roundtrip() {
         let dir = tmp("roundtrip");
@@ -403,8 +445,7 @@ mod tests {
         s.sync(&[Message::user("vieux 1"), Message::assistant_text("vieux 2")])
             .await
             .unwrap();
-        // checkpoint atomique : frontière + transcript post-compaction ([résumé]).
-        s.checkpoint(CompactKind::Auto, &[Message::user("[résumé]")])
+        s.checkpoint(CompactKind::Auto, &[summary("[résumé]")])
             .await
             .unwrap();
 
@@ -416,6 +457,54 @@ mod tests {
             "les vieux messages sont compactés"
         );
         assert_eq!(resumed.messages[0].text(), "[résumé]");
+        let raw = std::fs::read_to_string(dir.join(SESSION_FILE)).unwrap();
+        assert!(
+            raw.contains("\"entry\":\"compact_checkpoint\""),
+            "nouveaux checkpoints en entrée unique"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_missing_summary() {
+        let dir = tmp("bad-checkpoint");
+        let s = JsonlSession::create_in(&dir).unwrap();
+        s.sync(&[Message::user("avant")]).await.unwrap();
+        let err = s
+            .checkpoint(
+                CompactKind::Auto,
+                &[Message::assistant_text("pas un résumé")],
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Serde(_)));
+
+        let resumed = resume_dir(&dir).unwrap();
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(resumed.messages[0].text(), "avant");
+        assert_eq!(resumed.compactions, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_compact_checkpoint_preserves_prior_transcript() {
+        let dir = tmp("truncated-checkpoint");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SESSION_FILE);
+        let old = serde_json::to_string(&SessionEntry::Message(Message::user("avant"))).unwrap();
+        let checkpoint = serde_json::to_string(&SessionEntry::CompactCheckpoint {
+            kind: CompactKind::Auto,
+            messages: vec![summary("resume"), Message::user("courant")],
+        })
+        .unwrap();
+        let cut = checkpoint.len() / 2;
+        std::fs::write(&path, format!("{old}\n{}", &checkpoint[..cut])).unwrap();
+
+        let resumed = resume_file(&path).unwrap();
+        assert!(resumed.skipped_partial);
+        assert_eq!(resumed.messages.len(), 1);
+        assert_eq!(resumed.messages[0].text(), "avant");
+        assert_eq!(resumed.compactions, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -602,6 +691,41 @@ mod tests {
         let resumed = resume_file(&path).unwrap();
         assert_eq!(resumed.messages.len(), 1);
         assert_eq!(resumed.messages[0].text(), "ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn encrypted_reasoning_redaction_replays() {
+        let dir = tmp("redact-reasoning");
+        let s = JsonlSession::create_in(&dir).unwrap();
+        let assistant = Message::assistant(vec![
+            ContentBlock::EncryptedReasoning {
+                id: "rs_1".into(),
+                encrypted_content: "ENC".into(),
+            },
+            ContentBlock::ToolUse {
+                id: "c1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+        ]);
+        s.sync(&[assistant]).await.unwrap();
+        s.redact_encrypted_reasoning().await.unwrap();
+
+        let resumed = resume_dir(&dir).unwrap();
+        assert_eq!(resumed.messages.len(), 1);
+        assert!(
+            resumed.messages[0]
+                .content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::EncryptedReasoning { .. }))
+        );
+        assert!(
+            resumed.messages[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

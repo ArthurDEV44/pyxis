@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::message::{ContentBlock, Message};
 use agent_core::provider::ToolSpec;
-use agent_core::{AgentContext, AgentEvent, Deps, RunConfig, run_agent};
+use agent_core::{AgentContext, AgentEvent, Deps, RunConfig, Session, run_agent};
 use agent_provider::KEYRING_ACCOUNT;
 use agent_tui::{
     AppState, Block, COMMANDS, InputAction, McpServerMeta, McpStatus, SessionMeta,
@@ -232,6 +232,18 @@ fn scrub_encrypted_reasoning(messages: &mut [Message]) -> usize {
     removed
 }
 
+fn count_encrypted_reasoning(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|msg| {
+            msg.content
+                .iter()
+                .filter(|b| matches!(b, ContentBlock::EncryptedReasoning { .. }))
+                .count()
+        })
+        .sum()
+}
+
 /// Lance la session interactive. Restaure le terminal en sortie quoi qu'il arrive.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -387,12 +399,25 @@ async fn event_loop(
                                         "Usage : /models <slug> (ex: /models gpt-5.5)".into(),
                                     ));
                                 } else {
-                                    cfg.model = arg.to_string();
-                                    state.model = arg.to_string();
                                     let removed = conversation
                                         .lock()
-                                        .map(|mut msgs| scrub_encrypted_reasoning(&mut msgs[..]))
+                                        .map(|msgs| count_encrypted_reasoning(&msgs[..]))
                                         .unwrap_or_default();
+                                    if removed > 0
+                                        && let Err(e) = session.redact_encrypted_reasoning().await
+                                    {
+                                        state.blocks.push(Block::Error(format!(
+                                            "models: redaction reasoning: {e}"
+                                        )));
+                                        continue;
+                                    }
+                                    if removed > 0 {
+                                        let _ = conversation
+                                            .lock()
+                                            .map(|mut msgs| scrub_encrypted_reasoning(&mut msgs[..]));
+                                    }
+                                    cfg.model = arg.to_string();
+                                    state.model = arg.to_string();
                                     let suffix = if removed > 0 {
                                         format!(" ({removed} reasoning items retirés)")
                                     } else {
@@ -871,8 +896,8 @@ fn new_session_path(dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        GOAL_DONE_MARKER, compose_system, scrub_encrypted_reasoning, session_path_from_arg,
-        take_goal_done,
+        GOAL_DONE_MARKER, compose_system, count_encrypted_reasoning, scrub_encrypted_reasoning,
+        session_path_from_arg, take_goal_done,
     };
     use agent_core::message::{ContentBlock, Message};
     use agent_tui::{AppState, Block};
@@ -959,7 +984,9 @@ mod tests {
                 input: serde_json::json!({}),
             },
         ])];
+        assert_eq!(count_encrypted_reasoning(&messages), 1);
         assert_eq!(scrub_encrypted_reasoning(&mut messages), 1);
+        assert_eq!(count_encrypted_reasoning(&messages), 0);
         assert!(
             messages[0]
                 .content

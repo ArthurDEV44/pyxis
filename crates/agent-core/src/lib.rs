@@ -87,6 +87,13 @@ mod loop_tests {
         fn capabilities(&self) -> &Capabilities {
             &self.caps
         }
+        fn max_context_for_model(&self, model: &str) -> u32 {
+            if model == "small-context" {
+                1000
+            } else {
+                self.caps.max_context
+            }
+        }
         async fn stream(
             &self,
             req: CanonicalRequest,
@@ -179,6 +186,15 @@ mod loop_tests {
             s.clear();
             s.extend_from_slice(messages);
             *self.cursor.lock().unwrap() = messages.len();
+            Ok(())
+        }
+        async fn redact_encrypted_reasoning(&self) -> Result<(), SessionError> {
+            let mut s = self.synced.lock().unwrap();
+            for message in &mut *s {
+                message
+                    .content
+                    .retain(|block| !matches!(block, ContentBlock::EncryptedReasoning { .. }));
+            }
             Ok(())
         }
         async fn record_file_snapshot(
@@ -707,6 +723,41 @@ mod loop_tests {
         assert_eq!(
             *request_models.lock().unwrap(),
             vec!["primary".to_string(), "fallback".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn overload_fallback_rebuilds_context_budget_for_new_model() {
+        let h = harness(
+            vec![
+                MockTurn::Err(ProviderError::Http {
+                    status: 529,
+                    message: "overloaded".into(),
+                    retry_after_ms: None,
+                }),
+                text_turn("ok"),
+            ],
+            false,
+            100_000,
+        );
+        let request_models = Arc::clone(&h.request_models);
+        let ctx = AgentContext::new("primary")
+            .with_config(RunConfig {
+                max_output_tokens: 200,
+                overload_fallback_model: Some("small-context".into()),
+                ..RunConfig::default()
+            })
+            .push(Message::user("historique très long"))
+            .push(Message::assistant_text("ok"))
+            .push(Message::user("x".repeat(3000)));
+        let events = drive(ctx, h.deps).await;
+        assert!(
+            has_compacted(&events, CompactKind::Auto),
+            "la petite fenêtre fallback doit déclencher l'auto-compaction: {events:?}"
+        );
+        assert_eq!(
+            *request_models.lock().unwrap(),
+            vec!["primary".to_string(), "small-context".to_string()]
         );
     }
 
