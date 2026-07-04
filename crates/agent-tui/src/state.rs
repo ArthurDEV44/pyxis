@@ -323,6 +323,8 @@ pub struct AppState {
     pub workspace: String,
     /// Fraction de contexte consommée (0–100). `None` = inconnue → segment masqué.
     pub context_pct: Option<u8>,
+    /// Effort de raisonnement affiché avec le modèle dans le footer.
+    pub reasoning_effort: Option<String>,
     /// Index sélectionné dans le menu de commandes slash (0 = première ligne).
     pub completion_index: usize,
     /// Sessions reprenables (sous-menu `/resume`), remplies par agent-cli.
@@ -392,6 +394,7 @@ impl AppState {
             model: model.into(),
             workspace: String::new(),
             context_pct: None,
+            reasoning_effort: None,
             completion_index: 0,
             sessions: Vec::new(),
             skills: Vec::new(),

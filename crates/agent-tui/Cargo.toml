@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [features]
-default = []
+default = ["codex_tui_parity"]
 codex_tui_parity = []
 
 # Frontend terminal (US-019). CLIENT du cœur : consomme `agent_core::AgentEvent`,

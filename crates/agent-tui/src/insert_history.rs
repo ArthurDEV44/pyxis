@@ -8,7 +8,7 @@ use std::io;
 
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
 const MAX_PENDING_HISTORY_LINES: usize = 4096;
@@ -36,6 +36,7 @@ impl SanitizedHistoryLine {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingHistoryInsert {
     pub lines: Vec<SanitizedHistoryLine>,
+    render_lines: Vec<Line<'static>>,
     pub mode: InsertHistoryMode,
 }
 
@@ -45,8 +46,14 @@ impl PendingHistoryInsert {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let raw_lines = sanitize_lines(lines);
+        let render_lines = raw_lines
+            .iter()
+            .map(|line| Line::raw(line.as_str().to_string()))
+            .collect();
         Self {
-            lines: sanitize_lines(lines),
+            lines: raw_lines,
+            render_lines,
             mode,
         }
     }
@@ -67,15 +74,44 @@ impl PendingHistoryInsert {
         Self::new(lines, InsertHistoryMode::InlineScrollback)
     }
 
+    pub fn from_render_lines<I>(lines: I, mode: InsertHistoryMode) -> Self
+    where
+        I: IntoIterator<Item = Line<'static>>,
+    {
+        let mut raw_lines = Vec::new();
+        let mut render_lines = Vec::new();
+        for line in lines.into_iter().take(MAX_PENDING_HISTORY_LINES) {
+            let (raw, render) = sanitize_render_line(line);
+            raw_lines.push(raw);
+            render_lines.push(render);
+        }
+        Self {
+            lines: raw_lines,
+            render_lines,
+            mode,
+        }
+    }
+
+    pub fn legacy_lines<I>(lines: I) -> Self
+    where
+        I: IntoIterator<Item = Line<'static>>,
+    {
+        Self::from_render_lines(lines, InsertHistoryMode::Legacy)
+    }
+
+    pub fn inline_scrollback_lines<I>(lines: I) -> Self
+    where
+        I: IntoIterator<Item = Line<'static>>,
+    {
+        Self::from_render_lines(lines, InsertHistoryMode::InlineScrollback)
+    }
+
     pub fn height(&self) -> u16 {
         self.lines.len().min(u16::MAX as usize) as u16
     }
 
     fn ratatui_lines(&self) -> Vec<Line<'static>> {
-        self.lines
-            .iter()
-            .map(|line| Line::raw(line.as_str().to_string()))
-            .collect()
+        self.render_lines.clone()
     }
 }
 
@@ -184,6 +220,26 @@ fn strip_terminal_controls(line: &str) -> String {
         .collect()
 }
 
+fn sanitize_render_line(line: Line<'static>) -> (SanitizedHistoryLine, Line<'static>) {
+    let mut plain = String::new();
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    let style = line.style;
+    for span in line.spans {
+        if used >= MAX_PENDING_HISTORY_LINE_CHARS {
+            break;
+        }
+        let clean = strip_terminal_controls(span.content.as_ref());
+        let remaining = MAX_PENDING_HISTORY_LINE_CHARS.saturating_sub(used);
+        let content = truncate_chars(&clean, remaining);
+        used += content.chars().count();
+        plain.push_str(&content);
+        spans.push(Span::styled(content, span.style));
+    }
+    let render = Line::from(spans).style(style);
+    (SanitizedHistoryLine::new(plain), render)
+}
+
 fn is_terminal_control(ch: char) -> bool {
     matches!(ch, '\u{1b}' | '\u{9b}' | '\u{7f}') || (ch.is_control() && ch != '\t')
 }
@@ -252,5 +308,19 @@ mod tests {
 
         assert_eq!(insert.lines.len(), MAX_PENDING_HISTORY_LINES);
         assert!(insert.lines[0].as_str().ends_with('…'));
+    }
+
+    #[test]
+    fn styled_lines_survive_pending_insert_sanitization() {
+        use ratatui::style::{Color, Style};
+
+        let insert = PendingHistoryInsert::inline_scrollback_lines([Line::from(Span::styled(
+            "accent",
+            Style::default().fg(Color::Cyan),
+        ))]);
+        let lines = insert.ratatui_lines();
+
+        assert_eq!(insert.lines[0].as_str(), "accent");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
     }
 }

@@ -93,38 +93,97 @@ pub fn render_parity(
     };
     let menu = menu_open && menu_height > 0;
 
+    if state.is_welcome()
+        && surface.transcript_cells().is_empty()
+        && surface.active_cell().is_none()
+    {
+        let chunks = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(menu_height),
+            Constraint::Length(bottom_height),
+        ])
+        .split(area);
+        render_welcome(frame, chunks[0], state, &theme);
+        if menu {
+            render_command_menu(frame, chunks[1], state, &theme, &matches);
+        }
+        match &state.pending {
+            Some(prompt) => render_permission(frame, chunks[2], prompt, &theme),
+            None => render_input(frame, chunks[2], state, &theme),
+        }
+        return;
+    }
+
+    let separator_height = u16::from(state.scroll == 0);
+    let available_transcript_height = area
+        .height
+        .saturating_sub(menu_height)
+        .saturating_sub(bottom_height)
+        .saturating_sub(separator_height);
+    let transcript_height = if state.scroll > 0 {
+        available_transcript_height
+    } else {
+        let visible_height = surface
+            .display_lines(area.width)
+            .len()
+            .min(u16::MAX as usize) as u16;
+        visible_height.min(available_transcript_height)
+    };
+    let trailing_height = area
+        .height
+        .saturating_sub(transcript_height)
+        .saturating_sub(separator_height)
+        .saturating_sub(menu_height)
+        .saturating_sub(bottom_height);
     let chunks = Layout::vertical([
-        Constraint::Min(1),
+        Constraint::Length(trailing_height),
+        Constraint::Length(transcript_height),
+        Constraint::Length(separator_height),
         Constraint::Length(menu_height),
         Constraint::Length(bottom_height),
     ])
     .split(area);
 
-    if state.is_welcome()
-        && surface.transcript_cells().is_empty()
-        && surface.active_cell().is_none()
-    {
-        render_welcome(frame, chunks[0], state, &theme);
-    } else {
-        render_active_surface(frame, chunks[0], surface);
-    }
+    render_parity_transcript(frame, chunks[1], state, surface, &theme);
     if menu {
-        render_command_menu(frame, chunks[1], state, &theme, &matches);
+        render_command_menu(frame, chunks[3], state, &theme, &matches);
     }
     match &state.pending {
-        Some(prompt) => render_permission(frame, chunks[2], prompt, &theme),
-        None => render_input(frame, chunks[2], state, &theme),
+        Some(prompt) => render_permission(frame, chunks[4], prompt, &theme),
+        None => render_input(frame, chunks[4], state, &theme),
     }
 }
 
 #[cfg(feature = "codex_tui_parity")]
-fn render_active_surface(
+fn render_parity_transcript(
     frame: &mut Frame,
     area: Rect,
+    state: &AppState,
     surface: &crate::history_cell::ChatSurface,
+    theme: &Theme,
 ) {
-    let lines = surface.active_display_lines(area.width);
+    let all_lines = surface.display_lines(area.width);
+    let max_off = all_lines.len().saturating_sub(area.height as usize);
+    state.scroll_max.set(max_off);
+
+    let lines = if area.height == 0 {
+        Vec::new()
+    } else if state.scroll == 0 {
+        all_lines
+            .into_iter()
+            .skip(max_off)
+            .take(area.height as usize)
+            .collect()
+    } else {
+        let offset = max_off.saturating_sub(state.scroll.min(max_off));
+        all_lines
+            .into_iter()
+            .skip(offset)
+            .take(area.height as usize)
+            .collect()
+    };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    render_scroll_pill(frame, area, state, theme);
 }
 
 /// Logo de Pyxis : une **sphère de Dyson** minimaliste. La boussole donne le cap
@@ -234,19 +293,18 @@ fn logo_lines(theme: &Theme) -> Vec<Line<'static>> {
     lines
 }
 
-/// Rect centré dans `area`, clampé à ses bornes (jamais plus grand qu'`area`).
-fn centered_rect(area: Rect, w: u16, h: u16) -> Rect {
+fn top_centered_rect(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
     let h = h.min(area.height);
     Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
+        y: area.y + u16::from(area.height > h),
         width: w,
         height: h,
     }
 }
 
-/// Écran d'accueil (hero façon Grok) : une carte centrée, logo braille (sphère
+/// Écran d'accueil (hero façon Grok) : une carte en haut, logo braille (sphère
 /// de Dyson, monochrome) à gauche, identité + raccourcis à droite. Affiché tant
 /// qu'aucune conversation n'a démarré (`AppState::is_welcome`) ; l'input reste
 /// rendu dessous, inchangé. Repli compact (sans logo ni bordure) si le terminal
@@ -276,7 +334,7 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     ];
     if !state.workspace.is_empty() {
         meta.push(Span::styled("  ·  ", theme.faint()));
-        meta.push(Span::styled(format!("{}/", state.workspace), theme.dim()));
+        meta.push(Span::styled(state.workspace.clone(), theme.dim()));
     }
     info.push(Line::from(meta));
     if state.provider_connected {
@@ -317,7 +375,7 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         return;
     }
 
-    let rect = centered_rect(area, card_w, card_h);
+    let rect = top_centered_rect(area, card_w, card_h);
     let frame_block = Boundary::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -353,12 +411,12 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     frame.render_widget(Paragraph::new(rows), body);
 }
 
-/// Repli de l'accueil pour terminal étroit : le bloc d'identité seul, centré,
+/// Repli de l'accueil pour terminal étroit : le bloc d'identité seul en haut,
 /// sans logo ni bordure (évite de tronquer la carte).
 fn render_welcome_compact(frame: &mut Frame, area: Rect, info: &[Line<'static>]) {
     let w = info.iter().map(|l| l.width()).max().unwrap_or(1).max(1) as u16;
     let h = (info.len() as u16).max(1);
-    let rect = centered_rect(area, w, h);
+    let rect = top_centered_rect(area, w, h);
     frame.render_widget(Paragraph::new(info.to_vec()), rect);
 }
 
@@ -1126,24 +1184,19 @@ fn strip_md(line: &str) -> String {
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let rows = Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).split(area);
 
-    // Box de saisie : filets haut/bas SEULEMENT — pas de bordure latérale. Un `│`
-    // à gauche/droite polluerait la sélection lors d'un copier-coller depuis le
-    // terminal (comme Claude Code). Le filet est discret au repos et s'allume
-    // (accent) tant que l'agent réfléchit — même grammaire que la gouttière `▌`.
-    // Aucun padding : le `›` est collé au bord gauche, aligné avec les filets.
-    let border = match state.status {
-        Status::Thinking => theme.accent(),
-        Status::Idle => theme.dim(),
-    };
-    let boundary = Boundary::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(border);
-    let inner = boundary.inner(rows[0]);
-    frame.render_widget(boundary, rows[0]);
+    let fill = (0..rows[0].height)
+        .map(|_| Line::from(Span::raw(" ".repeat(rows[0].width as usize))))
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(fill).style(theme.composer()), rows[0]);
 
-    // Saisie : prompt accent + texte (skills surlignés). Le curseur est le VRAI
-    // curseur terminal, positionné plus bas — pas de glyphe dans le buffer.
-    let mut spans = vec![Span::styled("› ", theme.accent())];
+    let inner = Rect {
+        x: rows[0].x,
+        y: rows[0].y + rows[0].height / 2,
+        width: rows[0].width,
+        height: 1,
+    };
+
+    let mut spans = vec![Span::styled("› ", theme.fg().add_modifier(Modifier::BOLD))];
     spans.extend(input_spans(
         &state.input,
         &state.skills,
@@ -1152,11 +1205,10 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 
-    // Curseur réel : offset byte logique → colonne terminale Unicode.
     let cursor_prefix = state.input.get(..state.cursor).unwrap_or(&state.input);
     let col = inner
         .x
-        .saturating_add(2) // largeur du prompt `› `
+        .saturating_add(2)
         .saturating_add(measure::width(cursor_prefix) as u16)
         .min(inner.right().saturating_sub(1));
     frame.set_cursor_position((col, inner.y));
@@ -1199,32 +1251,30 @@ fn input_spans(
     spans
 }
 
-/// Status line sous la box : `workspace · modèle · contexte` à gauche, état à
-/// droite. Séparateur = point médian faint ; seul l'état peut prendre l'accent
-/// (pendant la réflexion).
 fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let mut left: Vec<Span> = Vec::new();
+    left.push(Span::styled(
+        state.model.clone(),
+        theme.fg().add_modifier(Modifier::BOLD),
+    ));
+    if let Some(effort) = &state.reasoning_effort
+        && !effort.trim().is_empty()
+    {
+        left.push(Span::styled(format!(" {}", effort.trim()), theme.dim()));
+    }
     if !state.workspace.is_empty() {
-        left.push(Span::styled(state.workspace.clone(), theme.dim()));
         left.push(Span::styled(" · ", theme.faint()));
+        left.push(Span::styled(state.workspace.clone(), theme.success()));
     }
-    // Badge fournisseur : `✓ codex` en accent quand connecté (cf. `/providers`).
-    if state.provider_connected {
-        left.push(Span::styled("✓ codex", theme.accent()));
-        left.push(Span::styled(" · ", theme.faint()));
-    }
-    left.push(Span::styled(state.model.clone(), theme.dim()));
     if let Some(pct) = state.context_pct {
         left.push(Span::styled(" · ", theme.faint()));
         left.push(Span::styled(context_gauge(pct), theme.faint()));
         left.push(Span::styled(format!(" {pct}% contexte"), theme.dim()));
     }
 
-    // À droite : pendant un tour, spinner animé + verbe + durée + tokens (US-044/045) ;
-    // au repos, l'état « prêt ». En spans pour une largeur dynamique.
     let mut right: Vec<Span> = match state.status {
         Status::Thinking => progress_spans(state, theme, area.width as usize),
-        Status::Idle => vec![Span::styled("○ prêt", theme.faint())],
+        Status::Idle => Vec::new(),
     };
     // Clampé à `area.width - 1` : sur terminal étroit, le segment droit est tronqué
     // plutôt que d'évincer la colonne gauche (workspace/modèle).
@@ -1364,6 +1414,18 @@ mod tests {
     fn draw(state: &AppState, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| render(f, state)).unwrap();
+        dump(term.backend().buffer())
+    }
+
+    #[cfg(feature = "codex_tui_parity")]
+    fn draw_parity(
+        state: &AppState,
+        surface: &crate::history_cell::ChatSurface,
+        w: u16,
+        h: u16,
+    ) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| render_parity(f, state, surface)).unwrap();
         dump(term.backend().buffer())
     }
 
@@ -1545,6 +1607,94 @@ mod tests {
         assert!(
             out.contains("message numéro 0"),
             "le haut du transcript doit être atteignable:\n{out}"
+        );
+    }
+
+    #[cfg(feature = "codex_tui_parity")]
+    #[test]
+    fn parity_scroll_reaches_full_transcript() {
+        let mut state = AppState::new("gpt-5", true);
+        let messages = (0..10)
+            .flat_map(|i| {
+                [
+                    agent_core::Message::user(format!("message {i}")),
+                    agent_core::Message::assistant_text(format!("answer {i}")),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let surface = crate::history_cell::ChatSurface::from_messages(&messages);
+
+        let bottom = draw_parity(&state, &surface, 48, 10);
+        assert!(
+            state.scroll_max.get() > 0,
+            "parity transcript should publish a scroll bound:\n{bottom}"
+        );
+        assert!(
+            !bottom.contains("message 0"),
+            "bottom-pinned parity view should show the transcript tail:\n{bottom}"
+        );
+
+        state.scroll_up(1000);
+        assert_eq!(state.scroll, state.scroll_max.get());
+        let top = draw_parity(&state, &surface, 48, 10);
+        assert!(
+            top.contains("message 0"),
+            "scrolled parity view should render the top of retained transcript:\n{top}"
+        );
+    }
+
+    #[cfg(feature = "codex_tui_parity")]
+    #[test]
+    fn parity_idle_composer_is_bottom_anchored() {
+        let state = AppState::new("gpt-5", true);
+        let surface = crate::history_cell::ChatSurface::from_messages(&[
+            agent_core::Message::user("prompt"),
+            agent_core::Message::assistant_text("final answer"),
+        ]);
+
+        let out = draw_parity(&state, &surface, 48, 12);
+        let prompt_row = out
+            .lines()
+            .enumerate()
+            .filter_map(|(idx, line)| line.contains("›").then_some(idx))
+            .last()
+            .expect("composer prompt should render");
+        assert!(
+            prompt_row >= 8,
+            "idle parity composer should stay near the terminal bottom:\n{out}"
+        );
+        assert!(
+            out.lines()
+                .take(prompt_row)
+                .any(|line| line.contains("final answer")),
+            "transcript tail should remain visible above the bottom composer:\n{out}"
+        );
+    }
+
+    #[cfg(feature = "codex_tui_parity")]
+    #[test]
+    fn parity_welcome_is_top_with_bottom_composer() {
+        let mut state = AppState::new("gpt-5", true);
+        state.workspace = "pyxis".into();
+        state.provider_connected = true;
+        let surface = crate::history_cell::ChatSurface::new();
+
+        let out = draw_parity(&state, &surface, 80, 20);
+        let title_row = out
+            .lines()
+            .position(|line| line.contains("PYXIS"))
+            .expect("welcome title should render");
+        let prompt_row = out
+            .lines()
+            .position(|line| line.contains("›"))
+            .expect("composer prompt should render");
+        assert!(
+            title_row <= 4,
+            "welcome should be anchored near the top:\n{out}"
+        );
+        assert!(
+            prompt_row >= 16,
+            "welcome composer should be anchored at the bottom:\n{out}"
         );
     }
 
@@ -1937,15 +2087,19 @@ mod tests {
         assert!(out.contains('~'), "estimation de tokens absente:\n{out}");
     }
 
-    // US-045 : à la fin du tour, les indicateurs disparaissent (état « prêt »).
+    // US-045 : à la fin du tour, les indicateurs de droite disparaissent.
     #[test]
-    fn idle_shows_ready_state() {
+    fn idle_footer_omits_ready_state() {
         let mut s = AppState::new("gpt-5", true);
         s.push_user("?");
         s.apply(&AgentEvent::Text("réponse".into()));
         s.apply(&AgentEvent::EndTurn);
         let out = draw(&s, 80, 12);
-        assert!(out.contains("prêt"), "état repos attendu:\n{out}");
+        assert!(
+            out.contains("gpt-5"),
+            "modèle attendu dans le footer:\n{out}"
+        );
+        assert!(!out.contains("prêt"), "état idle trop verbeux:\n{out}");
     }
 
     // US-046 : la pill « nouveaux messages » n'apparaît QUE remonté ET contenu arrivé.

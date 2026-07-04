@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [features]
-default = []
+default = ["codex_tui_parity"]
 codex_tui_parity = ["agent-tui/codex_tui_parity"]
 
 # Binaire publié `pyxis` (ADR-5/ADR-8). SEUL crate qui dépend de tout : il câble

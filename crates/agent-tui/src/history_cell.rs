@@ -5,22 +5,30 @@
 //! `agent-core`.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use agent_core::message::{ContentBlock, Message, Role, ToolCallId};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app_event::{
-    TranscriptExecSource, TranscriptExecStream, TranscriptItem, TranscriptItemId,
-    TranscriptItemKind, TranscriptItemStatus, TranscriptLifecycle, TranscriptPayload,
-    TranscriptRole, TranscriptUpdate,
+    TranscriptExecSource, TranscriptExecStream, TranscriptHookOutputEntry,
+    TranscriptHookOutputKind, TranscriptHookStatus, TranscriptItem, TranscriptItemId,
+    TranscriptItemKind, TranscriptItemStatus, TranscriptLifecycle, TranscriptNoticeKind,
+    TranscriptNoticeLink, TranscriptPatchChangeKind, TranscriptPatchFileChange, TranscriptPayload,
+    TranscriptPlanStepStatus, TranscriptRole, TranscriptUpdate, TranscriptUserInputAnswer,
+    TranscriptUserInputQuestion,
 };
 use crate::insert_history::{InsertHistoryMode, PendingHistoryInsert};
 use crate::measure;
 use crate::render::sanitize;
 use crate::streaming::StreamController;
+use crate::terminal_hyperlinks::{
+    HyperlinkLine, annotate_web_urls, plain_hyperlink_lines, visible_lines,
+};
 use crate::theme::Theme;
 
 pub const MIN_CELL_WIDTH: u16 = 1;
@@ -32,15 +40,122 @@ const MAX_MARKDOWN_SOURCE_CHARS: usize = 65_536;
 const MAX_TEXT_CELL_CHARS: usize = 65_536;
 const MAX_EXEC_COMMAND_WIDTH: usize = 240;
 const MAX_EXEC_OUTPUT_SCAN_CHARS: usize = 65_536;
-const EXEC_OUTPUT_HEAD_LINES: usize = 2;
-const EXEC_OUTPUT_TAIL_LINES: usize = 2;
+const TOOL_CALL_MAX_LINES: usize = 5;
+const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
+const RAW_TOOL_OUTPUT_WIDTH: usize = 120;
+const SESSION_HEADER_MAX_INNER_WIDTH: usize = 56;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryRenderMode {
+    Rich,
+    Raw,
+}
+
+pub fn raw_lines_from_source(source: &str) -> Vec<Line<'static>> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+
+    let mut parts = source.split('\n').collect::<Vec<_>>();
+    if source.ends_with('\n') {
+        parts.pop();
+    }
+
+    parts
+        .into_iter()
+        .map(|line| Line::from(line.to_string()))
+        .collect()
+}
+
+pub fn plain_lines(lines: impl IntoIterator<Item = Line<'static>>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let text = line
+                .spans
+                .into_iter()
+                .map(|span| span.content.into_owned())
+                .collect::<String>();
+            Line::from(text)
+        })
+        .collect()
+}
 
 pub trait HistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
 
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        plain_lines(self.display_lines(u16::MAX))
+    }
+
+    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        plain_hyperlink_lines(self.display_lines(width))
+    }
+
+    fn display_lines_for_mode(&self, width: u16, mode: HistoryRenderMode) -> Vec<Line<'static>> {
+        match mode {
+            HistoryRenderMode::Rich => visible_lines(self.display_hyperlink_lines(width)),
+            HistoryRenderMode::Raw => self.raw_lines(),
+        }
+    }
+
+    fn display_hyperlink_lines_for_mode(
+        &self,
+        width: u16,
+        mode: HistoryRenderMode,
+    ) -> Vec<HyperlinkLine> {
+        match mode {
+            HistoryRenderMode::Rich => self.display_hyperlink_lines(width),
+            HistoryRenderMode::Raw => plain_hyperlink_lines(self.raw_lines()),
+        }
+    }
+
     fn desired_height(&self, width: u16) -> u16 {
-        let lines = self.display_lines(width.max(MIN_CELL_WIDTH)).len().max(1);
-        lines.min(u16::MAX as usize) as u16
+        self.desired_height_for_mode(width, HistoryRenderMode::Rich)
+    }
+
+    fn desired_height_for_mode(&self, width: u16, mode: HistoryRenderMode) -> u16 {
+        let rows = Paragraph::new(Text::from(
+            self.display_lines_for_mode(width.max(MIN_CELL_WIDTH), mode),
+        ))
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(MIN_CELL_WIDTH))
+        .max(1);
+        rows.min(u16::MAX as usize) as u16
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines(width)
+    }
+
+    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        plain_hyperlink_lines(self.transcript_lines(width))
+    }
+
+    fn desired_transcript_height(&self, width: u16) -> u16 {
+        let lines = visible_lines(self.transcript_hyperlink_lines(width.max(MIN_CELL_WIDTH)));
+        if let [line] = &lines[..]
+            && line
+                .spans
+                .iter()
+                .all(|span| span.content.chars().all(char::is_whitespace))
+        {
+            return 1;
+        }
+
+        let rows = Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .line_count(width.max(MIN_CELL_WIDTH))
+            .max(1);
+        rows.min(u16::MAX as usize) as u16
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        false
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -50,6 +165,7 @@ pub fn safe_cell_width(width: u16) -> u16 {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum HistoryCellKind {
+    SessionHeader(SessionHeaderCell),
     User(UserCell),
     AgentMarkdown(AgentMarkdownCell),
     Reasoning(ReasoningCell),
@@ -57,6 +173,16 @@ pub enum HistoryCellKind {
     Error(ErrorCell),
     Exec(ExecCell),
     Tool(ToolCell),
+    Approval(ApprovalCell),
+    PlanUpdate(PlanUpdateCell),
+    WebSearch(WebSearchCell),
+    McpTool(McpToolCell),
+    RequestUserInput(RequestUserInputCell),
+    FinalSeparator(FinalMessageSeparatorCell),
+    PatchSummary(PatchSummaryCell),
+    PatchApplyFailure(PatchApplyFailureCell),
+    SpecialNotice(SpecialNoticeCell),
+    Hook(HookCell),
     FileChange(FileChangeCell),
     Composite(CompositeCell),
 }
@@ -76,7 +202,18 @@ impl HistoryCellKind {
                 }
             }
             Self::Tool(cell) => cell.apply_item(item),
+            Self::Approval(cell) => cell.apply_item(item),
             Self::Exec(cell) => cell.apply_item(item),
+            Self::WebSearch(cell) => cell.apply_item(item),
+            Self::McpTool(cell) => cell.apply_item(item),
+            Self::RequestUserInput(_) => {}
+            Self::PlanUpdate(_)
+            | Self::FinalSeparator(_)
+            | Self::PatchSummary(_)
+            | Self::PatchApplyFailure(_)
+            | Self::SpecialNotice(_)
+            | Self::SessionHeader(_) => {}
+            Self::Hook(cell) => cell.apply_item(item),
             Self::FileChange(_) => {}
             Self::Notice(cell) => {
                 if let TranscriptPayload::Notice { message } = &item.payload {
@@ -112,6 +249,10 @@ impl HistoryCellKind {
             }
             Self::Exec(cell) => cell.mark_status(status),
             Self::Tool(cell) => cell.status = status,
+            Self::Approval(cell) => cell.status = status,
+            Self::WebSearch(cell) => cell.mark_status(status),
+            Self::McpTool(cell) => cell.mark_status(status),
+            Self::Hook(cell) => cell.mark_status(status),
             _ => {}
         }
     }
@@ -124,6 +265,7 @@ impl HistoryCellKind {
 impl HistoryCell for HistoryCellKind {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         match self {
+            Self::SessionHeader(cell) => cell.display_lines(width),
             Self::User(cell) => cell.display_lines(width),
             Self::AgentMarkdown(cell) => cell.display_lines(width),
             Self::Reasoning(cell) => cell.display_lines(width),
@@ -131,8 +273,132 @@ impl HistoryCell for HistoryCellKind {
             Self::Error(cell) => cell.display_lines(width),
             Self::Exec(cell) => cell.display_lines(width),
             Self::Tool(cell) => cell.display_lines(width),
+            Self::Approval(cell) => cell.display_lines(width),
+            Self::PlanUpdate(cell) => cell.display_lines(width),
+            Self::WebSearch(cell) => cell.display_lines(width),
+            Self::McpTool(cell) => cell.display_lines(width),
+            Self::RequestUserInput(cell) => cell.display_lines(width),
+            Self::FinalSeparator(cell) => cell.display_lines(width),
+            Self::PatchSummary(cell) => cell.display_lines(width),
+            Self::PatchApplyFailure(cell) => cell.display_lines(width),
+            Self::SpecialNotice(cell) => cell.display_lines(width),
+            Self::Hook(cell) => cell.display_lines(width),
             Self::FileChange(cell) => cell.display_lines(width),
             Self::Composite(cell) => cell.display_lines(width),
+        }
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        match self {
+            Self::SessionHeader(cell) => cell.raw_lines(),
+            Self::User(cell) => cell.raw_lines(),
+            Self::AgentMarkdown(cell) => cell.raw_lines(),
+            Self::Reasoning(cell) => cell.raw_lines(),
+            Self::Notice(cell) => cell.raw_lines(),
+            Self::Error(cell) => cell.raw_lines(),
+            Self::Exec(cell) => cell.raw_lines(),
+            Self::Tool(cell) => cell.raw_lines(),
+            Self::Approval(cell) => cell.raw_lines(),
+            Self::PlanUpdate(cell) => cell.raw_lines(),
+            Self::WebSearch(cell) => cell.raw_lines(),
+            Self::McpTool(cell) => cell.raw_lines(),
+            Self::RequestUserInput(cell) => cell.raw_lines(),
+            Self::FinalSeparator(cell) => cell.raw_lines(),
+            Self::PatchSummary(cell) => cell.raw_lines(),
+            Self::PatchApplyFailure(cell) => cell.raw_lines(),
+            Self::SpecialNotice(cell) => cell.raw_lines(),
+            Self::Hook(cell) => cell.raw_lines(),
+            Self::FileChange(cell) => cell.raw_lines(),
+            Self::Composite(cell) => cell.raw_lines(),
+        }
+    }
+
+    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        match self {
+            Self::SessionHeader(cell) => cell.display_hyperlink_lines(width),
+            Self::User(cell) => cell.display_hyperlink_lines(width),
+            Self::AgentMarkdown(cell) => cell.display_hyperlink_lines(width),
+            Self::Reasoning(cell) => cell.display_hyperlink_lines(width),
+            Self::Notice(cell) => cell.display_hyperlink_lines(width),
+            Self::Error(cell) => cell.display_hyperlink_lines(width),
+            Self::Exec(cell) => cell.display_hyperlink_lines(width),
+            Self::Tool(cell) => cell.display_hyperlink_lines(width),
+            Self::Approval(cell) => cell.display_hyperlink_lines(width),
+            Self::PlanUpdate(cell) => cell.display_hyperlink_lines(width),
+            Self::WebSearch(cell) => cell.display_hyperlink_lines(width),
+            Self::McpTool(cell) => cell.display_hyperlink_lines(width),
+            Self::RequestUserInput(cell) => cell.display_hyperlink_lines(width),
+            Self::FinalSeparator(cell) => cell.display_hyperlink_lines(width),
+            Self::PatchSummary(cell) => cell.display_hyperlink_lines(width),
+            Self::PatchApplyFailure(cell) => cell.display_hyperlink_lines(width),
+            Self::SpecialNotice(cell) => cell.display_hyperlink_lines(width),
+            Self::Hook(cell) => cell.display_hyperlink_lines(width),
+            Self::FileChange(cell) => cell.display_hyperlink_lines(width),
+            Self::Composite(cell) => cell.display_hyperlink_lines(width),
+        }
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        match self {
+            Self::SessionHeader(cell) => cell.transcript_lines(width),
+            Self::User(cell) => cell.transcript_lines(width),
+            Self::AgentMarkdown(cell) => cell.transcript_lines(width),
+            Self::Reasoning(cell) => cell.transcript_lines(width),
+            Self::Notice(cell) => cell.transcript_lines(width),
+            Self::Error(cell) => cell.transcript_lines(width),
+            Self::Exec(cell) => cell.transcript_lines(width),
+            Self::Tool(cell) => cell.transcript_lines(width),
+            Self::Approval(cell) => cell.transcript_lines(width),
+            Self::PlanUpdate(cell) => cell.transcript_lines(width),
+            Self::WebSearch(cell) => cell.transcript_lines(width),
+            Self::McpTool(cell) => cell.transcript_lines(width),
+            Self::RequestUserInput(cell) => cell.transcript_lines(width),
+            Self::FinalSeparator(cell) => cell.transcript_lines(width),
+            Self::PatchSummary(cell) => cell.transcript_lines(width),
+            Self::PatchApplyFailure(cell) => cell.transcript_lines(width),
+            Self::SpecialNotice(cell) => cell.transcript_lines(width),
+            Self::Hook(cell) => cell.transcript_lines(width),
+            Self::FileChange(cell) => cell.transcript_lines(width),
+            Self::Composite(cell) => cell.transcript_lines(width),
+        }
+    }
+
+    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        match self {
+            Self::SessionHeader(cell) => cell.transcript_hyperlink_lines(width),
+            Self::User(cell) => cell.transcript_hyperlink_lines(width),
+            Self::AgentMarkdown(cell) => cell.transcript_hyperlink_lines(width),
+            Self::Reasoning(cell) => cell.transcript_hyperlink_lines(width),
+            Self::Notice(cell) => cell.transcript_hyperlink_lines(width),
+            Self::Error(cell) => cell.transcript_hyperlink_lines(width),
+            Self::Exec(cell) => cell.transcript_hyperlink_lines(width),
+            Self::Tool(cell) => cell.transcript_hyperlink_lines(width),
+            Self::Approval(cell) => cell.transcript_hyperlink_lines(width),
+            Self::PlanUpdate(cell) => cell.transcript_hyperlink_lines(width),
+            Self::WebSearch(cell) => cell.transcript_hyperlink_lines(width),
+            Self::McpTool(cell) => cell.transcript_hyperlink_lines(width),
+            Self::RequestUserInput(cell) => cell.transcript_hyperlink_lines(width),
+            Self::FinalSeparator(cell) => cell.transcript_hyperlink_lines(width),
+            Self::PatchSummary(cell) => cell.transcript_hyperlink_lines(width),
+            Self::PatchApplyFailure(cell) => cell.transcript_hyperlink_lines(width),
+            Self::SpecialNotice(cell) => cell.transcript_hyperlink_lines(width),
+            Self::Hook(cell) => cell.transcript_hyperlink_lines(width),
+            Self::FileChange(cell) => cell.transcript_hyperlink_lines(width),
+            Self::Composite(cell) => cell.transcript_hyperlink_lines(width),
+        }
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        matches!(self, Self::AgentMarkdown(cell) if cell.is_stream_continuation())
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        match self {
+            Self::AgentMarkdown(cell) => cell.transcript_animation_tick(),
+            Self::WebSearch(cell) => cell.transcript_animation_tick(),
+            Self::McpTool(cell) => cell.transcript_animation_tick(),
+            Self::Hook(cell) => cell.transcript_animation_tick(),
+            _ => None,
         }
     }
 }
@@ -159,6 +425,10 @@ impl HistoryCell for UserCell {
             Span::raw("  "),
             width,
         )
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        raw_lines_from_source(&self.text)
     }
 }
 
@@ -221,6 +491,26 @@ impl HistoryCell for AgentMarkdownCell {
             width,
         )
     }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        raw_lines_from_source(&self.markdown)
+    }
+
+    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        annotate_web_urls(self.display_lines(width))
+    }
+
+    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        self.display_hyperlink_lines(width)
+    }
+
+    fn is_stream_continuation(&self) -> bool {
+        self.streaming
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        self.streaming.then_some(self.controller.revision())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +545,10 @@ impl HistoryCell for ReasoningCell {
             width,
         )
     }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        raw_lines_from_source(&self.text)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +573,10 @@ impl HistoryCell for NoticeCell {
             Span::raw("  "),
             width,
         )
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        raw_lines_from_source(&self.message)
     }
 }
 
@@ -305,6 +603,10 @@ impl HistoryCell for ErrorCell {
             width,
         )
     }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        raw_lines_from_source(&self.message)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,15 +623,6 @@ struct ExecCall {
     output: String,
     is_error: bool,
     stream: TranscriptExecStream,
-    kind: ExecCommandKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ExecCommandKind {
-    Run(String),
-    Read(String),
-    List(String),
-    Search(String),
 }
 
 impl ExecCell {
@@ -364,7 +657,6 @@ impl ExecCell {
                     existing.command = call.command;
                     existing.source = call.source;
                     existing.status = call.status;
-                    existing.kind = call.kind;
                 } else if self.can_group_with(&call) {
                     self.calls.push(call);
                 }
@@ -410,18 +702,12 @@ impl ExecCell {
         self.can_group_with(&call)
     }
 
-    fn can_group_with(&self, call: &ExecCall) -> bool {
-        self.is_exploring() && call.is_exploring()
-    }
-
-    fn is_exploring(&self) -> bool {
-        !self.calls.is_empty()
-            && self.calls.iter().all(ExecCall::is_exploring)
-            && !self.calls.iter().any(ExecCall::failed)
+    fn can_group_with(&self, _call: &ExecCall) -> bool {
+        false
     }
 
     fn should_defer_finalization(&self) -> bool {
-        self.is_exploring() && self.calls.iter().all(|call| !call.is_running())
+        false
     }
 
     fn call_mut(&mut self, id: Option<&TranscriptItemId>) -> Option<&mut ExecCall> {
@@ -430,10 +716,6 @@ impl ExecCell {
             .iter_mut()
             .rev()
             .find(|call| call.id.as_ref() == Some(id))
-    }
-
-    fn any_running(&self) -> bool {
-        self.calls.iter().any(ExecCall::is_running)
     }
 
     fn command_display_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -446,64 +728,28 @@ impl ExecCell {
         }
         out
     }
-
-    fn exploring_display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let title = if self.any_running() {
-            "Exploring"
-        } else {
-            "Explored"
-        };
-        let mut lines = vec![Line::from(Span::styled(
-            title,
-            Style::default().add_modifier(Modifier::BOLD),
-        ))];
-        lines.extend(self.exploring_detail_lines());
-        render_prefixed(
-            &lines,
-            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
-            width,
-        )
-    }
-
-    fn exploring_detail_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        let mut idx = 0;
-        while idx < self.calls.len() {
-            if matches!(self.calls[idx].kind, ExecCommandKind::Read(_)) {
-                let mut names = Vec::new();
-                while idx < self.calls.len() {
-                    let ExecCommandKind::Read(name) = &self.calls[idx].kind else {
-                        break;
-                    };
-                    if !names.iter().any(|known| known == name) {
-                        names.push(name.clone());
-                    }
-                    idx += 1;
-                }
-                lines.push(operation_line("Read", &names.join(", ")));
-                continue;
-            }
-
-            match &self.calls[idx].kind {
-                ExecCommandKind::List(target) => lines.push(operation_line("List", target)),
-                ExecCommandKind::Search(target) => lines.push(operation_line("Search", target)),
-                ExecCommandKind::Run(command) => lines.push(operation_line("Run", command)),
-                ExecCommandKind::Read(_) => {}
-            }
-            idx += 1;
-        }
-        lines
-    }
 }
 
 impl HistoryCell for ExecCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        if self.is_exploring() {
-            self.exploring_display_lines(width)
-        } else {
-            self.command_display_lines(width)
+        self.command_display_lines(width)
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        plain_lines(self.transcript_lines(u16::MAX))
+    }
+
+    fn transcript_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for (idx, call) in self.calls.iter().enumerate() {
+            if idx > 0 {
+                out.push(Line::default());
+            }
+            out.push(Line::from(format!("$ {}", call.command)));
+            out.extend(raw_lines_from_source(&call.output));
+            out.push(Line::from(call.transcript_status_line()));
         }
+        out
     }
 }
 
@@ -515,7 +761,6 @@ impl ExecCall {
         status: TranscriptItemStatus,
     ) -> Self {
         let command = clean_exec_command(command);
-        let kind = classify_exec_command(&command);
         Self {
             id,
             command,
@@ -524,7 +769,6 @@ impl ExecCall {
             output: String::new(),
             is_error: false,
             stream: TranscriptExecStream::Combined,
-            kind,
         }
     }
 
@@ -537,10 +781,6 @@ impl ExecCall {
 
     fn failed(&self) -> bool {
         self.is_error || self.status == TranscriptItemStatus::Failed
-    }
-
-    fn is_exploring(&self) -> bool {
-        !matches!(self.kind, ExecCommandKind::Run(_))
     }
 
     fn append_output(
@@ -602,7 +842,12 @@ impl ExecCall {
             );
         }
 
-        let lines = bounded_output_lines(&self.output)
+        let line_limit = if self.source == TranscriptExecSource::User {
+            USER_SHELL_TOOL_CALL_MAX_LINES
+        } else {
+            TOOL_CALL_MAX_LINES
+        };
+        let lines = bounded_output_lines(&self.output, line_limit)
             .into_iter()
             .map(|line| {
                 Line::from(Span::styled(
@@ -617,6 +862,16 @@ impl ExecCall {
             Span::raw("    "),
             width,
         )
+    }
+
+    fn transcript_status_line(&self) -> String {
+        if self.is_running() {
+            "running".to_string()
+        } else if self.failed() {
+            "failed".to_string()
+        } else {
+            "succeeded".to_string()
+        }
     }
 }
 
@@ -639,7 +894,7 @@ impl ToolCell {
         };
         Self {
             title: sanitize_label(&title),
-            detail: "Calling".into(),
+            detail: String::new(),
             status,
             name: Some(name.to_string()),
             input: Some(input.clone()),
@@ -698,8 +953,8 @@ impl HistoryCell for ToolCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let status = match self.status {
             TranscriptItemStatus::Pending => "Pending",
-            TranscriptItemStatus::Running => "Calling",
-            TranscriptItemStatus::Complete => "Called",
+            TranscriptItemStatus::Running => "Running",
+            TranscriptItemStatus::Complete => "Ran",
             TranscriptItemStatus::Failed => "Failed",
             TranscriptItemStatus::Cancelled => "Cancelled",
         };
@@ -721,14 +976,1679 @@ impl HistoryCell for ToolCell {
         }
         let mut out = render_prefixed(
             &lines,
-            Span::styled("● ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled("⎿ ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
             width,
         );
         if let Some(file_change) = &self.file_change {
             out.extend(file_change.display_lines(width));
         }
         out
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut source = self.title.clone();
+        if !self.detail.is_empty() {
+            source.push('\n');
+            source.push_str(&self.detail);
+        }
+        raw_lines_from_source(&source)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalCell {
+    pub tool: String,
+    pub reason: String,
+    pub input_summary: String,
+    pub status: TranscriptItemStatus,
+    decision: Option<bool>,
+}
+
+impl ApprovalCell {
+    fn request(
+        tool: &str,
+        reason: &str,
+        input_summary: &str,
+        status: TranscriptItemStatus,
+    ) -> Self {
+        Self {
+            tool: sanitize_label(tool),
+            reason: bounded_text(reason.to_string(), MAX_TEXT_CELL_CHARS),
+            input_summary: sanitize_label(input_summary),
+            status,
+            decision: None,
+        }
+    }
+
+    fn decision(tool: &str, reason: &str, input_summary: &str, allow: bool) -> Self {
+        let mut cell = Self::request(
+            tool,
+            reason,
+            input_summary,
+            if allow {
+                TranscriptItemStatus::Complete
+            } else {
+                TranscriptItemStatus::Failed
+            },
+        );
+        cell.decision = Some(allow);
+        cell
+    }
+
+    fn apply_item(&mut self, item: &TranscriptItem) {
+        self.status = item.status;
+        match &item.payload {
+            TranscriptPayload::Permission {
+                tool,
+                reason,
+                input_summary,
+                ..
+            } => {
+                self.tool = sanitize_label(tool);
+                self.reason = bounded_text(reason.clone(), MAX_TEXT_CELL_CHARS);
+                self.input_summary = sanitize_label(input_summary);
+                self.decision = None;
+            }
+            TranscriptPayload::ApprovalDecision {
+                allow,
+                tool,
+                reason,
+                input_summary,
+            } => {
+                self.tool = sanitize_label(tool);
+                self.reason = bounded_text(reason.clone(), MAX_TEXT_CELL_CHARS);
+                self.input_summary = sanitize_label(input_summary);
+                self.decision = Some(*allow);
+            }
+            _ => {}
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self.decision {
+            Some(true) => "Approved",
+            Some(false) => "Denied",
+            None => "Approval requested",
+        }
+    }
+}
+
+impl HistoryCell for ApprovalCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let prefix = match self.decision {
+            Some(true) => "✓ ",
+            Some(false) => "✗ ",
+            None => "? ",
+        };
+        let prefix_style = match self.decision {
+            Some(false) => Style::default().add_modifier(Modifier::BOLD),
+            _ => Style::default().add_modifier(Modifier::DIM),
+        };
+        let mut lines = vec![Line::from(vec![
+            Span::styled(self.title(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(
+                self.tool.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])];
+        if !self.input_summary.is_empty() {
+            lines.push(Line::from(Span::styled(
+                self.input_summary.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+        if !self.reason.is_empty() {
+            lines.extend(text_lines(
+                &self.reason,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        render_prefixed(
+            &lines,
+            Span::styled(prefix, prefix_style),
+            Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
+            width,
+        )
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut source = format!("{} {}", self.title(), self.tool);
+        if !self.input_summary.is_empty() {
+            source.push('\n');
+            source.push_str(&self.input_summary);
+        }
+        if !self.reason.is_empty() {
+            source.push('\n');
+            source.push_str(&self.reason);
+        }
+        raw_lines_from_source(&source)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHeaderCell {
+    pub version: String,
+    pub model: String,
+    pub reasoning_effort: Option<String>,
+    pub directory: String,
+    pub yolo_mode: bool,
+    pub show_fast_status: bool,
+}
+
+impl SessionHeaderCell {
+    pub fn new(
+        version: impl Into<String>,
+        model: impl Into<String>,
+        reasoning_effort: Option<impl Into<String>>,
+        directory: impl Into<String>,
+        yolo_mode: bool,
+        show_fast_status: bool,
+    ) -> Self {
+        Self {
+            version: sanitize_label(&version.into()),
+            model: sanitize_label(&model.into()),
+            reasoning_effort: reasoning_effort.map(|value| sanitize_label(&value.into())),
+            directory: bounded_text(directory.into(), MAX_TEXT_CELL_CHARS),
+            yolo_mode,
+            show_fast_status,
+        }
+    }
+
+    fn formatted_directory(&self, max_width: Option<usize>) -> String {
+        let clean = sanitize(&self.directory);
+        match max_width {
+            Some(width) => measure::truncate(&clean, width),
+            None => clean,
+        }
+    }
+}
+
+impl HistoryCell for SessionHeaderCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(inner_width) = card_inner_width(width, SESSION_HEADER_MAX_INNER_WIDTH) else {
+            return Vec::new();
+        };
+
+        const DIR_LABEL: &str = "directory:";
+        const PERMISSIONS_LABEL: &str = "permissions:";
+        let label_width = if self.yolo_mode {
+            DIR_LABEL.len().max(PERMISSIONS_LABEL.len())
+        } else {
+            DIR_LABEL.len()
+        };
+
+        let mut model_spans = vec![
+            Span::styled(
+                format!("{:<label_width$} ", "model:"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+            Span::styled(
+                self.model.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(reasoning) = self
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            model_spans.push(Span::raw(" "));
+            model_spans.push(Span::raw(reasoning.to_string()));
+        }
+        if self.show_fast_status {
+            model_spans.push(Span::raw("   "));
+            model_spans.push(Span::styled("fast", Style::default().fg(Color::Magenta)));
+        }
+        model_spans.push(Span::styled(
+            "   ",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        model_spans.push(Span::styled("/model", Style::default().fg(Color::Cyan)));
+        model_spans.push(Span::styled(
+            " to change",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+
+        let dir_prefix = format!("{DIR_LABEL:<label_width$} ");
+        let dir_width = measure::width(&dir_prefix);
+        let directory = self.formatted_directory(Some(inner_width.saturating_sub(dir_width)));
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(">_ ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled("Pyxis", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled(
+                    format!("(v{})", self.version),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]),
+            Line::default(),
+            Line::from(model_spans),
+            Line::from(vec![
+                Span::styled(dir_prefix, Style::default().add_modifier(Modifier::DIM)),
+                Span::raw(directory),
+            ]),
+        ];
+
+        if self.yolo_mode {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{PERMISSIONS_LABEL:<label_width$} "),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+                Span::styled(
+                    "YOLO mode",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+
+        with_border(lines, inner_width)
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![
+            Line::from(format!("Pyxis (v{})", self.version)),
+            Line::from(format!(
+                "model: {}{}",
+                self.model,
+                self.reasoning_effort
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!(" {value}"))
+                    .unwrap_or_default()
+            )),
+            Line::from(format!(
+                "directory: {}",
+                self.formatted_directory(/*max_width*/ None)
+            )),
+        ];
+        if self.yolo_mode {
+            lines.push(Line::from("permissions: YOLO mode"));
+        }
+        lines
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookStatus {
+    Running,
+    Completed,
+    Failed,
+    Blocked,
+    Stopped,
+}
+
+impl HookStatus {
+    fn is_running(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    fn as_status_text(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+impl From<TranscriptHookStatus> for HookStatus {
+    fn from(status: TranscriptHookStatus) -> Self {
+        match status {
+            TranscriptHookStatus::Running => Self::Running,
+            TranscriptHookStatus::Completed => Self::Completed,
+            TranscriptHookStatus::Failed => Self::Failed,
+            TranscriptHookStatus::Blocked => Self::Blocked,
+            TranscriptHookStatus::Stopped => Self::Stopped,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookOutputKind {
+    Warning,
+    Stop,
+    Feedback,
+    Context,
+    Error,
+}
+
+impl HookOutputKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Warning => "warning: ",
+            Self::Stop => "stop: ",
+            Self::Feedback => "feedback: ",
+            Self::Context => "hook context: ",
+            Self::Error => "error: ",
+        }
+    }
+}
+
+impl From<TranscriptHookOutputKind> for HookOutputKind {
+    fn from(kind: TranscriptHookOutputKind) -> Self {
+        match kind {
+            TranscriptHookOutputKind::Warning => Self::Warning,
+            TranscriptHookOutputKind::Stop => Self::Stop,
+            TranscriptHookOutputKind::Feedback => Self::Feedback,
+            TranscriptHookOutputKind::Context => Self::Context,
+            TranscriptHookOutputKind::Error => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookOutputEntry {
+    pub kind: HookOutputKind,
+    pub text: String,
+}
+
+impl HookOutputEntry {
+    pub fn new(kind: HookOutputKind, text: impl Into<String>) -> Self {
+        Self {
+            kind,
+            text: bounded_text(text.into(), MAX_TEXT_CELL_CHARS),
+        }
+    }
+}
+
+impl From<&TranscriptHookOutputEntry> for HookOutputEntry {
+    fn from(entry: &TranscriptHookOutputEntry) -> Self {
+        Self::new(HookOutputKind::from(entry.kind), entry.text.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookCell {
+    pub event: String,
+    pub status_message: Option<String>,
+    pub status: HookStatus,
+    pub entries: Vec<HookOutputEntry>,
+    animations_enabled: bool,
+    start_time: Instant,
+}
+
+impl HookCell {
+    pub fn new(
+        event: impl Into<String>,
+        status_message: Option<impl Into<String>>,
+        status: HookStatus,
+        entries: Vec<HookOutputEntry>,
+    ) -> Self {
+        Self {
+            event: sanitize_label(&event.into()),
+            status_message: status_message.map(|value| sanitize_label(&value.into())),
+            status,
+            entries,
+            animations_enabled: true,
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn running(event: impl Into<String>, status_message: Option<impl Into<String>>) -> Self {
+        Self::new(event, status_message, HookStatus::Running, Vec::new())
+    }
+
+    pub fn completed(
+        event: impl Into<String>,
+        status_message: Option<impl Into<String>>,
+        status: HookStatus,
+        entries: Vec<HookOutputEntry>,
+    ) -> Self {
+        let mut cell = Self::new(event, status_message, status, entries);
+        cell.animations_enabled = false;
+        cell
+    }
+
+    fn mark_status(&mut self, status: TranscriptItemStatus) {
+        self.status = match status {
+            TranscriptItemStatus::Pending | TranscriptItemStatus::Running => HookStatus::Running,
+            TranscriptItemStatus::Complete => {
+                if self.status.is_running() {
+                    HookStatus::Completed
+                } else {
+                    self.status
+                }
+            }
+            TranscriptItemStatus::Failed => HookStatus::Failed,
+            TranscriptItemStatus::Cancelled => HookStatus::Stopped,
+        };
+        if !self.status.is_running() {
+            self.animations_enabled = false;
+        }
+    }
+
+    fn apply_item(&mut self, item: &TranscriptItem) {
+        if let TranscriptPayload::HookRun {
+            event,
+            status_message,
+            status,
+            entries,
+        } = &item.payload
+        {
+            self.event = sanitize_label(event);
+            self.status_message = status_message.as_ref().map(|value| sanitize_label(value));
+            self.status = HookStatus::from(*status);
+            self.entries = entries.iter().map(HookOutputEntry::from).collect();
+            self.animations_enabled = self.status.is_running();
+        } else {
+            self.mark_status(item.status);
+        }
+    }
+
+    fn completed_bullet(&self) -> Span<'static> {
+        match self.status {
+            HookStatus::Completed => {
+                if self
+                    .entries
+                    .iter()
+                    .any(|entry| entry.kind == HookOutputKind::Warning)
+                {
+                    Span::styled("•", Style::default().add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled(
+                        "•",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                }
+            }
+            HookStatus::Failed | HookStatus::Blocked | HookStatus::Stopped => Span::styled(
+                "•",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            HookStatus::Running => Span::raw("•"),
+        }
+    }
+
+    fn running_header(&self) -> Line<'static> {
+        let mut spans = vec![
+            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                format!("Running {} hook", self.event),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(status_message) = self
+            .status_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            spans.push(Span::raw(": "));
+            spans.push(Span::styled(
+                status_message.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        Line::from(spans)
+    }
+}
+
+impl HistoryCell for HookCell {
+    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
+        if self.status.is_running() {
+            return vec![self.running_header()];
+        }
+
+        let mut lines = vec![Line::from(vec![
+            self.completed_bullet(),
+            Span::raw(" "),
+            Span::raw(format!(
+                "{} hook ({})",
+                self.event,
+                self.status.as_status_text()
+            )),
+        ])];
+
+        for entry in &self.entries {
+            let clean_entry_text = sanitize(&entry.text);
+            let mut output_lines = clean_entry_text.split('\n').collect::<Vec<_>>();
+            if output_lines.is_empty() {
+                continue;
+            }
+            let first_line = output_lines.remove(0);
+            lines.push(Line::from(format!(
+                "  {}{}",
+                entry.kind.prefix(),
+                first_line
+            )));
+            for line in output_lines {
+                if line.is_empty() {
+                    lines.push(Line::default());
+                } else {
+                    lines.push(Line::from(format!("    {line}")));
+                }
+            }
+        }
+
+        lines
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines(width)
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        plain_lines(self.display_lines(u16::MAX))
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if self.animations_enabled && self.status.is_running() {
+            return Some(self.start_time.elapsed().as_millis() as u64 / 600);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStepStatus {
+    Completed,
+    InProgress,
+    Pending,
+}
+
+impl PlanStepStatus {
+    fn style(self) -> Style {
+        match self {
+            Self::Completed => Style::default().add_modifier(Modifier::DIM | Modifier::CROSSED_OUT),
+            Self::InProgress => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            Self::Pending => Style::default().add_modifier(Modifier::DIM),
+        }
+    }
+
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Completed => "✔ ",
+            Self::InProgress | Self::Pending => "□ ",
+        }
+    }
+}
+
+impl From<TranscriptPlanStepStatus> for PlanStepStatus {
+    fn from(status: TranscriptPlanStepStatus) -> Self {
+        match status {
+            TranscriptPlanStepStatus::Completed => Self::Completed,
+            TranscriptPlanStepStatus::InProgress => Self::InProgress,
+            TranscriptPlanStepStatus::Pending => Self::Pending,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanStep {
+    pub step: String,
+    pub status: PlanStepStatus,
+}
+
+impl PlanStep {
+    pub fn new(step: impl Into<String>, status: PlanStepStatus) -> Self {
+        Self {
+            step: bounded_text(step.into(), MAX_TEXT_CELL_CHARS),
+            status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanUpdateCell {
+    pub explanation: Option<String>,
+    pub steps: Vec<PlanStep>,
+}
+
+impl PlanUpdateCell {
+    pub fn new(explanation: Option<impl Into<String>>, steps: Vec<PlanStep>) -> Self {
+        Self {
+            explanation: explanation.map(|text| bounded_text(text.into(), MAX_TEXT_CELL_CHARS)),
+            steps,
+        }
+    }
+}
+
+impl HistoryCell for PlanUpdateCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut logical = vec![Line::from(Span::styled(
+            "Updated Plan",
+            Style::default().add_modifier(Modifier::BOLD),
+        ))];
+
+        if let Some(explanation) = self
+            .explanation
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            logical.extend(text_lines(
+                explanation,
+                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+            ));
+        }
+
+        if self.steps.is_empty() {
+            logical.push(Line::from(Span::styled(
+                "(no steps provided)",
+                Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC),
+            )));
+        } else {
+            for step in &self.steps {
+                logical.push(Line::from(vec![
+                    Span::styled(step.status.marker(), step.status.style()),
+                    Span::styled(step.step.clone(), step.status.style()),
+                ]));
+            }
+        }
+
+        render_prefixed(
+            &logical,
+            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
+            width,
+        )
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from("Updated Plan")];
+        if let Some(explanation) = self
+            .explanation
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            lines.extend(raw_lines_from_source(explanation));
+        }
+        if self.steps.is_empty() {
+            lines.push(Line::from("(no steps provided)"));
+        } else {
+            for step in &self.steps {
+                lines.push(Line::from(format!("{:?}: {}", step.status, step.step)));
+            }
+        }
+        lines
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSearchCell {
+    pub query: String,
+    pub detail: Option<String>,
+    pub completed: bool,
+    animations_enabled: bool,
+    start_time: Instant,
+}
+
+impl WebSearchCell {
+    pub fn searching(query: impl Into<String>, detail: Option<impl Into<String>>) -> Self {
+        Self {
+            query: sanitize_label(&query.into()),
+            detail: detail.map(|value| sanitize_label(&value.into())),
+            completed: false,
+            animations_enabled: true,
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn searched(query: impl Into<String>, detail: Option<impl Into<String>>) -> Self {
+        let mut cell = Self::searching(query, detail);
+        cell.completed = true;
+        cell.animations_enabled = false;
+        cell
+    }
+
+    fn mark_status(&mut self, status: TranscriptItemStatus) {
+        self.completed = !matches!(
+            status,
+            TranscriptItemStatus::Pending | TranscriptItemStatus::Running
+        );
+    }
+
+    fn apply_item(&mut self, item: &TranscriptItem) {
+        self.mark_status(item.status);
+        if let TranscriptPayload::WebSearch { query, detail } = &item.payload {
+            self.query = sanitize_label(query);
+            self.detail = detail.as_ref().map(|value| sanitize_label(value));
+        }
+    }
+
+    fn header(&self) -> &'static str {
+        if self.completed {
+            "Searched the web"
+        } else {
+            "Searching the web"
+        }
+    }
+
+    fn effective_detail(&self) -> String {
+        self.detail
+            .clone()
+            .filter(|detail| !detail.is_empty())
+            .unwrap_or_else(|| self.query.clone())
+    }
+}
+
+impl HistoryCell for WebSearchCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let detail = self.effective_detail();
+        let mut spans = vec![Span::styled(
+            self.header(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if !detail.is_empty() {
+            let separator = if self.completed { " for " } else { " " };
+            spans.push(Span::raw(separator));
+            spans.push(Span::raw(detail));
+        }
+
+        render_prefixed(
+            &[Line::from(spans)],
+            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
+            Span::raw("  "),
+            width,
+        )
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let detail = self.effective_detail();
+        if detail.is_empty() {
+            vec![Line::from(self.header())]
+        } else {
+            let separator = if self.completed { " for " } else { " " };
+            vec![Line::from(format!("{}{separator}{detail}", self.header()))]
+        }
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if self.completed || !self.animations_enabled {
+            return None;
+        }
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpInvocation {
+    pub server: String,
+    pub tool: String,
+    pub arguments: Option<Value>,
+}
+
+impl McpInvocation {
+    pub fn new(
+        server: impl Into<String>,
+        tool: impl Into<String>,
+        arguments: Option<Value>,
+    ) -> Self {
+        Self {
+            server: sanitize_label(&server.into()),
+            tool: sanitize_label(&tool.into()),
+            arguments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpToolCell {
+    pub invocation: McpInvocation,
+    pub status: TranscriptItemStatus,
+    pub output: String,
+    pub is_error: bool,
+    animations_enabled: bool,
+    start_time: Instant,
+}
+
+impl McpToolCell {
+    pub fn calling(invocation: McpInvocation) -> Self {
+        Self {
+            invocation,
+            status: TranscriptItemStatus::Running,
+            output: String::new(),
+            is_error: false,
+            animations_enabled: true,
+            start_time: Instant::now(),
+        }
+    }
+
+    pub fn called(invocation: McpInvocation, output: impl Into<String>, is_error: bool) -> Self {
+        let mut cell = Self::calling(invocation);
+        cell.output = bounded_text(output.into(), MAX_EXEC_OUTPUT_SCAN_CHARS);
+        cell.is_error = is_error;
+        cell.status = if is_error {
+            TranscriptItemStatus::Failed
+        } else {
+            TranscriptItemStatus::Complete
+        };
+        cell.animations_enabled = false;
+        cell
+    }
+
+    fn mark_status(&mut self, status: TranscriptItemStatus) {
+        self.status = status;
+    }
+
+    fn apply_item(&mut self, item: &TranscriptItem) {
+        self.status = item.status;
+        match &item.payload {
+            TranscriptPayload::McpToolCall {
+                server,
+                tool,
+                arguments,
+            } => {
+                self.invocation = McpInvocation::new(server, tool, arguments.clone());
+                if matches!(
+                    item.status,
+                    TranscriptItemStatus::Pending | TranscriptItemStatus::Running
+                ) {
+                    self.output.clear();
+                    self.is_error = false;
+                }
+            }
+            TranscriptPayload::McpToolResult { output, is_error } => {
+                self.output = bounded_text(output.clone(), MAX_EXEC_OUTPUT_SCAN_CHARS);
+                self.is_error = *is_error;
+            }
+            _ => {}
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(
+            self.status,
+            TranscriptItemStatus::Pending | TranscriptItemStatus::Running
+        )
+    }
+
+    fn header(&self) -> &'static str {
+        if self.is_running() { "Running" } else { "Ran" }
+    }
+
+    fn output_for_display(&self) -> String {
+        if self.output.trim().is_empty() {
+            return String::new();
+        }
+        if self.is_error && !self.output.trim_start().starts_with("Error:") {
+            format!("Error: {}", self.output)
+        } else {
+            self.output.clone()
+        }
+    }
+}
+
+impl HistoryCell for McpToolCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let bullet_style = if self.is_error || self.status == TranscriptItemStatus::Failed {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        } else if self.status == TranscriptItemStatus::Complete {
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+
+        let invocation_line = format_mcp_invocation(&self.invocation);
+        let header = Line::from(vec![
+            Span::styled("• ", bullet_style),
+            Span::styled(self.header(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+        ]);
+        let inline_invocation = line_visible_width(&header)
+            .saturating_add(line_visible_width(&invocation_line))
+            <= safe_width_usize(width);
+
+        if inline_invocation {
+            let mut spans = header.spans;
+            spans.extend(invocation_line.spans);
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("• ", bullet_style),
+                Span::styled(self.header(), Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+            lines.extend(render_prefixed(
+                &[invocation_line],
+                Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
+                Span::raw("    "),
+                width,
+            ));
+        }
+
+        let output = self.output_for_display();
+        if !output.is_empty() {
+            let detail_lines = bounded_output_lines(&output, TOOL_CALL_MAX_LINES)
+                .into_iter()
+                .map(|line| {
+                    Line::from(Span::styled(
+                        measure::truncate(
+                            &line,
+                            safe_width_usize(width).max(RAW_TOOL_OUTPUT_WIDTH),
+                        ),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let first_prefix = if inline_invocation {
+                Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM))
+            } else {
+                Span::raw("    ")
+            };
+            lines.extend(render_prefixed(
+                &detail_lines,
+                first_prefix,
+                Span::raw("    "),
+                width,
+            ));
+        }
+
+        lines
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(format!(
+            "{} {}",
+            self.header(),
+            plain_line_text(&format_mcp_invocation(&self.invocation))
+        ))];
+        let output = self.output_for_display();
+        if !output.is_empty() {
+            lines.extend(raw_lines_from_source(&output));
+        }
+        lines
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if !self.is_running() || !self.animations_enabled {
+            return None;
+        }
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInputQuestion {
+    pub id: String,
+    pub question: String,
+    pub is_secret: bool,
+}
+
+impl From<&TranscriptUserInputQuestion> for UserInputQuestion {
+    fn from(question: &TranscriptUserInputQuestion) -> Self {
+        Self {
+            id: sanitize_label(&question.id),
+            question: bounded_text(question.question.clone(), MAX_TEXT_CELL_CHARS),
+            is_secret: question.is_secret,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInputAnswer {
+    pub question_id: String,
+    pub answers: Vec<String>,
+}
+
+impl From<&TranscriptUserInputAnswer> for UserInputAnswer {
+    fn from(answer: &TranscriptUserInputAnswer) -> Self {
+        Self {
+            question_id: sanitize_label(&answer.question_id),
+            answers: answer
+                .answers
+                .iter()
+                .map(|answer| bounded_text(answer.clone(), MAX_TEXT_CELL_CHARS))
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestUserInputCell {
+    pub questions: Vec<UserInputQuestion>,
+    pub answers: Vec<UserInputAnswer>,
+    pub interrupted: bool,
+}
+
+impl RequestUserInputCell {
+    pub fn new(
+        questions: Vec<UserInputQuestion>,
+        answers: Vec<UserInputAnswer>,
+        interrupted: bool,
+    ) -> Self {
+        Self {
+            questions,
+            answers,
+            interrupted,
+        }
+    }
+
+    fn answer_for(&self, id: &str) -> Option<&UserInputAnswer> {
+        self.answers
+            .iter()
+            .find(|answer| answer.question_id == id && !answer.answers.is_empty())
+    }
+
+    fn answered_count(&self) -> usize {
+        self.questions
+            .iter()
+            .filter(|question| self.answer_for(&question.id).is_some())
+            .count()
+    }
+
+    fn split_answer(answer: &UserInputAnswer) -> (Vec<String>, Option<String>) {
+        let mut options = Vec::new();
+        let mut note = None;
+        for entry in &answer.answers {
+            if let Some(value) = entry.strip_prefix("user_note: ") {
+                note = Some(value.to_string());
+            } else {
+                options.push(entry.clone());
+            }
+        }
+        (options, note)
+    }
+}
+
+impl HistoryCell for RequestUserInputCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let answered = self.answered_count();
+        let total = self.questions.len();
+        let mut header = vec![
+            Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("Questions", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {answered}/{total} answered"),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ];
+        if self.interrupted {
+            header.push(Span::styled(
+                " (interrupted)",
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+
+        let mut lines = vec![Line::from(header)];
+        for question in &self.questions {
+            let answer = self.answer_for(&question.id);
+            let missing = answer.is_none();
+            let mut question_lines = text_lines(&question.question, Style::default());
+            if missing && let Some(last) = question_lines.last_mut() {
+                last.spans.push(Span::styled(
+                    " (unanswered)",
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+            lines.extend(render_prefixed(
+                &question_lines,
+                Span::raw("  • "),
+                Span::raw("    "),
+                width,
+            ));
+
+            let Some(answer) = answer else {
+                continue;
+            };
+            if question.is_secret {
+                lines.extend(render_prefixed(
+                    &[Line::from(Span::styled(
+                        "••••••",
+                        Style::default().fg(Color::Cyan),
+                    ))],
+                    Span::styled("    answer: ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled("            ", Style::default().add_modifier(Modifier::DIM)),
+                    width,
+                ));
+                continue;
+            }
+
+            let (options, note) = Self::split_answer(answer);
+            for option in options {
+                lines.extend(render_prefixed(
+                    &[Line::from(Span::styled(
+                        option,
+                        Style::default().fg(Color::Cyan),
+                    ))],
+                    Span::styled("    answer: ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled("            ", Style::default().add_modifier(Modifier::DIM)),
+                    width,
+                ));
+            }
+            if let Some(note) = note {
+                lines.extend(render_prefixed(
+                    &[Line::from(Span::styled(
+                        note,
+                        Style::default().fg(Color::Cyan),
+                    ))],
+                    Span::styled("    note: ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::styled("          ", Style::default().add_modifier(Modifier::DIM)),
+                    width,
+                ));
+            }
+        }
+
+        let unanswered = total.saturating_sub(answered);
+        if self.interrupted && unanswered > 0 {
+            lines.extend(render_prefixed(
+                &[Line::from(Span::styled(
+                    format!("interrupted with {unanswered} unanswered"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                ))],
+                Span::styled("  ↳ ", Style::default().fg(Color::Cyan)),
+                Span::styled("    ", Style::default().add_modifier(Modifier::DIM)),
+                width,
+            ));
+        }
+        lines
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let answered = self.answered_count();
+        let total = self.questions.len();
+        let mut lines = vec![Line::from(format!("Questions {answered}/{total} answered"))];
+        if self.interrupted {
+            lines.push(Line::from("(interrupted)"));
+        }
+        for question in &self.questions {
+            lines.push(Line::from(question.question.clone()));
+            let Some(answer) = self.answer_for(&question.id) else {
+                lines.push(Line::from("(unanswered)"));
+                continue;
+            };
+            if question.is_secret {
+                lines.push(Line::from("answer: ******"));
+                continue;
+            }
+            let (options, note) = Self::split_answer(answer);
+            for option in options {
+                lines.push(Line::from(format!("answer: {option}")));
+            }
+            if let Some(note) = note {
+                lines.push(Line::from(format!("note: {note}")));
+            }
+        }
+        lines
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalMessageSeparatorCell {
+    pub elapsed_seconds: Option<u64>,
+    pub metrics: Vec<String>,
+}
+
+impl FinalMessageSeparatorCell {
+    pub fn new(elapsed_seconds: Option<u64>, metrics: Vec<String>) -> Self {
+        Self {
+            elapsed_seconds,
+            metrics: metrics
+                .into_iter()
+                .map(|metric| sanitize_label(&metric))
+                .filter(|metric| !metric.is_empty())
+                .collect(),
+        }
+    }
+
+    fn label_parts(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(seconds) = self.elapsed_seconds.filter(|seconds| *seconds > 60) {
+            parts.push(format!(
+                "Worked for {}",
+                crate::spinner::fmt_duration(Duration::from_secs(seconds))
+            ));
+        }
+        parts.extend(self.metrics.iter().cloned());
+        parts
+    }
+}
+
+impl HistoryCell for FinalMessageSeparatorCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = safe_width_usize(width);
+        let parts = self.label_parts();
+        if parts.is_empty() {
+            return vec![Line::from(Span::styled(
+                "─".repeat(width),
+                Style::default().add_modifier(Modifier::DIM),
+            ))];
+        }
+
+        let label = format!("─ {} ─", parts.join(" • "));
+        let label = measure::truncate(&label, width);
+        let label_width = measure::width(&label);
+        vec![Line::from(vec![
+            Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+            Span::styled(
+                "─".repeat(width.saturating_sub(label_width)),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])]
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let parts = self.label_parts();
+        if parts.is_empty() {
+            Vec::new()
+        } else {
+            vec![Line::from(parts.join(" • "))]
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchChangeKind {
+    Added,
+    Deleted,
+    Edited,
+}
+
+impl PatchChangeKind {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Added => "Added",
+            Self::Deleted => "Deleted",
+            Self::Edited => "Edited",
+        }
+    }
+}
+
+impl From<TranscriptPatchChangeKind> for PatchChangeKind {
+    fn from(kind: TranscriptPatchChangeKind) -> Self {
+        match kind {
+            TranscriptPatchChangeKind::Added => Self::Added,
+            TranscriptPatchChangeKind::Deleted => Self::Deleted,
+            TranscriptPatchChangeKind::Edited => Self::Edited,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchFileChange {
+    pub path: String,
+    pub move_path: Option<String>,
+    pub kind: PatchChangeKind,
+    pub added: usize,
+    pub removed: usize,
+    pub diff: Option<crate::diff::Diff>,
+}
+
+impl PatchFileChange {
+    pub fn new(
+        path: impl Into<String>,
+        kind: PatchChangeKind,
+        added: usize,
+        removed: usize,
+        diff: Option<crate::diff::Diff>,
+    ) -> Self {
+        Self {
+            path: sanitize_label(&path.into()),
+            move_path: None,
+            kind,
+            added,
+            removed,
+            diff,
+        }
+    }
+
+    pub fn with_move_path(mut self, move_path: impl Into<String>) -> Self {
+        self.move_path = Some(sanitize_label(&move_path.into()));
+        self
+    }
+
+    fn path_label(&self) -> String {
+        match self.move_path.as_deref() {
+            Some(move_path) if !move_path.is_empty() => format!("{} → {move_path}", self.path),
+            _ => self.path.clone(),
+        }
+    }
+}
+
+impl From<&TranscriptPatchFileChange> for PatchFileChange {
+    fn from(change: &TranscriptPatchFileChange) -> Self {
+        let mut out = PatchFileChange::new(
+            change.path.clone(),
+            PatchChangeKind::from(change.kind),
+            change.added,
+            change.removed,
+            None,
+        );
+        out.move_path = change
+            .move_path
+            .as_ref()
+            .map(|move_path| sanitize_label(move_path));
+        out
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchSummaryCell {
+    pub changes: Vec<PatchFileChange>,
+}
+
+impl PatchSummaryCell {
+    pub fn new(mut changes: Vec<PatchFileChange>) -> Self {
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        Self { changes }
+    }
+
+    fn totals(&self) -> (usize, usize) {
+        self.changes.iter().fold((0usize, 0usize), |acc, change| {
+            (
+                acc.0.saturating_add(change.added),
+                acc.1.saturating_add(change.removed),
+            )
+        })
+    }
+
+    fn line_count_spans(added: usize, removed: usize) -> Vec<Span<'static>> {
+        vec![
+            Span::raw("("),
+            Span::styled(format!("+{added}"), Style::default().fg(Color::Green)),
+            Span::raw(" "),
+            Span::styled(format!("-{removed}"), Style::default().fg(Color::Red)),
+            Span::raw(")"),
+        ]
+    }
+
+    fn header_line(&self) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            "• ",
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        match self.changes.as_slice() {
+            [change] => {
+                spans.push(Span::styled(
+                    change.kind.verb(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(" "));
+                spans.push(Span::raw(change.path_label()));
+                spans.push(Span::raw(" "));
+                spans.extend(Self::line_count_spans(change.added, change.removed));
+            }
+            changes => {
+                let (added, removed) = self.totals();
+                let noun = if changes.len() == 1 { "file" } else { "files" };
+                spans.push(Span::styled(
+                    "Edited",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(format!(" {} {noun} ", changes.len())));
+                spans.extend(Self::line_count_spans(added, removed));
+            }
+        }
+        Line::from(spans)
+    }
+
+    fn file_header_line(change: &PatchFileChange) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            "  └ ",
+            Style::default().add_modifier(Modifier::DIM),
+        )];
+        spans.push(Span::raw(change.path_label()));
+        spans.push(Span::raw(" "));
+        spans.extend(Self::line_count_spans(change.added, change.removed));
+        Line::from(spans)
+    }
+
+    fn push_diff_lines(
+        out: &mut Vec<Line<'static>>,
+        diff: &crate::diff::Diff,
+        theme: &Theme,
+        width: u16,
+    ) {
+        for line in render_file_diff(diff, theme, width.saturating_sub(4)) {
+            let mut spans = vec![Span::raw("    ")];
+            spans.extend(line.spans);
+            out.push(Line::from(spans));
+        }
+    }
+}
+
+impl HistoryCell for PatchSummaryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let theme = Theme::new(true);
+        let mut lines = vec![self.header_line()];
+        let skip_single_header = self.changes.len() == 1;
+
+        for (idx, change) in self.changes.iter().enumerate() {
+            if idx > 0 {
+                lines.push(Line::default());
+            }
+            if !skip_single_header {
+                lines.push(Self::file_header_line(change));
+            }
+            if let Some(diff) = &change.diff {
+                Self::push_diff_lines(&mut lines, diff, &theme, width);
+            }
+        }
+
+        lines
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        plain_lines(self.display_lines(RAW_TOOL_OUTPUT_WIDTH as u16))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchApplyFailureCell {
+    pub stderr: String,
+}
+
+impl PatchApplyFailureCell {
+    pub fn new(stderr: impl Into<String>) -> Self {
+        Self {
+            stderr: bounded_text(stderr.into(), MAX_EXEC_OUTPUT_SCAN_CHARS),
+        }
+    }
+}
+
+impl HistoryCell for PatchApplyFailureCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(vec![
+            Span::styled("✘ ", Style::default().fg(Color::Magenta)),
+            Span::styled(
+                "Failed to apply patch",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])];
+        if !self.stderr.trim().is_empty() {
+            let stderr_lines = bounded_output_lines(&self.stderr, TOOL_CALL_MAX_LINES)
+                .into_iter()
+                .map(|line| {
+                    Line::from(Span::styled(
+                        line,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            lines.extend(render_prefixed(
+                &stderr_lines,
+                Span::styled("  └ ", Style::default().add_modifier(Modifier::DIM)),
+                Span::raw("    "),
+                width,
+            ));
+        }
+        lines
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from("Failed to apply patch")];
+        if !self.stderr.trim().is_empty() {
+            lines.extend(raw_lines_from_source(&self.stderr));
+        }
+        lines
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialNoticeKind {
+    Info,
+    Warning,
+    Error,
+    Deprecation,
+    SafetyAccess,
+}
+
+impl From<TranscriptNoticeKind> for SpecialNoticeKind {
+    fn from(kind: TranscriptNoticeKind) -> Self {
+        match kind {
+            TranscriptNoticeKind::Info => Self::Info,
+            TranscriptNoticeKind::Warning => Self::Warning,
+            TranscriptNoticeKind::Error => Self::Error,
+            TranscriptNoticeKind::Deprecation => Self::Deprecation,
+            TranscriptNoticeKind::SafetyAccess => Self::SafetyAccess,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecialNoticeLink {
+    pub label: String,
+    pub url: String,
+}
+
+impl From<&TranscriptNoticeLink> for SpecialNoticeLink {
+    fn from(link: &TranscriptNoticeLink) -> Self {
+        Self {
+            label: sanitize_label(&link.label),
+            url: sanitize_label(&link.url),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecialNoticeCell {
+    pub kind: SpecialNoticeKind,
+    pub title: String,
+    pub body: Option<String>,
+    pub hint: Option<String>,
+    pub links: Vec<SpecialNoticeLink>,
+}
+
+impl SpecialNoticeCell {
+    pub fn new(
+        kind: SpecialNoticeKind,
+        title: impl Into<String>,
+        body: Option<impl Into<String>>,
+        hint: Option<impl Into<String>>,
+        links: Vec<SpecialNoticeLink>,
+    ) -> Self {
+        Self {
+            kind,
+            title: bounded_text(title.into(), MAX_TEXT_CELL_CHARS),
+            body: body.map(|value| bounded_text(value.into(), MAX_TEXT_CELL_CHARS)),
+            hint: hint.map(|value| bounded_text(value.into(), MAX_TEXT_CELL_CHARS)),
+            links,
+        }
+    }
+
+    fn title_line(&self) -> Line<'static> {
+        match self.kind {
+            SpecialNoticeKind::Info => {
+                let mut spans = vec![
+                    Span::styled("• ", Style::default().add_modifier(Modifier::DIM)),
+                    Span::raw(self.title.clone()),
+                ];
+                if let Some(hint) = &self.hint {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        hint.clone(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+                Line::from(spans)
+            }
+            SpecialNoticeKind::Warning => Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
+                Span::styled(self.title.clone(), Style::default().fg(Color::Yellow)),
+            ]),
+            SpecialNoticeKind::Error => Line::from(Span::styled(
+                format!("■ {}", self.title),
+                Style::default().fg(Color::Red),
+            )),
+            SpecialNoticeKind::Deprecation => Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(Color::Red)),
+                Span::styled(self.title.clone(), Style::default().fg(Color::Red)),
+            ]),
+            SpecialNoticeKind::SafetyAccess => Line::from(vec![
+                Span::styled("ⓘ ", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    self.title.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+            ]),
+        }
+    }
+}
+
+impl HistoryCell for SpecialNoticeCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = vec![self.title_line()];
+        if let Some(body) = self.body.as_deref().filter(|body| !body.trim().is_empty()) {
+            lines.extend(render_prefixed(
+                &text_lines(body, Style::default().add_modifier(Modifier::DIM)),
+                Span::raw("  "),
+                Span::raw("  "),
+                width,
+            ));
+        }
+        for link in &self.links {
+            lines.extend(render_prefixed(
+                &[Line::from(vec![
+                    Span::styled(
+                        format!("{}: ", link.label),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                    Span::styled(
+                        link.url.clone(),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::UNDERLINED),
+                    ),
+                ])],
+                Span::raw("  "),
+                Span::raw("  "),
+                width,
+            ));
+        }
+        lines
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut lines = vec![Line::from(self.title.clone())];
+        if let Some(body) = self.body.as_deref().filter(|body| !body.trim().is_empty()) {
+            lines.extend(raw_lines_from_source(body));
+        }
+        if let Some(hint) = self.hint.as_deref().filter(|hint| !hint.trim().is_empty()) {
+            lines.push(Line::from(hint.to_string()));
+        }
+        for link in &self.links {
+            lines.push(Line::from(format!("{}: {}", link.label, link.url)));
+        }
+        lines
+    }
+
+    fn display_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        annotate_web_urls(self.display_lines(width))
+    }
+
+    fn transcript_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+        self.display_hyperlink_lines(width)
     }
 }
 
@@ -795,6 +2715,40 @@ impl HistoryCell for FileChangeCell {
         }
         lines
     }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut source = format!("{} {}", self.title, self.summary);
+        if let Some(diff) = &self.diff {
+            for row in &diff.rows {
+                source.push('\n');
+                match row {
+                    crate::diff::Row::Add { segs, .. } => {
+                        source.push('+');
+                        source.push(' ');
+                        source.push_str(
+                            &segs.iter().map(|seg| seg.text.as_str()).collect::<String>(),
+                        );
+                    }
+                    crate::diff::Row::Remove { segs, .. } => {
+                        source.push('-');
+                        source.push(' ');
+                        source.push_str(
+                            &segs.iter().map(|seg| seg.text.as_str()).collect::<String>(),
+                        );
+                    }
+                    crate::diff::Row::Context { text, .. } => {
+                        source.push(' ');
+                        source.push_str(text);
+                    }
+                    crate::diff::Row::Gap => source.push_str("..."),
+                    crate::diff::Row::Truncated(hidden) => {
+                        source.push_str(&format!("... +{hidden} lines"));
+                    }
+                }
+            }
+        }
+        raw_lines_from_source(&source)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -816,6 +2770,28 @@ impl HistoryCell for CompositeCell {
                 out.push(Line::default());
             }
             out.extend(cell.display_lines(width));
+        }
+        out
+    }
+
+    fn raw_lines(&self) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for (idx, cell) in self.cells.iter().enumerate() {
+            if idx > 0 {
+                out.push(Line::default());
+            }
+            out.extend(cell.raw_lines());
+        }
+        out
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for (idx, cell) in self.cells.iter().enumerate() {
+            if idx > 0 {
+                out.push(Line::default());
+            }
+            out.extend(cell.transcript_lines(width));
         }
         out
     }
@@ -858,6 +2834,7 @@ pub struct ChatSurface {
     active_cell: Option<ActiveHistoryCell>,
     active_tools: Vec<ActiveHistoryCell>,
     pending_insert_cells: Vec<HistoryCellKind>,
+    pending_insert_needs_leading_separator: bool,
 }
 
 impl ChatSurface {
@@ -872,6 +2849,7 @@ impl ChatSurface {
             transcript_cells,
             active_cell: None,
             active_tools: Vec::new(),
+            pending_insert_needs_leading_separator: false,
         }
     }
 
@@ -899,26 +2877,56 @@ impl ChatSurface {
     }
 
     pub fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines_for_mode(width, HistoryRenderMode::Rich)
+    }
+
+    pub fn display_lines_for_mode(
+        &self,
+        width: u16,
+        mode: HistoryRenderMode,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for cell in &self.transcript_cells {
-            lines.extend(cell.display_lines(width));
+            extend_surface_lines(&mut lines, cell.display_lines_for_mode(width, mode));
         }
         for active in &self.active_tools {
-            lines.extend(active.cell.display_lines(width));
+            extend_surface_lines(&mut lines, active.cell.display_lines_for_mode(width, mode));
         }
         if let Some(active) = &self.active_cell {
-            lines.extend(active.cell.display_lines(width));
+            extend_surface_lines(&mut lines, active.cell.display_lines_for_mode(width, mode));
         }
         lines
     }
 
     pub fn active_display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.active_display_lines_for_mode(width, HistoryRenderMode::Rich)
+    }
+
+    pub fn active_display_lines_for_mode(
+        &self,
+        width: u16,
+        mode: HistoryRenderMode,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for active in &self.active_tools {
-            lines.extend(active.cell.display_lines(width));
+            extend_surface_lines(&mut lines, active.cell.display_lines_for_mode(width, mode));
         }
         if let Some(active) = &self.active_cell {
-            lines.extend(active.cell.display_lines(width));
+            extend_surface_lines(&mut lines, active.cell.display_lines_for_mode(width, mode));
+        }
+        lines
+    }
+
+    pub fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        for cell in &self.transcript_cells {
+            extend_surface_lines(&mut lines, cell.transcript_lines(width));
+        }
+        for active in &self.active_tools {
+            extend_surface_lines(&mut lines, active.cell.transcript_lines(width));
+        }
+        if let Some(active) = &self.active_cell {
+            extend_surface_lines(&mut lines, active.cell.transcript_lines(width));
         }
         lines
     }
@@ -932,13 +2940,17 @@ impl ChatSurface {
             return None;
         }
         let mut lines = Vec::new();
-        for cell in self.pending_insert_cells.drain(..) {
-            lines.extend(cell.display_lines(width).into_iter().map(plain_line));
+        if self.pending_insert_needs_leading_separator {
+            lines.push(Line::default());
         }
+        for cell in self.pending_insert_cells.drain(..) {
+            extend_surface_lines(&mut lines, cell.display_lines(width));
+        }
+        self.pending_insert_needs_leading_separator = false;
         match mode {
-            InsertHistoryMode::Legacy => Some(PendingHistoryInsert::legacy(lines)),
+            InsertHistoryMode::Legacy => Some(PendingHistoryInsert::legacy_lines(lines)),
             InsertHistoryMode::InlineScrollback => {
-                Some(PendingHistoryInsert::inline_scrollback(lines))
+                Some(PendingHistoryInsert::inline_scrollback_lines(lines))
             }
         }
     }
@@ -1154,14 +3166,28 @@ impl ChatSurface {
         if cell.is_empty_control() {
             return;
         }
+        let has_prior_transcript = !self.transcript_cells.is_empty();
+        if self.pending_insert_cells.is_empty() && has_prior_transcript {
+            self.pending_insert_needs_leading_separator = true;
+        }
         self.pending_insert_cells.push(cell.clone());
         self.transcript_cells.push(cell);
     }
 }
 
+fn extend_surface_lines(out: &mut Vec<Line<'static>>, mut lines: Vec<Line<'static>>) {
+    if lines.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(Line::default());
+    }
+    out.append(&mut lines);
+}
+
 pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
     let mut cells = Vec::new();
-    let mut pending_exec_calls = HashMap::<ToolCallId, usize>::new();
+    let mut pending_exec_calls = HashMap::<ToolCallId, PendingExecReplay>::new();
     for message in messages {
         match message.role {
             Role::System => {
@@ -1193,15 +3219,21 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                                 .push(HistoryCellKind::Reasoning(ReasoningCell::new(text.clone())));
                         }
                         ContentBlock::ToolUse { id, name, input } => {
-                            if let Some(command) = exec_command_from_tool(name, input) {
+                            if let Some(mapping) = tool_exec_mapping_from_tool(name, input) {
                                 cells.push(HistoryCellKind::Exec(ExecCell::command_with_id(
                                     Some(TranscriptItemId::derived("exec", id)),
-                                    &command,
+                                    &mapping.command,
                                     TranscriptExecSource::Agent,
                                     TranscriptItemStatus::Complete,
                                 )));
                                 let index = cells.len().saturating_sub(1);
-                                pending_exec_calls.insert(id.clone(), index);
+                                pending_exec_calls.insert(
+                                    id.clone(),
+                                    PendingExecReplay {
+                                        index,
+                                        strip_read_line_numbers: mapping.strip_read_line_numbers,
+                                    },
+                                );
                             } else {
                                 cells.push(HistoryCellKind::Tool(ToolCell::calling(
                                     name,
@@ -1237,16 +3269,21 @@ pub fn cells_from_messages(messages: &[Message]) -> Vec<HistoryCellKind> {
                         } else {
                             TranscriptItemStatus::Complete
                         };
-                        if let Some(index) = pending_exec_calls.get(tool_use_id).copied()
-                            && let Some(HistoryCellKind::Exec(cell)) = cells.get_mut(index)
+                        if let Some(pending) = pending_exec_calls.get(tool_use_id).copied()
+                            && let Some(HistoryCellKind::Exec(cell)) = cells.get_mut(pending.index)
                         {
+                            let content = if pending.strip_read_line_numbers && !*is_error {
+                                strip_numbered_read_output(content)
+                            } else {
+                                content.clone()
+                            };
                             let item = TranscriptItem::new(
                                 Some(TranscriptItemId::derived("exec", tool_use_id)),
                                 TranscriptRole::Assistant,
                                 TranscriptItemKind::ExecCommand,
                                 status,
                                 TranscriptPayload::ExecOutput {
-                                    content: content.clone(),
+                                    content,
                                     is_error: *is_error,
                                     stream: TranscriptExecStream::Combined,
                                     untrusted: true,
@@ -1321,9 +3358,121 @@ fn cell_from_item(item: &TranscriptItem) -> Option<HistoryCellKind> {
             *is_error,
             item.status,
         ))),
-        TranscriptPayload::Permission { tool, reason, .. } => Some(HistoryCellKind::Notice(
-            NoticeCell::new(format!("permission: {tool} ({reason})")),
+        TranscriptPayload::PlanUpdate { explanation, steps } => {
+            Some(HistoryCellKind::PlanUpdate(PlanUpdateCell::new(
+                explanation.clone(),
+                steps
+                    .iter()
+                    .map(|step| PlanStep::new(step.step.clone(), PlanStepStatus::from(step.status)))
+                    .collect(),
+            )))
+        }
+        TranscriptPayload::WebSearch { query, detail } => {
+            let mut cell = WebSearchCell::searching(query.clone(), detail.clone());
+            cell.mark_status(item.status);
+            Some(HistoryCellKind::WebSearch(cell))
+        }
+        TranscriptPayload::McpToolCall {
+            server,
+            tool,
+            arguments,
+        } => {
+            let mut cell =
+                McpToolCell::calling(McpInvocation::new(server, tool, arguments.clone()));
+            cell.mark_status(item.status);
+            Some(HistoryCellKind::McpTool(cell))
+        }
+        TranscriptPayload::McpToolResult { output, is_error } => {
+            Some(HistoryCellKind::McpTool(McpToolCell::called(
+                McpInvocation::new("(unknown server)", "(unknown tool)", None),
+                output,
+                *is_error,
+            )))
+        }
+        TranscriptPayload::SessionHeader {
+            version,
+            model,
+            reasoning_effort,
+            directory,
+            yolo_mode,
+            show_fast_status,
+        } => Some(HistoryCellKind::SessionHeader(SessionHeaderCell::new(
+            version,
+            model,
+            reasoning_effort.clone(),
+            directory,
+            *yolo_mode,
+            *show_fast_status,
+        ))),
+        TranscriptPayload::UserInputResult {
+            questions,
+            answers,
+            interrupted,
+        } => Some(HistoryCellKind::RequestUserInput(
+            RequestUserInputCell::new(
+                questions.iter().map(UserInputQuestion::from).collect(),
+                answers.iter().map(UserInputAnswer::from).collect(),
+                *interrupted,
+            ),
         )),
+        TranscriptPayload::PatchSummary { changes } => Some(HistoryCellKind::PatchSummary(
+            PatchSummaryCell::new(changes.iter().map(PatchFileChange::from).collect()),
+        )),
+        TranscriptPayload::PatchApplyFailure { stderr } => Some(
+            HistoryCellKind::PatchApplyFailure(PatchApplyFailureCell::new(stderr)),
+        ),
+        TranscriptPayload::FinalSeparator {
+            elapsed_seconds,
+            metrics,
+        } => Some(HistoryCellKind::FinalSeparator(
+            FinalMessageSeparatorCell::new(*elapsed_seconds, metrics.clone()),
+        )),
+        TranscriptPayload::SpecialNotice {
+            kind,
+            title,
+            body,
+            hint,
+            links,
+        } => Some(HistoryCellKind::SpecialNotice(SpecialNoticeCell::new(
+            SpecialNoticeKind::from(*kind),
+            title,
+            body.clone(),
+            hint.clone(),
+            links.iter().map(SpecialNoticeLink::from).collect(),
+        ))),
+        TranscriptPayload::HookRun {
+            event,
+            status_message,
+            status,
+            entries,
+        } => Some(HistoryCellKind::Hook(HookCell::new(
+            event,
+            status_message.clone(),
+            HookStatus::from(*status),
+            entries.iter().map(HookOutputEntry::from).collect(),
+        ))),
+        TranscriptPayload::Permission {
+            tool,
+            reason,
+            input_summary,
+            ..
+        } => Some(HistoryCellKind::Approval(ApprovalCell::request(
+            tool,
+            reason,
+            input_summary,
+            item.status,
+        ))),
+        TranscriptPayload::ApprovalDecision {
+            allow,
+            tool,
+            reason,
+            input_summary,
+        } => Some(HistoryCellKind::Approval(ApprovalCell::decision(
+            tool,
+            reason,
+            input_summary,
+            *allow,
+        ))),
         TranscriptPayload::Notice { message } => {
             Some(HistoryCellKind::Notice(NoticeCell::new(message)))
         }
@@ -1331,6 +3480,77 @@ fn cell_from_item(item: &TranscriptItem) -> Option<HistoryCellKind> {
             Some(HistoryCellKind::Error(ErrorCell::new(message)))
         }
     }
+}
+
+fn line_visible_width(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| measure::width(span.content.as_ref()))
+        .sum()
+}
+
+fn plain_line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
+fn card_inner_width(width: u16, max_inner_width: usize) -> Option<usize> {
+    if width < 4 {
+        return None;
+    }
+    Some((width.saturating_sub(4) as usize).min(max_inner_width))
+}
+
+fn with_border(lines: Vec<Line<'static>>, forced_inner_width: usize) -> Vec<Line<'static>> {
+    let max_line_width = lines.iter().map(line_visible_width).max().unwrap_or(0);
+    let content_width = forced_inner_width.max(max_line_width);
+    let border_inner_width = content_width + 2;
+    let border_style = Style::default().add_modifier(Modifier::DIM);
+    let mut out = Vec::with_capacity(lines.len() + 2);
+    out.push(Line::from(Span::styled(
+        format!("╭{}╮", "─".repeat(border_inner_width)),
+        border_style,
+    )));
+
+    for line in lines {
+        let used_width = line_visible_width(&line);
+        let mut spans = Vec::with_capacity(line.spans.len() + 4);
+        spans.push(Span::styled("│ ", border_style));
+        spans.extend(line.spans);
+        if used_width < content_width {
+            spans.push(Span::styled(
+                " ".repeat(content_width - used_width),
+                border_style,
+            ));
+        }
+        spans.push(Span::styled(" │", border_style));
+        out.push(Line::from(spans));
+    }
+
+    out.push(Line::from(Span::styled(
+        format!("╰{}╯", "─".repeat(border_inner_width)),
+        border_style,
+    )));
+    out
+}
+
+fn format_mcp_invocation(invocation: &McpInvocation) -> Line<'static> {
+    let args = invocation
+        .arguments
+        .as_ref()
+        .map(|value| serde_json::to_string(value).unwrap_or_else(|_| value.to_string()))
+        .unwrap_or_default();
+
+    Line::from(vec![
+        Span::styled(invocation.server.clone(), Style::default().fg(Color::Cyan)),
+        Span::raw("."),
+        Span::styled(invocation.tool.clone(), Style::default().fg(Color::Cyan)),
+        Span::raw("("),
+        Span::styled(args, Style::default().add_modifier(Modifier::DIM)),
+        Span::raw(")"),
+    ])
 }
 
 fn text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
@@ -1377,60 +3597,139 @@ fn render_prefixed(
 }
 
 fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
-    let mut units = Vec::new();
-    for span in spans {
-        for grapheme in span.content.as_ref().graphemes(true) {
-            units.push((grapheme.to_string(), span.style, measure::width(grapheme)));
-        }
-    }
-    if units.is_empty() {
+    let tokens = wrap_tokens(spans);
+    if tokens.is_empty() {
         return vec![Vec::new()];
     }
 
     let mut out = Vec::new();
     let mut line = Vec::new();
     let mut line_width = 0usize;
-    let mut last_space = None;
-    for unit in units {
-        line_width = line_width.saturating_add(unit.2);
-        line.push(unit);
-        if line.last().is_some_and(|(text, _, _)| text == " ") {
-            last_space = Some(line.len() - 1);
-        }
-        if line_width > width {
-            if let Some(split_at) = last_space {
-                let rest = line.split_off(split_at + 1);
-                line.pop();
-                out.push(rebuild_spans(&line));
-                line = rest;
-            } else {
-                let overflow = line.pop();
+    for token in tokens {
+        let token_width = wrap_units_width(&token);
+        if is_url_like_token(&token) {
+            if !line.is_empty() && line_width.saturating_add(token_width) > width {
                 out.push(rebuild_spans(&line));
                 line.clear();
-                if let Some(unit) = overflow {
-                    line.push(unit);
-                }
+                line_width = 0;
             }
-            line_width = line.iter().map(|(_, _, width)| *width).sum();
-            last_space = None;
+            line_width = line_width.saturating_add(token_width);
+            line.extend(token);
+            continue;
         }
+
+        if token_width > width {
+            if !line.is_empty() {
+                out.push(rebuild_spans(&line));
+                line.clear();
+                line_width = 0;
+            }
+            let mut split = wrap_units_hard(&token, width);
+            if let Some(last) = split.pop() {
+                out.extend(split.into_iter().map(|units| rebuild_spans(&units)));
+                line_width = wrap_units_width(&last);
+                line = last;
+            }
+            continue;
+        }
+
+        if !line.is_empty() && line_width.saturating_add(token_width) > width {
+            out.push(rebuild_spans(&line));
+            line.clear();
+            line_width = 0;
+            if token
+                .iter()
+                .all(|unit| unit.text.chars().all(char::is_whitespace))
+            {
+                continue;
+            }
+        }
+        line_width = line_width.saturating_add(token_width);
+        line.extend(token);
     }
-    out.push(rebuild_spans(&line));
+    if !line.is_empty() {
+        out.push(rebuild_spans(&line));
+    }
+    if out.is_empty() {
+        out.push(Vec::new());
+    }
     out
 }
 
-fn rebuild_spans(units: &[(String, Style, usize)]) -> Vec<Span<'static>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WrapUnit {
+    text: String,
+    style: Style,
+    width: usize,
+}
+
+fn wrap_tokens(spans: &[Span<'static>]) -> Vec<Vec<WrapUnit>> {
+    let mut tokens: Vec<Vec<WrapUnit>> = Vec::new();
+    let mut current = Vec::new();
+    let mut current_whitespace = None;
+    for span in spans {
+        for grapheme in span.content.as_ref().graphemes(true) {
+            let is_whitespace = grapheme.chars().all(char::is_whitespace);
+            if current_whitespace.is_some_and(|known| known != is_whitespace) {
+                tokens.push(std::mem::take(&mut current));
+            }
+            current_whitespace = Some(is_whitespace);
+            current.push(WrapUnit {
+                text: grapheme.to_string(),
+                style: span.style,
+                width: measure::width(grapheme),
+            });
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn wrap_units_hard(units: &[WrapUnit], width: usize) -> Vec<Vec<WrapUnit>> {
+    let mut out = Vec::new();
+    let mut line = Vec::new();
+    let mut line_width = 0usize;
+    for unit in units {
+        if !line.is_empty() && line_width.saturating_add(unit.width) > width {
+            out.push(std::mem::take(&mut line));
+            line_width = 0;
+        }
+        line_width = line_width.saturating_add(unit.width);
+        line.push(unit.clone());
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    out
+}
+
+fn wrap_units_width(units: &[WrapUnit]) -> usize {
+    units.iter().map(|unit| unit.width).sum()
+}
+
+fn is_url_like_token(units: &[WrapUnit]) -> bool {
+    let text = units
+        .iter()
+        .map(|unit| unit.text.as_str())
+        .collect::<String>();
+    let text = text.trim_matches(|ch: char| matches!(ch, '(' | ')' | '[' | ']' | '{' | '}'));
+    text.starts_with("http://") || text.starts_with("https://") || text.starts_with("file://")
+}
+
+fn rebuild_spans(units: &[WrapUnit]) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut current_style = None;
     let mut buffer = String::new();
-    for (text, style, _) in units {
-        if current_style != Some(*style) {
+    for unit in units {
+        if current_style != Some(unit.style) {
             if let Some(style) = current_style.take() {
                 spans.push(Span::styled(std::mem::take(&mut buffer), style));
             }
-            current_style = Some(*style);
+            current_style = Some(unit.style);
         }
-        buffer.push_str(text);
+        buffer.push_str(&unit.text);
     }
     if let Some(style) = current_style {
         spans.push(Span::styled(buffer, style));
@@ -1658,26 +3957,52 @@ fn command_logical_lines(title: &str, command: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut command_lines = command.lines();
     let first = command_lines.next().unwrap_or("(unknown command)");
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{title} "),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(first.to_string()),
-    ]));
+    let mut spans = vec![Span::styled(
+        format!("{title} "),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(command_spans(first));
+    lines.push(Line::from(spans));
     lines.extend(command_lines.map(|line| Line::from(Span::raw(line.to_string()))));
     lines
 }
 
-fn operation_line(kind: &str, target: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            kind.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::raw(target.to_string()),
-    ])
+fn command_spans(command: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut first_token = true;
+    for token in command.split_inclusive(char::is_whitespace) {
+        let (body, trailing_space) = split_trailing_space(token);
+        if !body.is_empty() {
+            let style = if first_token {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if body.starts_with('-') {
+                Style::default().fg(Color::Magenta)
+            } else {
+                Style::default()
+            };
+            spans.push(Span::styled(body.to_string(), style));
+            first_token = false;
+        }
+        if !trailing_space.is_empty() {
+            spans.push(Span::raw(trailing_space.to_string()));
+        }
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(command.to_string()));
+    }
+    spans
+}
+
+fn split_trailing_space(token: &str) -> (&str, &str) {
+    let split = token
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .unwrap_or(0);
+    token.split_at(split)
 }
 
 fn bounded_exec_text(text: &str) -> String {
@@ -1710,7 +4035,7 @@ fn bound_exec_output_buffer(text: &str) -> String {
     format!("{head}{marker}{tail}")
 }
 
-fn bounded_output_lines(output: &str) -> Vec<String> {
+fn bounded_output_lines(output: &str, line_limit: usize) -> Vec<String> {
     let clean = bound_exec_output_buffer(output);
     let lines = clean
         .lines()
@@ -1718,97 +4043,132 @@ fn bounded_output_lines(output: &str) -> Vec<String> {
         .map(str::to_string)
         .collect::<Vec<_>>();
     let total = lines.len();
-    let edge_total = EXEC_OUTPUT_HEAD_LINES + EXEC_OUTPUT_TAIL_LINES;
-    if total <= edge_total + 1 {
+    if total <= line_limit {
         return lines;
     }
 
+    let head_lines = line_limit / 2;
+    let tail_lines = line_limit.saturating_sub(head_lines + 1);
     let mut out = Vec::new();
-    out.extend(lines.iter().take(EXEC_OUTPUT_HEAD_LINES).cloned());
-    out.push(format!("… +{} lines", total.saturating_sub(edge_total)));
-    out.extend(
-        lines
-            .iter()
-            .skip(total.saturating_sub(EXEC_OUTPUT_TAIL_LINES))
-            .cloned(),
-    );
+    out.extend(lines.iter().take(head_lines).cloned());
+    out.push(format!(
+        "… +{} lines (ctrl + t to view transcript)",
+        total.saturating_sub(head_lines + tail_lines)
+    ));
+    out.extend(lines.iter().skip(total.saturating_sub(tail_lines)).cloned());
     out
 }
 
-fn classify_exec_command(command: &str) -> ExecCommandKind {
-    let first_line = command.lines().next().unwrap_or(command).trim();
-    let parts = first_line.split_whitespace().collect::<Vec<_>>();
-    let Some(raw_program) = parts.first() else {
-        return ExecCommandKind::Run("(unknown command)".to_string());
-    };
-    let program = raw_program
-        .trim_matches(['"', '\''])
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(raw_program)
-        .to_ascii_lowercase();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingExecReplay {
+    index: usize,
+    strip_read_line_numbers: bool,
+}
 
-    match program.as_str() {
-        "cat" | "type" | "get-content" | "gc" => ExecCommandKind::Read(sanitize_exec_target(
-            last_non_option(&parts).unwrap_or(first_line),
-        )),
-        "sed" => ExecCommandKind::Read(sanitize_exec_target(
-            last_non_option(&parts).unwrap_or(first_line),
-        )),
-        "ls" | "dir" | "find" | "fd" | "get-childitem" | "gci" => {
-            ExecCommandKind::List(sanitize_exec_target(last_non_option(&parts).unwrap_or(".")))
-        }
-        "rg" | "grep" | "select-string" => ExecCommandKind::Search(sanitize_exec_target(
-            search_target(&parts).unwrap_or(first_line),
-        )),
-        _ => ExecCommandKind::Run(measure::truncate(first_line, MAX_EXEC_COMMAND_WIDTH)),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolExecMapping {
+    command: String,
+    strip_read_line_numbers: bool,
+}
+
+fn tool_exec_mapping_from_tool(name: &str, input: &Value) -> Option<ToolExecMapping> {
+    match name {
+        "bash" => input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| ToolExecMapping {
+                command: command.to_string(),
+                strip_read_line_numbers: false,
+            }),
+        "read" => input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| ToolExecMapping {
+                command: format!("Get-Content -Raw {}", display_shell_arg(path)),
+                strip_read_line_numbers: true,
+            }),
+        "glob" => input.get("pattern").and_then(Value::as_str).map(|pattern| {
+            let mut parts = vec!["Get-ChildItem".to_string(), "-Recurse".to_string()];
+            if let Some(path) = input.get("path").and_then(Value::as_str)
+                && !path.trim().is_empty()
+                && path.trim() != "."
+            {
+                parts.push(display_shell_arg(path));
+            }
+            parts.push("-Filter".to_string());
+            parts.push(display_shell_arg(pattern));
+            ToolExecMapping {
+                command: parts.join(" "),
+                strip_read_line_numbers: false,
+            }
+        }),
+        "grep" => input.get("pattern").and_then(Value::as_str).map(|pattern| {
+            let mut parts = vec!["rg".to_string(), display_shell_arg(pattern)];
+            if let Some(glob) = input.get("glob").and_then(Value::as_str)
+                && !glob.trim().is_empty()
+            {
+                parts.push("-g".to_string());
+                parts.push(display_shell_arg(glob));
+            }
+            if let Some(path) = input.get("path").and_then(Value::as_str)
+                && !path.trim().is_empty()
+            {
+                parts.push(display_shell_arg(path));
+            }
+            ToolExecMapping {
+                command: parts.join(" "),
+                strip_read_line_numbers: false,
+            }
+        }),
+        _ => None,
     }
 }
 
-fn sanitize_exec_target(target: &str) -> String {
-    let target = sanitize_label(target);
-    if target.is_empty() {
-        "(unknown)".to_string()
+fn display_shell_arg(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "\"\"".to_string();
+    }
+    if trimmed
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '`' | '(' | ')' | '[' | ']'))
+    {
+        format!("\"{}\"", trimmed.replace('"', "\\\""))
     } else {
-        target
+        trimmed.to_string()
     }
 }
 
-fn last_non_option<'a>(parts: &'a [&str]) -> Option<&'a str> {
-    parts
-        .iter()
-        .skip(1)
-        .rev()
-        .copied()
-        .find(|part| !part.starts_with('-'))
-}
-
-fn search_target<'a>(parts: &'a [&str]) -> Option<&'a str> {
-    parts
-        .iter()
-        .copied()
-        .skip(1)
-        .find(|part| !part.starts_with('-'))
-        .or_else(|| last_non_option(parts))
-}
-
-fn exec_command_from_tool(name: &str, input: &Value) -> Option<String> {
-    if name != "bash" {
-        return None;
+fn strip_numbered_read_output(content: &str) -> String {
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if let Some((prefix, body)) = line.split_once('\t')
+            && !prefix.is_empty()
+            && prefix.chars().all(|ch| ch.is_ascii_digit())
+        {
+            out.push(body.to_string());
+        } else {
+            out.push(line.to_string());
+        }
     }
-    input
-        .get("command")
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    if content.ends_with('\n') {
+        out.push(String::new());
+    }
+    out.join("\n")
 }
 
 fn is_tool_item(item: &TranscriptItem) -> bool {
     matches!(
         &item.payload,
-        TranscriptPayload::ToolCall { .. } | TranscriptPayload::ToolResult { .. }
+        TranscriptPayload::ToolCall { .. }
+            | TranscriptPayload::ToolResult { .. }
+            | TranscriptPayload::McpToolCall { .. }
+            | TranscriptPayload::McpToolResult { .. }
     ) || matches!(
         item.kind,
-        TranscriptItemKind::ToolCall | TranscriptItemKind::ToolResult
+        TranscriptItemKind::ToolCall
+            | TranscriptItemKind::ToolResult
+            | TranscriptItemKind::McpToolCall
     )
 }
 
@@ -1821,13 +4181,6 @@ fn is_exec_item(item: &TranscriptItem) -> bool {
 
 fn active_exec_should_defer(cell: &HistoryCellKind) -> bool {
     matches!(cell, HistoryCellKind::Exec(exec) if exec.should_defer_finalization())
-}
-
-fn plain_line(line: Line<'static>) -> String {
-    line.spans
-        .into_iter()
-        .map(|span| span.content.into_owned())
-        .collect()
 }
 
 fn bounded_sanitize(text: &str, max_chars: usize) -> String {
@@ -1969,6 +4322,364 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_wrap_keeps_url_tokens_intact() {
+        let url = "https://example.com/really/long/path";
+        let lines = render_prefixed(
+            &[Line::from(format!("see {url} now"))],
+            Span::raw("• "),
+            Span::raw("  "),
+            18,
+        );
+        let flat = flatten(&lines);
+
+        assert!(
+            flat.iter().any(|line| line.contains(url)),
+            "url token should remain intact: {flat:?}"
+        );
+    }
+
+    #[test]
+    fn chat_surface_exposes_raw_mode_and_transcript_lines() {
+        let mut surface = ChatSurface::new();
+        surface.apply_update(text_update(
+            TranscriptLifecycle::Completed,
+            Some(TranscriptItemId::local("assistant", 1)),
+            "**bold**",
+            TranscriptItemStatus::Complete,
+        ));
+        surface.apply_update(exec_command_update(
+            TranscriptLifecycle::Started,
+            Some(TranscriptItemId::local("exec", 2)),
+            "echo ok",
+            TranscriptItemStatus::Running,
+        ));
+        surface.apply_update(exec_output_update(
+            TranscriptLifecycle::Completed,
+            Some(TranscriptItemId::local("exec", 2)),
+            "ok",
+            false,
+            TranscriptItemStatus::Complete,
+        ));
+
+        let raw = flatten(&surface.display_lines_for_mode(80, HistoryRenderMode::Raw));
+        let transcript = flatten(&surface.transcript_lines(80));
+
+        assert!(raw.iter().any(|line| line == "**bold**"));
+        assert!(transcript.iter().any(|line| line == "$ echo ok"));
+        assert!(transcript.iter().any(|line| line == "succeeded"));
+    }
+
+    #[test]
+    fn codex_operational_cells_expose_plain_raw_lines() {
+        let cells = [
+            HistoryCellKind::SessionHeader(SessionHeaderCell::new(
+                "0.1.0",
+                "gpt-5-codex",
+                Some("high"),
+                "C:\\dev\\pyxis",
+                true,
+                true,
+            )),
+            HistoryCellKind::PlanUpdate(PlanUpdateCell::new(
+                Some("Port rendering parity"),
+                vec![
+                    PlanStep::new("map Codex cells", PlanStepStatus::Completed),
+                    PlanStep::new("wire Pyxis snapshots", PlanStepStatus::InProgress),
+                ],
+            )),
+            HistoryCellKind::WebSearch(WebSearchCell::searched(
+                "codex tui history_cell",
+                Some("plans.rs"),
+            )),
+            HistoryCellKind::McpTool(McpToolCell::called(
+                McpInvocation::new(
+                    "github",
+                    "list_issues",
+                    Some(serde_json::json!({ "state": "open" })),
+                ),
+                "issue #1",
+                false,
+            )),
+            HistoryCellKind::RequestUserInput(RequestUserInputCell::new(
+                vec![UserInputQuestion {
+                    id: "scope".into(),
+                    question: "Which scope?".into(),
+                    is_secret: false,
+                }],
+                vec![UserInputAnswer {
+                    question_id: "scope".into(),
+                    answers: vec!["All".into()],
+                }],
+                false,
+            )),
+            HistoryCellKind::FinalSeparator(FinalMessageSeparatorCell::new(
+                Some(75),
+                vec!["Local tools: 2 calls (3s)".to_string()],
+            )),
+            HistoryCellKind::PatchSummary(PatchSummaryCell::new(vec![PatchFileChange::new(
+                "src/lib.rs",
+                PatchChangeKind::Edited,
+                2,
+                1,
+                None,
+            )])),
+            HistoryCellKind::PatchApplyFailure(PatchApplyFailureCell::new("anchor missing")),
+            HistoryCellKind::SpecialNotice(SpecialNoticeCell::new(
+                SpecialNoticeKind::SafetyAccess,
+                "This content can't be shown",
+                Some("Eligible researchers can apply for Trusted Access."),
+                None::<String>,
+                vec![SpecialNoticeLink {
+                    label: "Learn more".into(),
+                    url: "https://help.openai.com/en/articles/20001326".into(),
+                }],
+            )),
+            HistoryCellKind::Hook(HookCell::completed(
+                "PostToolUse",
+                None::<String>,
+                HookStatus::Completed,
+                vec![HookOutputEntry::new(
+                    HookOutputKind::Warning,
+                    "format changed",
+                )],
+            )),
+        ];
+
+        let raw = cells
+            .iter()
+            .flat_map(|cell| flatten(&cell.display_lines_for_mode(80, HistoryRenderMode::Raw)))
+            .collect::<Vec<_>>();
+
+        assert!(raw.iter().any(|line| line == "Pyxis (v0.1.0)"));
+        assert!(raw.iter().any(|line| line == "Updated Plan"));
+        assert!(raw.iter().any(|line| line.contains("Searched the web")));
+        assert!(
+            raw.iter()
+                .any(|line| { line.contains("Ran github.list_issues({\"state\":\"open\"})") })
+        );
+        assert!(raw.iter().any(|line| line == "Questions 1/1 answered"));
+        assert!(raw.iter().any(|line| line.contains("Worked for 1m 15s")));
+        assert!(raw.iter().any(|line| line.contains("Edited src/lib.rs")));
+        assert!(raw.iter().any(|line| line == "Failed to apply patch"));
+        assert!(raw.iter().any(|line| line == "This content can't be shown"));
+        assert!(
+            raw.iter()
+                .any(|line| line.contains("PostToolUse hook (completed)"))
+        );
+        assert!(raw.iter().any(|line| line == "  warning: format changed"));
+    }
+
+    #[test]
+    fn chat_surface_maps_codex_operational_payloads() {
+        let mut surface = ChatSurface::new();
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(TranscriptItemId::local("session", 0)),
+                TranscriptRole::System,
+                TranscriptItemKind::SessionHeader,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::SessionHeader {
+                    version: "0.1.0".into(),
+                    model: "gpt-5-codex".into(),
+                    reasoning_effort: Some("high".into()),
+                    directory: "C:\\dev\\pyxis".into(),
+                    yolo_mode: false,
+                    show_fast_status: true,
+                },
+            ),
+        });
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(TranscriptItemId::local("plan", 1)),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::PlanUpdate,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::PlanUpdate {
+                    explanation: Some("Port cells".into()),
+                    steps: vec![crate::app_event::TranscriptPlanStep {
+                        step: "wire mapper".into(),
+                        status: crate::app_event::TranscriptPlanStepStatus::Completed,
+                    }],
+                },
+            ),
+        });
+        let web_id = TranscriptItemId::local("web", 2);
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Started,
+            item: TranscriptItem::new(
+                Some(web_id.clone()),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::WebSearch,
+                TranscriptItemStatus::Running,
+                TranscriptPayload::WebSearch {
+                    query: "codex tui".into(),
+                    detail: Some("history_cell".into()),
+                },
+            ),
+        });
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(web_id),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::WebSearch,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::WebSearch {
+                    query: "codex tui".into(),
+                    detail: Some("history_cell".into()),
+                },
+            ),
+        });
+        let mcp_id = TranscriptItemId::local("mcp", 3);
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Started,
+            item: TranscriptItem::new(
+                Some(mcp_id.clone()),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::McpToolCall,
+                TranscriptItemStatus::Running,
+                TranscriptPayload::McpToolCall {
+                    server: "github".into(),
+                    tool: "list_issues".into(),
+                    arguments: Some(serde_json::json!({ "state": "open" })),
+                },
+            ),
+        });
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(mcp_id),
+                TranscriptRole::Tool,
+                TranscriptItemKind::McpToolCall,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::McpToolResult {
+                    output: "issue #1".into(),
+                    is_error: false,
+                },
+            ),
+        });
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(TranscriptItemId::local("patch", 4)),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::PatchSummary,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::PatchSummary {
+                    changes: vec![crate::app_event::TranscriptPatchFileChange {
+                        path: "src/lib.rs".into(),
+                        move_path: None,
+                        kind: crate::app_event::TranscriptPatchChangeKind::Edited,
+                        added: 2,
+                        removed: 1,
+                    }],
+                },
+            ),
+        });
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(TranscriptItemId::local("questions", 5)),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::UserInputRequest,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::UserInputResult {
+                    questions: vec![crate::app_event::TranscriptUserInputQuestion {
+                        id: "scope".into(),
+                        question: "Which scope?".into(),
+                        is_secret: false,
+                    }],
+                    answers: vec![crate::app_event::TranscriptUserInputAnswer {
+                        question_id: "scope".into(),
+                        answers: vec!["All".into()],
+                    }],
+                    interrupted: false,
+                },
+            ),
+        });
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(TranscriptItemId::local("sep", 6)),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::FinalSeparator,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::FinalSeparator {
+                    elapsed_seconds: Some(75),
+                    metrics: vec!["Local tools: 2 calls (3s)".into()],
+                },
+            ),
+        });
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(TranscriptItemId::local("notice", 7)),
+                TranscriptRole::System,
+                TranscriptItemKind::SpecialNotice,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::SpecialNotice {
+                    kind: crate::app_event::TranscriptNoticeKind::SafetyAccess,
+                    title: "This content can't be shown".into(),
+                    body: Some("Eligible researchers can apply for Trusted Access.".into()),
+                    hint: None,
+                    links: vec![crate::app_event::TranscriptNoticeLink {
+                        label: "Learn more".into(),
+                        url: "https://help.openai.com/en/articles/20001326".into(),
+                    }],
+                },
+            ),
+        });
+        let hook_id = TranscriptItemId::local("hook", 8);
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Started,
+            item: TranscriptItem::new(
+                Some(hook_id.clone()),
+                TranscriptRole::System,
+                TranscriptItemKind::HookRun,
+                TranscriptItemStatus::Running,
+                TranscriptPayload::HookRun {
+                    event: "PreToolUse".into(),
+                    status_message: Some("checking command".into()),
+                    status: crate::app_event::TranscriptHookStatus::Running,
+                    entries: Vec::new(),
+                },
+            ),
+        });
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(hook_id),
+                TranscriptRole::System,
+                TranscriptItemKind::HookRun,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::HookRun {
+                    event: "PreToolUse".into(),
+                    status_message: None,
+                    status: crate::app_event::TranscriptHookStatus::Completed,
+                    entries: vec![crate::app_event::TranscriptHookOutputEntry {
+                        kind: crate::app_event::TranscriptHookOutputKind::Feedback,
+                        text: "allowed".into(),
+                    }],
+                },
+            ),
+        });
+
+        let text = flatten(&surface.display_lines(100)).join("\n");
+        assert!(text.contains("Pyxis"));
+        assert!(text.contains("Updated Plan"));
+        assert!(text.contains("Searched the web for history_cell"));
+        assert!(text.contains("Ran github.list_issues({\"state\":\"open\"})"));
+        assert!(text.contains("Edited src/lib.rs"));
+        assert!(text.contains("Questions 1/1 answered"));
+        assert!(text.contains("Worked for 1m 15s"));
+        assert!(text.contains("This content can't be shown"));
+        assert!(text.contains("PreToolUse hook (completed)"));
+        assert!(text.contains("feedback: allowed"));
+    }
+
+    #[test]
     fn parity_snapshot_matrix_covers_critical_flows() {
         let mut exec_done = ExecCell::command_with_id(
             Some(TranscriptItemId::local("exec", 1)),
@@ -2020,6 +4731,17 @@ mod tests {
         .expect("failed file change");
 
         let snapshots = vec![
+            cell_snapshot(
+                "session header",
+                HistoryCellKind::SessionHeader(SessionHeaderCell::new(
+                    "0.1.0",
+                    "gpt-5-codex",
+                    Some("high"),
+                    "C:\\dev\\pyxis",
+                    true,
+                    true,
+                )),
+            ),
             cell_snapshot(
                 "chat idle",
                 HistoryCellKind::Notice(NoticeCell::new("idle")),
@@ -2106,6 +4828,140 @@ mod tests {
                 HistoryCellKind::Notice(NoticeCell::new("permission : bash")),
             ),
             cell_snapshot(
+                "plan update",
+                HistoryCellKind::PlanUpdate(PlanUpdateCell::new(
+                    Some("Port Codex rendering"),
+                    vec![
+                        PlanStep::new("explore history_cell", PlanStepStatus::Completed),
+                        PlanStep::new("adapt missing cells", PlanStepStatus::InProgress),
+                        PlanStep::new("run gates", PlanStepStatus::Pending),
+                    ],
+                )),
+            ),
+            cell_snapshot(
+                "web search active",
+                HistoryCellKind::WebSearch(WebSearchCell::searching(
+                    "codex tui history_cell",
+                    Some("mcp.rs"),
+                )),
+            ),
+            cell_snapshot(
+                "web search complete",
+                HistoryCellKind::WebSearch(WebSearchCell::searched(
+                    "codex tui history_cell",
+                    Some("plans.rs"),
+                )),
+            ),
+            cell_snapshot(
+                "mcp calling",
+                HistoryCellKind::McpTool(McpToolCell::calling(McpInvocation::new(
+                    "github",
+                    "list_pull_requests",
+                    Some(serde_json::json!({ "owner": "openai" })),
+                ))),
+            ),
+            cell_snapshot(
+                "mcp called",
+                HistoryCellKind::McpTool(McpToolCell::called(
+                    McpInvocation::new(
+                        "github",
+                        "list_issues",
+                        Some(serde_json::json!({ "state": "open" })),
+                    ),
+                    "issue #1\nissue #2",
+                    false,
+                )),
+            ),
+            cell_snapshot(
+                "request user input",
+                HistoryCellKind::RequestUserInput(RequestUserInputCell::new(
+                    vec![
+                        UserInputQuestion {
+                            id: "scope".into(),
+                            question: "Which scope?".into(),
+                            is_secret: false,
+                        },
+                        UserInputQuestion {
+                            id: "token".into(),
+                            question: "Secret token?".into(),
+                            is_secret: true,
+                        },
+                    ],
+                    vec![
+                        UserInputAnswer {
+                            question_id: "scope".into(),
+                            answers: vec!["All".into(), "user_note: include snapshots".into()],
+                        },
+                        UserInputAnswer {
+                            question_id: "token".into(),
+                            answers: vec!["secret".into()],
+                        },
+                    ],
+                    false,
+                )),
+            ),
+            cell_snapshot(
+                "final separator",
+                HistoryCellKind::FinalSeparator(FinalMessageSeparatorCell::new(
+                    Some(75),
+                    vec!["Local tools: 2 calls (3s)".to_string()],
+                )),
+            ),
+            cell_snapshot(
+                "patch summary",
+                HistoryCellKind::PatchSummary(PatchSummaryCell::new(vec![
+                    PatchFileChange::new(
+                        "src/lib.rs",
+                        PatchChangeKind::Edited,
+                        2,
+                        1,
+                        crate::diff::from_tool(
+                            "edit",
+                            &serde_json::json!({
+                                "old_string": "old()\n",
+                                "new_string": "new()\n",
+                            }),
+                        ),
+                    ),
+                    PatchFileChange::new("src/new.rs", PatchChangeKind::Added, 1, 0, None),
+                ])),
+            ),
+            cell_snapshot(
+                "patch failure",
+                HistoryCellKind::PatchApplyFailure(PatchApplyFailureCell::new(
+                    "could not find anchor",
+                )),
+            ),
+            cell_snapshot(
+                "special notice",
+                HistoryCellKind::SpecialNotice(SpecialNoticeCell::new(
+                    SpecialNoticeKind::SafetyAccess,
+                    "This content can't be shown",
+                    Some("Eligible researchers can apply for Trusted Access."),
+                    None::<String>,
+                    vec![SpecialNoticeLink {
+                        label: "Learn more".into(),
+                        url: "https://help.openai.com/en/articles/20001326".into(),
+                    }],
+                )),
+            ),
+            cell_snapshot(
+                "hook running",
+                HistoryCellKind::Hook(HookCell::running("PreToolUse", Some("checking command"))),
+            ),
+            cell_snapshot(
+                "hook completed",
+                HistoryCellKind::Hook(HookCell::completed(
+                    "PostToolUse",
+                    None::<String>,
+                    HookStatus::Completed,
+                    vec![HookOutputEntry::new(
+                        HookOutputKind::Feedback,
+                        "allowed\nwith context",
+                    )],
+                )),
+            ),
+            cell_snapshot(
                 "queue input resize",
                 HistoryCellKind::Composite(CompositeCell::new(vec![
                     HistoryCellKind::User(UserCell::new("queued")),
@@ -2114,7 +4970,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(snapshots.len(), 20);
+        assert_eq!(snapshots.len(), 33);
         for (name, text) in snapshots {
             assert!(!text.trim().is_empty(), "empty snapshot for {name}");
         }
@@ -2167,6 +5023,52 @@ mod tests {
                 .drain_pending_insert(20, InsertHistoryMode::InlineScrollback)
                 .is_none(),
             "resize without new finalization must not duplicate inserts"
+        );
+    }
+
+    #[test]
+    fn pending_insert_keeps_breathing_between_incremental_cells() {
+        let mut surface = ChatSurface::new();
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(TranscriptItemId::local("user", 1)),
+                TranscriptRole::User,
+                TranscriptItemKind::UserMessage,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::Text {
+                    delta: "first block".into(),
+                },
+            ),
+        });
+
+        let first = surface
+            .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
+            .expect("first insert");
+        assert_ne!(first.lines[0].as_str(), "");
+
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(TranscriptItemId::local("assistant", 2)),
+                TranscriptRole::Assistant,
+                TranscriptItemKind::AssistantMessage,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::Text {
+                    delta: "second block".into(),
+                },
+            ),
+        });
+
+        let second = surface
+            .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
+            .expect("second insert");
+        assert_eq!(second.lines[0].as_str(), "");
+        assert!(
+            second
+                .lines
+                .iter()
+                .any(|line| line.as_str().contains("second block"))
         );
     }
 
@@ -2347,9 +5249,9 @@ mod tests {
         ));
 
         let text = flatten(&surface.display_lines(100)).join("\n");
-        let explored = text.find("Explored").expect("explored cell");
+        let search = text.find("Ran rg shimmer").expect("search cell");
         let ran = text.find("Ran echo after").expect("run cell");
-        assert!(explored < ran);
+        assert!(search < ran);
     }
 
     #[test]
@@ -2379,7 +5281,7 @@ mod tests {
     }
 
     #[test]
-    fn exploratory_exec_commands_group_until_boundary() {
+    fn exploratory_exec_commands_render_as_individual_runs() {
         let mut surface = ChatSurface::new();
         for (id, command) in [
             ("call-1", "rg shimmer_spans"),
@@ -2402,11 +5304,13 @@ mod tests {
             ));
         }
 
-        assert_eq!(surface.transcript_cells().len(), 0);
+        assert_eq!(surface.transcript_cells().len(), 3);
         let active = flatten(&surface.active_display_lines(100)).join("\n");
-        assert!(active.contains("Explored"));
-        assert!(active.contains("Search shimmer_spans"));
-        assert!(active.contains("Read shimmer.rs, status_indicator_widget.rs"));
+        assert!(active.is_empty());
+        let text = flatten(&surface.display_lines(100)).join("\n");
+        assert!(text.contains("Ran rg shimmer_spans"));
+        assert!(text.contains("Ran cat shimmer.rs"));
+        assert!(text.contains("Ran cat status_indicator_widget.rs"));
 
         surface.apply_update(TranscriptUpdate {
             lifecycle: TranscriptLifecycle::Completed,
@@ -2419,7 +5323,7 @@ mod tests {
             ),
         });
 
-        assert_eq!(surface.transcript_cells().len(), 1);
+        assert_eq!(surface.transcript_cells().len(), 3);
         assert!(surface.active_cell().is_none());
     }
 
@@ -2606,7 +5510,7 @@ mod tests {
         assert!(text.contains("salut"));
         assert!(text.contains("plan"));
         assert!(text.contains("voici"));
-        assert!(text.contains("Read(a.rs)"));
+        assert!(text.contains("Ran Get-Content -Raw a.rs"));
         assert!(text.contains("contenu"));
         let initial = surface
             .drain_pending_insert(80, InsertHistoryMode::InlineScrollback)
@@ -2866,6 +5770,54 @@ mod tests {
         assert!(text.contains("Edited src/lib.rs"));
         assert!(text.contains("old()"));
         assert!(text.contains("new()"));
+    }
+
+    #[test]
+    fn permission_request_finalizes_as_approval_decision_cell() {
+        let mut surface = ChatSurface::new();
+        let id = TranscriptItemId::derived("permission", "call-1");
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Started,
+            item: TranscriptItem::new(
+                Some(id.clone()),
+                TranscriptRole::System,
+                TranscriptItemKind::PermissionRequest,
+                TranscriptItemStatus::Pending,
+                TranscriptPayload::Permission {
+                    tool: "bash".into(),
+                    reason: "writes workspace files".into(),
+                    taint_forced: false,
+                    input_summary: "cargo test".into(),
+                    mode: "ask".into(),
+                    input: serde_json::json!({ "command": "cargo test" }),
+                },
+            ),
+        });
+
+        let active = flatten(&surface.active_display_lines(100)).join("\n");
+        assert!(active.contains("Approval requested"));
+        assert!(active.contains("cargo test"));
+
+        surface.apply_update(TranscriptUpdate {
+            lifecycle: TranscriptLifecycle::Completed,
+            item: TranscriptItem::new(
+                Some(id),
+                TranscriptRole::System,
+                TranscriptItemKind::ApprovalDecision,
+                TranscriptItemStatus::Failed,
+                TranscriptPayload::ApprovalDecision {
+                    allow: false,
+                    tool: "bash".into(),
+                    reason: "writes workspace files".into(),
+                    input_summary: "cargo test".into(),
+                },
+            ),
+        });
+
+        assert!(surface.active_cell().is_none());
+        let text = flatten(&surface.display_lines(100)).join("\n");
+        assert!(text.contains("Denied bash"));
+        assert!(text.contains("writes workspace files"));
     }
 
     #[test]

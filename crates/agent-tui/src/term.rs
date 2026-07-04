@@ -3,10 +3,13 @@
 
 use std::io::{self, Stdout};
 
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use crossterm::cursor::MoveTo;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+#[cfg(not(feature = "codex_tui_parity"))]
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
+#[cfg(feature = "codex_tui_parity")]
+use crossterm::terminal::{Clear, ClearType, size};
 #[cfg(not(feature = "codex_tui_parity"))]
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -16,12 +19,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::{TerminalOptions, Viewport};
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
-#[cfg(feature = "codex_tui_parity")]
-const PARITY_INLINE_HEIGHT: u16 = 12;
 
-/// Entre en mode plein écran (raw + alt screen + capture souris). La capture
-/// souris route la molette vers l'app (scroll du transcript) ; contrepartie : la
-/// sélection au clic-glissé passe par Shift (la copie native n'est plus directe).
+/// Entre en mode terminal interactif. Le chemin historique utilise l'alt-screen
+/// avec capture souris ; le chemin parity garde le scrollback terminal natif.
 pub fn enter() -> io::Result<Tui> {
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -36,7 +36,14 @@ pub fn enter() -> io::Result<Tui> {
         return Err(e);
     }
     #[cfg(feature = "codex_tui_parity")]
-    if let Err(e) = execute!(out, EnableMouseCapture, EnableBracketedPaste) {
+    let inline_height = size().map(|(_, rows)| rows.max(1)).unwrap_or(24);
+    #[cfg(feature = "codex_tui_parity")]
+    if let Err(e) = execute!(
+        out,
+        EnableBracketedPaste,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    ) {
         let _ = disable_raw_mode();
         return Err(e);
     }
@@ -46,7 +53,7 @@ pub fn enter() -> io::Result<Tui> {
     let terminal = Terminal::with_options(
         CrosstermBackend::new(out),
         TerminalOptions {
-            viewport: Viewport::Inline(PARITY_INLINE_HEIGHT),
+            viewport: Viewport::Inline(inline_height),
         },
     );
     match terminal {
@@ -61,7 +68,7 @@ pub fn enter() -> io::Result<Tui> {
                 LeaveAlternateScreen
             );
             #[cfg(feature = "codex_tui_parity")]
-            let _ = execute!(out, DisableBracketedPaste, DisableMouseCapture);
+            let _ = execute!(out, DisableBracketedPaste);
             let _ = disable_raw_mode();
             Err(e)
         }
@@ -81,11 +88,7 @@ pub fn leave(tui: &mut Tui) -> io::Result<()> {
         first_err = Some(e);
     }
     #[cfg(feature = "codex_tui_parity")]
-    if let Err(e) = execute!(
-        tui.backend_mut(),
-        DisableBracketedPaste,
-        DisableMouseCapture
-    ) {
+    if let Err(e) = execute!(tui.backend_mut(), DisableBracketedPaste) {
         first_err = Some(e);
     }
     if let Err(e) = disable_raw_mode()

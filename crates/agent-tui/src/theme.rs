@@ -71,6 +71,16 @@ impl Theme {
             Style::default().add_modifier(Modifier::REVERSED)
         }
     }
+    /// Fond du composer Codex-like: bloc plein, pas de filet coloré.
+    pub fn composer(&self) -> Style {
+        if self.truecolor {
+            Style::default()
+                .fg(Color::Rgb(0xe4, 0xe4, 0xe4))
+                .bg(Color::Rgb(0x33, 0x33, 0x35))
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        }
+    }
     /// Surbrillance d'un `/skill` inséré dans l'input : pastille teal sur fond sombre.
     pub fn skill_chip(&self) -> Style {
         if self.truecolor {

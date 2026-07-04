@@ -30,16 +30,22 @@ pub mod state;
 pub mod streaming;
 pub mod term;
 #[cfg(feature = "codex_tui_parity")]
+pub mod terminal_hyperlinks;
+#[cfg(feature = "codex_tui_parity")]
 pub mod terminal_viewport;
 pub mod theme;
 mod tool;
 
 #[cfg(feature = "codex_tui_parity")]
 pub use app_event::{
-    AppDispatchOutcome, AppEvent as TuiAppEvent, AppEventDispatcher, TranscriptExecSource,
-    TranscriptExecStream, TranscriptItem, TranscriptItemId, TranscriptItemKind,
-    TranscriptItemStatus, TranscriptLifecycle, TranscriptMapper, TranscriptPayload, TranscriptRole,
-    TranscriptToolErrorKind, TranscriptUpdate,
+    AppDispatchOutcome, AppEvent as TuiAppEvent, AppEventDispatcher, PermissionTranscriptRequest,
+    TranscriptExecSource, TranscriptExecStream, TranscriptHookOutputEntry,
+    TranscriptHookOutputKind, TranscriptHookStatus, TranscriptItem, TranscriptItemId,
+    TranscriptItemKind, TranscriptItemStatus, TranscriptLifecycle, TranscriptMapper,
+    TranscriptNoticeKind, TranscriptNoticeLink, TranscriptPatchChangeKind,
+    TranscriptPatchFileChange, TranscriptPayload, TranscriptPlanStep, TranscriptPlanStepStatus,
+    TranscriptRole, TranscriptToolErrorKind, TranscriptUpdate, TranscriptUserInputAnswer,
+    TranscriptUserInputQuestion,
 };
 #[cfg(feature = "codex_tui_parity")]
 pub use bottom_pane::{
@@ -47,9 +53,13 @@ pub use bottom_pane::{
 };
 #[cfg(feature = "codex_tui_parity")]
 pub use history_cell::{
-    ActiveHistoryCell, AgentMarkdownCell, ChatSurface, CompositeCell, ErrorCell, ExecCell,
-    FileChangeCell, HistoryCell, HistoryCellKind, NoticeCell, ReasoningCell, ToolCell, UserCell,
-    cells_from_messages,
+    ActiveHistoryCell, AgentMarkdownCell, ApprovalCell, ChatSurface, CompositeCell, ErrorCell,
+    ExecCell, FileChangeCell, FinalMessageSeparatorCell, HistoryCell, HistoryCellKind, HookCell,
+    HookOutputEntry, HookOutputKind, HookStatus, McpInvocation, McpToolCell, NoticeCell,
+    PatchApplyFailureCell, PatchChangeKind, PatchFileChange, PatchSummaryCell, PlanStep,
+    PlanStepStatus, PlanUpdateCell, ReasoningCell, RequestUserInputCell, SessionHeaderCell,
+    SpecialNoticeCell, SpecialNoticeKind, SpecialNoticeLink, ToolCell, UserCell, UserInputAnswer,
+    UserInputQuestion, WebSearchCell, cells_from_messages,
 };
 #[cfg(feature = "codex_tui_parity")]
 pub use insert_history::{

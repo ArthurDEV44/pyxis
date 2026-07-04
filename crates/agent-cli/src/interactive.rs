@@ -22,8 +22,8 @@ use agent_tui::{
 };
 #[cfg(feature = "codex_tui_parity")]
 use agent_tui::{
-    BottomPane, ChatSurface, HistoryInserter, InsertHistoryMode, TerminalViewport,
-    TerminalViewportState, TranscriptMapper,
+    BottomPane, ChatSurface, HistoryInserter, InsertHistoryMode, PermissionTranscriptRequest,
+    TerminalViewport, TerminalViewportState, TranscriptMapper,
 };
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 use futures_util::StreamExt;
@@ -324,8 +324,9 @@ async fn event_loop(
     let mut state = AppState::new(cfg.model.clone(), cfg.truecolor);
     state.workspace = std::env::current_dir()
         .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+    state.reasoning_effort = Some(agent_provider::DEFAULT_REASONING_EFFORT.to_string());
     state.provider_connected = cfg.connected;
     state.reduced_motion = cfg.reduced_motion;
     state.skills = std::mem::take(&mut cfg.skills);
@@ -415,7 +416,7 @@ async fn event_loop(
         #[cfg(feature = "codex_tui_parity")]
         {
             let size = tui.size()?;
-            parity_viewport.resize(size.width, size.height, size.height.min(12));
+            parity_viewport.resize(size.width, size.height, size.height);
             if parity_inserter.mode() == InsertHistoryMode::InlineScrollback
                 && let Some(insert) =
                     parity_surface.drain_pending_insert(size.width, parity_inserter.mode())
@@ -777,6 +778,8 @@ async fn event_loop(
                         if let Some(resp) = pending_resp.take() {
                             let _ = resp.send(allow);
                         }
+                        #[cfg(feature = "codex_tui_parity")]
+                        parity_surface.apply_update(parity_mapper.map_approval_decision(allow));
                     }
                     _ => {}
                 }
@@ -854,6 +857,20 @@ async fn event_loop(
             perm = perm_rx.recv() => {
                 if let Some((req, resp)) = perm {
                     state.pending = Some(to_prompt(&req));
+                    #[cfg(feature = "codex_tui_parity")]
+                    {
+                        for update in parity_mapper.map_permission_request(PermissionTranscriptRequest {
+                            call_id: req.call_id.clone(),
+                            tool: req.tool.clone(),
+                            reason: req.reason.clone(),
+                            taint_forced: req.taint_forced,
+                            input_summary: req.input_summary.clone(),
+                            mode: req.mode.clone(),
+                            input: req.input.clone(),
+                        }) {
+                            parity_surface.apply_update(update);
+                        }
+                    }
                     pending_resp = Some(resp);
                 }
             }
