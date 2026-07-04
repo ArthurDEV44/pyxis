@@ -81,25 +81,25 @@ pub const OPENAI_BETA_SSE: &str = "responses=experimental";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    #[error("erreur HTTP : {0}")]
+    #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("réponse token invalide : {0}")]
+    #[error("invalid token response: {0}")]
     TokenResponse(String),
-    #[error("JWT illisible : {0}")]
+    #[error("unreadable JWT: {0}")]
     Jwt(String),
-    #[error("chatgpt_account_id absent du token")]
+    #[error("chatgpt_account_id missing from token")]
     MissingAccountId,
-    #[error("credential provider inattendu : {0:?}")]
+    #[error("unexpected credential provider: {0:?}")]
     WrongProvider(ProviderId),
-    #[error("callback OAuth : {0}")]
+    #[error("OAuth callback: {0}")]
     Callback(String),
-    #[error("state OAuth ne correspond pas (anti-CSRF)")]
+    #[error("OAuth state mismatch (anti-CSRF)")]
     StateMismatch,
-    #[error("device flow expiré (900 s)")]
+    #[error("device flow expired (900 s)")]
     DeviceTimeout,
-    #[error("device flow refusé : {0}")]
+    #[error("device flow denied: {0}")]
     DeviceDenied(String),
-    #[error("io : {0}")]
+    #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
 
@@ -194,10 +194,10 @@ pub fn parse_callback_request_line(
     let target = line
         .split_whitespace()
         .nth(1)
-        .ok_or_else(|| AuthError::Callback("ligne de requête HTTP invalide".to_string()))?;
+        .ok_or_else(|| AuthError::Callback("invalid HTTP request line".to_string()))?;
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != "/auth/callback" {
-        return Err(AuthError::Callback(format!("path inattendu : {path}")));
+        return Err(AuthError::Callback(format!("unexpected path: {path}")));
     }
 
     let mut code = None;
@@ -210,11 +210,11 @@ pub fn parse_callback_request_line(
         }
     }
 
-    let state = state.ok_or_else(|| AuthError::Callback("state manquant".to_string()))?;
+    let state = state.ok_or_else(|| AuthError::Callback("missing state".to_string()))?;
     if state != expected_state {
         return Err(AuthError::StateMismatch);
     }
-    let code = code.ok_or_else(|| AuthError::Callback("code manquant".to_string()))?;
+    let code = code.ok_or_else(|| AuthError::Callback("missing code".to_string()))?;
     Ok(CallbackResult { code, state })
 }
 
@@ -264,7 +264,7 @@ pub fn classify_device_poll(
                 code_verifier: v.to_string(),
             }),
             _ => Err(AuthError::TokenResponse(
-                "device 200 sans authorization_code/code_verifier".to_string(),
+                "device 200 without authorization_code/code_verifier".to_string(),
             )),
         };
     }
@@ -399,7 +399,7 @@ fn random_state() -> String {
 pub async fn login_browser(client: &reqwest::Client) -> Result<OAuthCredential, AuthError> {
     login_browser_with_notice(client, |url, opened| {
         if !opened {
-            println!("Ouvre cette URL pour autoriser Pyxis :\n{url}");
+            println!("Open this URL to authorize Pyxis:\n{url}");
         }
     })
     .await
@@ -424,11 +424,11 @@ where
 
     let cb = tokio::time::timeout(CALLBACK_TIMEOUT, accept_callback(&listener, &state))
         .await
-        .map_err(|_| AuthError::Callback("callback OAuth expiré".to_string()))??;
+        .map_err(|_| AuthError::Callback("OAuth callback expired".to_string()))??;
     exchange_code(client, &cb.code, &pkce.verifier, REDIRECT_URI, now_ms()).await
 }
 
-const SUCCESS_BODY: &str = "<!doctype html><meta charset=utf-8><body style=\"font-family:system-ui;background:#0b0b0b;color:#eaeaea;display:grid;place-items:center;height:100vh\"><div><h2>Pyxis — connecté</h2><p>Tu peux fermer cet onglet.</p></div></body>";
+const SUCCESS_BODY: &str = "<!doctype html><meta charset=utf-8><body style=\"font-family:system-ui;background:#0b0b0b;color:#eaeaea;display:grid;place-items:center;height:100vh\"><div><h2>Pyxis connected</h2><p>You can close this tab.</p></div></body>";
 
 /// Accepte des connexions jusqu'à recevoir un callback `/auth/callback` valide.
 /// Les requêtes parasites (favicon, etc.) reçoivent un 404 et la boucle continue.
@@ -473,11 +473,11 @@ async fn accept_callback_with_read_timeout(
                 let _ = sock.flush().await;
                 return Ok(cb);
             }
-            // requête non pertinente → 404, on continue d'écouter
+            // Irrelevant request: return 404 and keep listening.
             Err(AuthError::Callback(_)) => {
                 let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
             }
-            // state mismatch (ou autre) → on coupe proprement
+            // State mismatch or another callback error: stop cleanly.
             Err(e) => {
                 let _ = sock.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                 return Err(e);
@@ -538,7 +538,7 @@ pub async fn start_device(
     let device_auth_id = v
         .get("device_auth_id")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| AuthError::TokenResponse("device_auth_id absent".to_string()))?
+        .ok_or_else(|| AuthError::TokenResponse("missing device_auth_id".to_string()))?
         .to_string();
     let user_code = v
         .get("user_code")

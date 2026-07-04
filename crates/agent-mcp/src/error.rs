@@ -10,7 +10,7 @@ pub enum McpError {
     Read(PathBuf, std::io::Error),
     #[error("JSON invalide dans {0} : {1}")]
     Parse(PathBuf, serde_json::Error),
-    #[error("serveur « {server} » : échec du démarrage du process : {source}")]
+    #[error("server \"{server}\": failed to start process: {source}")]
     Spawn {
         server: String,
         source: std::io::Error,

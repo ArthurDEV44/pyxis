@@ -24,7 +24,8 @@ use futures_util::stream::{self, StreamExt};
 
 use crate::error::ToolError;
 use crate::permission::{
-    Approver, AutoDeny, PermCtx, PermissionMode, PermissionRequest, Resolved, resolve_permission,
+    Approver, AutoDeny, PermCtx, PermissionMode, PermissionModeState, PermissionRequest, Resolved,
+    resolve_permission,
 };
 use crate::taint::TaintTracker;
 use crate::tool::{DynTool, ToolCtx, into_dyn};
@@ -38,7 +39,7 @@ const CONCURRENCY: usize = 10;
 /// dans le cœur comme `Arc<dyn ToolDispatch>`.
 pub struct Registry {
     tools: HashMap<String, Box<dyn DynTool>>,
-    mode: PermissionMode,
+    mode: PermissionModeState,
     approver: Arc<dyn Approver>,
     taint: TaintTracker,
     ctx: ToolCtx,
@@ -48,7 +49,7 @@ impl Registry {
     pub fn builder(workspace: impl Into<std::path::PathBuf>) -> RegistryBuilder {
         RegistryBuilder {
             tools: HashMap::new(),
-            mode: PermissionMode::default(),
+            mode: PermissionModeState::default(),
             approver: None,
             taint_window: crate::taint::DEFAULT_WINDOW,
             initial_taint_recent: false,
@@ -57,7 +58,11 @@ impl Registry {
     }
 
     pub fn mode(&self) -> PermissionMode {
-        self.mode
+        self.mode.get()
+    }
+
+    pub fn set_mode(&self, mode: PermissionMode) {
+        self.mode.set(mode);
     }
 
     /// Le taint est-il récent ? (exposé pour les tests / l'observabilité.)
@@ -122,7 +127,7 @@ impl Registry {
         let Some(tool) = self.tools.get(&call.name) else {
             return err_outcome(
                 id,
-                format!("outil inconnu: {}", call.name),
+                format!("unknown tool: {}", call.name),
                 ToolErrorKind::UnknownTool,
             );
         };
@@ -133,13 +138,14 @@ impl Registry {
         }
 
         // 2. permission : baseline outil mise en forme par mode + taint (§4.4/4.6).
+        let mode = self.mode();
         let pctx = PermCtx {
-            mode: self.mode,
+            mode,
             taint_recent: self.taint.is_recent(),
         };
         let baseline = tool.permission(&call.input, &pctx);
         let resolved = resolve_permission(
-            self.mode,
+            mode,
             baseline,
             tool.is_read_only(),
             tool.is_sensitive(),
@@ -150,10 +156,7 @@ impl Registry {
             Resolved::Deny => {
                 return err_outcome(
                     id,
-                    format!(
-                        "permission refusée pour « {} » (mode {:?})",
-                        call.name, self.mode
-                    ),
+                    format!("permission denied for \"{}\" (mode {:?})", call.name, mode),
                     ToolErrorKind::PermissionDenied,
                 );
             }
@@ -164,7 +167,7 @@ impl Registry {
                     tool: call.name.clone(),
                     reason: ask_reason(taint_forced),
                     taint_forced,
-                    mode: format!("{:?}", self.mode),
+                    mode: format!("{mode:?}"),
                     input_summary: summarize(&call.input),
                     input: call.input.clone(),
                 };
@@ -180,7 +183,7 @@ impl Registry {
                 if !self.approver.approve(&req).await {
                     return err_outcome(
                         id,
-                        format!("action « {} » refusée par l'utilisateur", call.name),
+                        format!("action \"{}\" rejected by user", call.name),
                         ToolErrorKind::PermissionDenied,
                     );
                 }
@@ -236,12 +239,13 @@ impl Registry {
         if tool.precheck(&call.input).is_err() {
             return true;
         }
+        let mode = self.mode();
         let pctx = PermCtx {
-            mode: self.mode,
+            mode,
             taint_recent: self.taint.is_recent(),
         };
         let resolved = resolve_permission(
-            self.mode,
+            mode,
             tool.permission(&call.input, &pctx),
             tool.is_read_only(),
             tool.is_sensitive(),
@@ -347,9 +351,9 @@ fn err_outcome_tainted(
 
 fn ask_reason(taint_forced: bool) -> String {
     if taint_forced {
-        "action sensible issue de contenu non fiable (défense injection)".to_string()
+        "sensitive action derived from untrusted content (injection defense)".to_string()
     } else {
-        "action sensible nécessitant confirmation".to_string()
+        "sensitive action requires confirmation".to_string()
     }
 }
 
@@ -378,7 +382,7 @@ fn truncate_utf8_prefix(s: &str, max: usize) -> &str {
 /// sans interlocuteur explicite, toute confirmation échoue).
 pub struct RegistryBuilder {
     tools: HashMap<String, Box<dyn DynTool>>,
-    mode: PermissionMode,
+    mode: PermissionModeState,
     approver: Option<Arc<dyn Approver>>,
     taint_window: u64,
     initial_taint_recent: bool,
@@ -386,7 +390,11 @@ pub struct RegistryBuilder {
 }
 
 impl RegistryBuilder {
-    pub fn mode(mut self, mode: PermissionMode) -> Self {
+    pub fn mode(self, mode: PermissionMode) -> Self {
+        self.mode.set(mode);
+        self
+    }
+    pub fn mode_state(mut self, mode: PermissionModeState) -> Self {
         self.mode = mode;
         self
     }

@@ -39,7 +39,7 @@ impl ContextBudget {
         }
         if output_reserve >= max_context {
             return Err(format!(
-                "max_output_tokens ({output_reserve}) doit rester inférieur au contexte ({max_context})"
+                "max_output_tokens ({output_reserve}) must be lower than context ({max_context})"
             ));
         }
         Ok(Self::for_model(max_context, output_reserve))

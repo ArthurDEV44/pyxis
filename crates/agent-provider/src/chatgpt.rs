@@ -869,7 +869,7 @@ mod tests {
                     p.classify_error(&terminal(body)),
                     ErrorClass::InvalidRequest
                 ),
-                "429 terminal attendu pour: {body}"
+                "terminal 429 expected for: {body}"
             );
         }
         // surcharge transitoire : pas de marqueur → retryable.
@@ -1006,7 +1006,7 @@ mod tests {
         let first = guarded.next().await;
         assert!(
             matches!(&first, Some(Err(ProviderError::Stream(m))) if m == "idle timeout"),
-            "idle timeout attendu, reçu: {first:?}"
+            "idle timeout expected, got: {first:?}"
         );
     }
 
@@ -1030,7 +1030,7 @@ mod tests {
         let res = send_with_header_timeout(rb, Duration::from_millis(150)).await;
         assert!(
             matches!(&res, Err(ProviderError::Stream(m)) if m == "header timeout"),
-            "header timeout attendu, reçu: {res:?}"
+            "header timeout expected, got: {res:?}"
         );
     }
 
@@ -1065,13 +1065,13 @@ mod tests {
             Ok(StreamEvent::TextDelta { text: "x".into() }),
             Err(ProviderError::Stream("boom".into())),
             Ok(StreamEvent::TextDelta {
-                text: "jamais".into(),
+                text: "never".into(),
             }),
         ])
         .boxed();
         let guarded = idle_guarded(inner, Duration::from_secs(5));
         let collected: Vec<_> = guarded.collect().await;
-        assert_eq!(collected.len(), 2, "doit s'arrêter après l'erreur");
+        assert_eq!(collected.len(), 2, "should stop after the error");
         assert!(matches!(collected[1], Err(ProviderError::Stream(_))));
     }
 }

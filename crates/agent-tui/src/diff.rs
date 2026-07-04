@@ -116,7 +116,7 @@ pub fn from_tool(name: &str, input: &Value) -> Option<Diff> {
             let raw = input.get("content")?.as_str()?;
             if raw_too_large(raw) {
                 return Some(note([format!(
-                    "(write trop volumineux pour l'aperçu : {} lignes min.)",
+                    "(write too large to preview: at least {} lines)",
                     bounded_line_count(raw)
                 )]));
             }
@@ -138,7 +138,7 @@ fn bounded_line_count(s: &str) -> usize {
 
 fn too_large_note(old: &str, new: &str) -> Diff {
     note([format!(
-        "(diff trop volumineux pour l'aperçu : {} → {} lignes min.)",
+        "(diff too large to preview: at least {} -> {} lines)",
         bounded_line_count(old),
         bounded_line_count(new)
     )])
@@ -155,7 +155,7 @@ fn from_edit(old: &str, new: &str) -> Diff {
         || new.lines().count() > MAX_DIFF_LINES
     {
         return note([format!(
-            "(diff trop volumineux pour l'aperçu : {} → {} lignes)",
+            "(diff too large to preview: {} -> {} lines)",
             old.lines().count(),
             new.lines().count()
         )]);
@@ -274,18 +274,18 @@ mod tests {
                 Row::Add { segs, .. } => Some(segs),
                 _ => None,
             })
-            .expect("ligne ajoutée attendue");
+            .expect("expected added line");
         assert!(
             segs.iter().any(|s| s.emphasized),
-            "emphase intra-ligne attendue"
+            "expected inline emphasis"
         );
         assert!(
             segs.iter().any(|s| !s.emphasized),
-            "le contexte intra-ligne reste neutre"
+            "inline context remains neutral"
         );
         let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined, "let x = 2;");
-        assert!(!joined.contains('\n'), "terminateur de ligne strippé");
+        assert!(!joined.contains('\n'), "line terminator stripped");
     }
 
     #[test]
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn write_is_all_additions() {
-        let d = from_write("ligne 1\nligne 2\nligne 3");
+        let d = from_write("line 1\nline 2\nline 3");
         assert_eq!(d.rows.len(), 3);
         assert!(d.rows.iter().all(|r| matches!(r, Row::Add { .. })));
         assert!(matches!(
@@ -360,7 +360,7 @@ mod tests {
                 "new_string": "let x = 2;\x1b]0;pwned\x07\x1b[31m"
             }),
         )
-        .expect("diff non vide");
+        .expect("non-empty diff");
         let any_esc = d.rows.iter().any(|r| match r {
             Row::Add { segs, .. } | Row::Remove { segs, .. } => {
                 segs.iter().any(|s| s.text.contains('\u{1b}'))
@@ -368,11 +368,11 @@ mod tests {
             Row::Context { text, .. } => text.contains('\u{1b}'),
             _ => false,
         });
-        assert!(!any_esc, "séquence d'échappement non assainie dans le diff");
+        assert!(!any_esc, "escape sequence not sanitized in diff");
         let w = from_tool("write", &json!({"content": "ok\x1b[2J"})).expect("diff");
         assert!(
             !matches!(&w.rows[0], Row::Add { segs, .. } if segs[0].text.contains('\u{1b}')),
-            "write non assaini"
+            "write not sanitized"
         );
     }
 
@@ -384,7 +384,7 @@ mod tests {
         let d = from_tool("edit", &json!({"old_string": "a", "new_string": huge})).expect("diff");
         assert!(
             d.rows.len() <= 2 && d.rows.iter().all(|r| matches!(r, Row::Context { .. })),
-            "repli borné attendu, pas un diff complet"
+            "bounded fallback expected, not a full diff"
         );
         // Idem sur une ligne unique géante (seuil d'octets).
         let big_line = "y".repeat(MAX_DIFF_BYTES + 1);

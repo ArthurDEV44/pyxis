@@ -11,6 +11,7 @@ mod context;
 mod interactive;
 mod prompt;
 mod session;
+mod settings;
 
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ use agent_core::{AgentContext, Deps, RunConfig};
 use agent_provider::{KEYRING_ACCOUNT, OpenAiChatGptProvider};
 use agent_sandbox::{ProxyPolicy, set_proxy_env};
 use agent_tokenizer::HeuristicCounter;
-use agent_tools::permission::{AutoDeny, PermissionMode};
+use agent_tools::permission::{AutoDeny, PermissionMode, PermissionModeState};
 use agent_tools::{Bash, Edit, Glob, Grep, Read, Registry, Write};
 
 use crate::approver::TuiApprover;
@@ -64,17 +65,17 @@ Usage: pyxis [options] [prompt]
 
 Options:
   -p, --print <prompt>                 Mode headless one-shot
-      --resume [latest|<file.jsonl>]    Reprendre une session
-      --model <slug>                    Modèle à utiliser
-      --allow <host>                    Autoriser un host réseau
-  -y, --yes                             Accepter les edits en headless
-      --no-sandbox                      Désactiver le sandbox FS
-      --token-budget <n>                Budget total de tokens
-      --cost-budget-micro-usd <n>       Budget coût total
-      --input-cost-micro-per-ktok <n>   Prix input
-      --output-cost-micro-per-ktok <n>  Prix output
-      --overload-fallback-model <slug>  Modèle de repli sur surcharge
-  -h, --help                            Afficher cette aide
+      --resume [latest|<file.jsonl>]    Resume a session
+      --model <slug>                    Model to use
+      --allow <host>                    Allow a network host
+  -y, --yes                             Accept edits in headless mode
+      --no-sandbox                      Disable the filesystem sandbox
+      --token-budget <n>                Total token budget
+      --cost-budget-micro-usd <n>       Total cost budget
+      --input-cost-micro-per-ktok <n>   Input price
+      --output-cost-micro-per-ktok <n>  Output price
+      --overload-fallback-model <slug>  Fallback model on overload
+  -h, --help                            Show this help
 ";
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -131,14 +132,14 @@ where
                     Some(next_value(&mut it, "--overload-fallback-model")?)
             }
             other => {
-                // un argument nu sans -p est traité comme le prompt (mode -p implicite).
+                // A bare argument without -p is treated as the prompt.
                 if other.starts_with('-') {
-                    anyhow::bail!("argument inconnu: {other}");
+                    anyhow::bail!("unknown argument: {other}");
                 }
                 if args.prompt.is_none() {
                     args.prompt = Some(other.to_string());
                 } else {
-                    anyhow::bail!("argument positionnel inattendu: {other}");
+                    anyhow::bail!("unexpected positional argument: {other}");
                 }
             }
         }
@@ -151,10 +152,10 @@ where
     I: Iterator<Item = String>,
 {
     let Some(value) = it.next() else {
-        anyhow::bail!("{flag}: valeur manquante");
+        anyhow::bail!("{flag}: missing value");
     };
     if value.starts_with('-') {
-        anyhow::bail!("{flag}: valeur manquante");
+        anyhow::bail!("{flag}: missing value");
     }
     Ok(value)
 }
@@ -168,13 +169,13 @@ pub(crate) fn resolve_resume_path(
         let latest = agent_session::list_sessions(sessions_dir, None)
             .into_iter()
             .next()
-            .ok_or_else(|| anyhow::anyhow!("resume : aucune session disponible"))?;
+            .ok_or_else(|| anyhow::anyhow!("resume: no session available"))?;
         return Ok(sessions_dir.join(latest.id));
     }
     let path = crate::interactive::session_path_from_arg(sessions_dir, arg)
-        .ok_or_else(|| anyhow::anyhow!("resume : identifiant de session invalide"))?;
+        .ok_or_else(|| anyhow::anyhow!("resume: invalid session id"))?;
     if !path.is_file() {
-        anyhow::bail!("resume : session introuvable: {}", path.display());
+        anyhow::bail!("resume: session not found: {}", path.display());
     }
     Ok(path)
 }
@@ -183,9 +184,9 @@ fn parse_positive_u64(raw: &str, name: &str) -> anyhow::Result<u64> {
     let value = raw
         .trim()
         .parse::<u64>()
-        .map_err(|_| anyhow::anyhow!("{name} doit être un entier positif"))?;
+        .map_err(|_| anyhow::anyhow!("{name} must be a positive integer"))?;
     if value == 0 {
-        anyhow::bail!("{name} doit être > 0");
+        anyhow::bail!("{name} must be > 0");
     }
     Ok(value)
 }
@@ -228,7 +229,7 @@ fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
             })
         }
         _ => anyhow::bail!(
-            "budget coût incomplet : fournir --cost-budget-micro-usd, --input-cost-micro-per-ktok et --output-cost-micro-per-ktok"
+            "incomplete cost budget: provide --cost-budget-micro-usd, --input-cost-micro-per-ktok, and --output-cost-micro-per-ktok"
         ),
     };
     let overload_fallback_model = args
@@ -248,7 +249,7 @@ fn run_config_from_args(args: &Args) -> anyhow::Result<RunConfig> {
             != prompt::uses_codex_finetuned_prompt(fallback)
     {
         anyhow::bail!(
-            "modèle de repli incompatible avec le prompt système: primary={} fallback={}",
+            "fallback model is incompatible with the system prompt: primary={} fallback={}",
             args.model,
             fallback
         );
@@ -282,10 +283,10 @@ fn sandbox_enforced_from_args(args: &Args, workspace: &std::path::Path) -> bool 
     if !args.sandbox {
         if args.yes {
             eprintln!(
-                "[sandbox] désactivé par --no-sandbox : --yes peut accepter les edits sans confinement FS"
+                "[sandbox] disabled by --no-sandbox: --yes may accept edits without filesystem confinement"
             );
         } else {
-            eprintln!("[sandbox] désactivé par --no-sandbox");
+            eprintln!("[sandbox] disabled by --no-sandbox");
         }
         return false;
     }
@@ -299,10 +300,10 @@ fn sandbox_enforced_from_args(args: &Args, workspace: &std::path::Path) -> bool 
         Err(e) => {
             if args.yes {
                 eprintln!(
-                    "[sandbox] échec d'application : {e} ; --yes peut accepter les edits sans confinement FS"
+                    "[sandbox] enforcement failed: {e}; --yes may accept edits without filesystem confinement"
                 );
             } else {
-                eprintln!("[sandbox] échec d'application : {e}");
+                eprintln!("[sandbox] enforcement failed: {e}");
             }
             false
         }
@@ -362,7 +363,7 @@ fn read_mcp_config(workspace: &std::path::Path) -> agent_mcp::McpConfigFile {
     let workspace_cfg = match agent_mcp::McpConfigFile::load(workspace) {
         Ok(cfg) => cfg,
         Err(e) if workspace_file.exists() => {
-            eprintln!("[mcp] workspace config invalide: {e}; user MCP ignoré");
+            eprintln!("[mcp] invalid workspace config: {e}; ignoring user MCP");
             return agent_mcp::McpConfigFile::default();
         }
         Err(e) => {
@@ -374,7 +375,7 @@ fn read_mcp_config(workspace: &std::path::Path) -> agent_mcp::McpConfigFile {
         .map(|home| {
             let path = home.join(".claude.json");
             agent_mcp::McpConfigFile::load_claude(&path).unwrap_or_else(|e| {
-                eprintln!("[mcp] ~/.claude.json : {e}");
+                eprintln!("[mcp] ~/.claude.json: {e}");
                 agent_mcp::McpConfigFile::default()
             })
         })
@@ -404,11 +405,10 @@ fn headless_auth_error(bootstrap: &CredentialBootstrap) -> String {
     match bootstrap {
         CredentialBootstrap::Connected(_) => String::new(),
         CredentialBootstrap::Missing => {
-            "Pyxis n'est pas connecté à ChatGPT. Lance `pyxis` sans -p pour ouvrir l'onboarding."
-                .into()
+            "Pyxis is not connected to ChatGPT. Run `pyxis` without -p to open onboarding.".into()
         }
         CredentialBootstrap::WrongProvider(provider) => format!(
-            "Credential ChatGPT invalide dans le keyring ({provider:?}). Lance `pyxis` sans -p pour reconnecter ChatGPT."
+            "Invalid ChatGPT credential in the keyring ({provider:?}). Run `pyxis` without -p to reconnect ChatGPT."
         ),
     }
 }
@@ -423,7 +423,7 @@ fn prepare_credential_before_sandbox(args: &Args) -> anyhow::Result<OAuthCredent
         CredentialBootstrap::Missing => run_auth_onboarding(),
         CredentialBootstrap::WrongProvider(provider) => {
             eprintln!(
-                "Credential ChatGPT invalide dans le keyring ({provider:?}). Reconnexion requise."
+                "Invalid ChatGPT credential in the keyring ({provider:?}). Reconnection required."
             );
             run_auth_onboarding()
         }
@@ -435,10 +435,10 @@ fn save_chatgpt_credential(cred: OAuthCredential) -> anyhow::Result<()> {
     match load_chatgpt_credential()? {
         CredentialBootstrap::Connected(_) => Ok(()),
         CredentialBootstrap::Missing => anyhow::bail!(
-            "Credential ChatGPT non retrouvée après écriture keyring. Le secret store Windows n'a pas persisté l'entrée."
+            "ChatGPT credential not found after keyring write. The Windows secret store did not persist the entry."
         ),
         CredentialBootstrap::WrongProvider(provider) => anyhow::bail!(
-            "Credential ChatGPT relue avec le mauvais provider ({provider:?}) après écriture keyring."
+            "ChatGPT credential was read back with the wrong provider ({provider:?}) after keyring write."
         ),
     }
 }
@@ -449,19 +449,19 @@ fn run_auth_onboarding() -> anyhow::Result<OAuthCredential> {
         .build()?;
     rt.block_on(async {
         eprintln!();
-        eprintln!("Bienvenue dans Pyxis");
-        eprintln!("Connexion ChatGPT requise pour utiliser l'agent.");
+        eprintln!("Welcome to Pyxis");
+        eprintln!("ChatGPT connection required to use the agent.");
         eprintln!();
 
         let client = reqwest::Client::new();
         let cred =
             agent_auth::oauth::openai_chatgpt::login_browser_with_notice(&client, |url, opened| {
                 if opened {
-                    eprintln!("Navigateur ouvert. Termine la connexion ChatGPT puis reviens ici.");
-                    eprintln!("Si rien ne s'affiche, ouvre cette URL :");
+                    eprintln!("Browser opened. Finish the ChatGPT login, then return here.");
+                    eprintln!("If nothing appears, open this URL:");
                     eprintln!("{url}");
                 } else {
-                    eprintln!("Ouvre cette URL pour autoriser Pyxis :");
+                    eprintln!("Open this URL to authorize Pyxis:");
                     eprintln!("{url}");
                 }
             })
@@ -470,9 +470,9 @@ fn run_auth_onboarding() -> anyhow::Result<OAuthCredential> {
         let stored = cred.clone();
         tokio::task::spawn_blocking(move || save_chatgpt_credential(stored))
             .await
-            .map_err(|e| anyhow::anyhow!("keyring : {e}"))??;
+            .map_err(|e| anyhow::anyhow!("keyring: {e}"))??;
 
-        eprintln!("Connecté. Lancement de Pyxis...");
+        eprintln!("Connected. Starting Pyxis...");
         eprintln!();
         Ok(cred)
     })
@@ -541,19 +541,19 @@ async fn run(
     let (current_session, initial_messages) = if let Some(resume_arg) = &args.resume {
         let path = resolve_resume_path(&sessions_dir, resume_arg)?;
         let resumed =
-            agent_session::resume_file(&path).map_err(|e| anyhow::anyhow!("resume : {e}"))?;
+            agent_session::resume_file(&path).map_err(|e| anyhow::anyhow!("resume: {e}"))?;
         (path, resumed.messages)
     } else {
         (interactive::new_session_path(&sessions_dir), Vec::new())
     };
     provider.set_prompt_cache_key(&interactive::prompt_cache_key_for_session(&current_session));
     let jsonl = agent_session::JsonlSession::create_at(&current_session)
-        .map_err(|e| anyhow::anyhow!("session : {e}"))?;
+        .map_err(|e| anyhow::anyhow!("session: {e}"))?;
     let (shared_session, conversation) = SharedSession::new(jsonl);
     if !initial_messages.is_empty() {
         *conversation
             .lock()
-            .map_err(|_| anyhow::anyhow!("session : snapshot empoisonné"))? = initial_messages;
+            .map_err(|_| anyhow::anyhow!("session: poisoned snapshot"))? = initial_messages;
     }
     let initial_taint_recent = recent_untrusted_content(
         &conversation.lock().map(|g| g.clone()).unwrap_or_default(),
@@ -570,6 +570,22 @@ async fn run(
     // 4. Registry d'outils + approbateur (TUI en interactif, auto en headless).
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let policy = permission_policy(headless, args.yes, sandbox_enforced);
+    let settings_path = if headless {
+        None
+    } else {
+        settings::default_settings_path()
+    };
+    let initial_permission_mode = settings_path
+        .as_deref()
+        .and_then(|path| match settings::load_permission_mode(path) {
+            Ok(mode) => mode,
+            Err(err) => {
+                eprintln!("[settings] permission_mode: {err}");
+                None
+            }
+        })
+        .unwrap_or(policy.mode);
+    let permission_mode = PermissionModeState::new(initial_permission_mode);
     let approver: Arc<dyn agent_tools::permission::Approver> = if headless {
         Arc::new(AutoDeny)
     } else {
@@ -577,7 +593,7 @@ async fn run(
     };
 
     let registry = Registry::builder(&workspace)
-        .mode(policy.mode)
+        .mode_state(permission_mode.clone())
         .approver(approver)
         .initial_taint_recent(initial_taint_recent)
         .command_hardener(harden)
@@ -625,7 +641,7 @@ async fn run(
         let result = agent_core::run_headless(ctx, deps).await;
         match result.ended {
             agent_core::HeadlessEnd::Error(e) => anyhow::bail!("{e}"),
-            agent_core::HeadlessEnd::Exhausted(reason) => anyhow::bail!("arrêt: {reason:?}"),
+            agent_core::HeadlessEnd::Exhausted(reason) => anyhow::bail!("stopped: {reason:?}"),
             agent_core::HeadlessEnd::EndTurn => {}
         }
         // En one-shot, pas de boucle d'objectif : on retire juste le marqueur.
@@ -661,6 +677,8 @@ async fn run(
             skills,
             goal,
             command_hardener: mcp_harden,
+            permission_mode,
+            settings_path,
         };
         interactive::run(
             deps,
@@ -726,7 +744,7 @@ mod tests {
         let mut args = args();
         args.cost_budget_micro_usd = Some("10".into());
         let err = run_config_from_args(&args).unwrap_err().to_string();
-        assert!(err.contains("budget coût incomplet"));
+        assert!(err.contains("incomplete cost budget"));
     }
 
     #[test]
@@ -734,7 +752,7 @@ mod tests {
         let mut args = args();
         args.token_budget = Some("0".into());
         let err = run_config_from_args(&args).unwrap_err().to_string();
-        assert!(err.contains("doit être > 0"));
+        assert!(err.contains("must be > 0"));
     }
 
     #[test]
@@ -751,7 +769,7 @@ mod tests {
         args.model = "gpt-5-codex".into();
         args.overload_fallback_model = Some("gpt-5.5".into());
         let err = run_config_from_args(&args).unwrap_err().to_string();
-        assert!(err.contains("modèle de repli incompatible"));
+        assert!(err.contains("fallback model is incompatible"));
     }
 
     #[test]
@@ -791,7 +809,7 @@ mod tests {
         let err = parse_args_from(vec!["-p".to_string(), "--resume".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("-p: valeur manquante"));
+        assert!(err.contains("-p: missing value"));
     }
 
     #[test]
@@ -799,7 +817,7 @@ mod tests {
         let err = parse_args_from(vec!["--wat".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("argument inconnu"));
+        assert!(err.contains("unknown argument"));
     }
 
     #[test]
@@ -807,7 +825,7 @@ mod tests {
         let err = parse_args_from(vec!["--model".to_string(), "--resume".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--model: valeur manquante"));
+        assert!(err.contains("--model: missing value"));
     }
 
     #[test]
@@ -815,7 +833,7 @@ mod tests {
         let err = parse_args_from(vec!["one".to_string(), "two".to_string()])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("argument positionnel inattendu"));
+        assert!(err.contains("unexpected positional argument"));
     }
 
     #[test]
@@ -832,7 +850,7 @@ mod tests {
         let err = resolve_resume_path(&dir, "missing.jsonl")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("session introuvable"));
+        assert!(err.contains("session not found"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

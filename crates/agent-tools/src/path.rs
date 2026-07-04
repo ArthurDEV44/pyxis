@@ -138,7 +138,7 @@ pub async fn replace_file_confined(
         ensure_existing_ancestor_confined(workspace, parent, display_path)?;
         tokio::fs::create_dir_all(parent)
             .await
-            .map_err(|e| ToolError::Io(format!("création du dossier parent: {e}")))?;
+            .map_err(|e| ToolError::Io(format!("creating parent directory: {e}")))?;
         ensure_existing_path_no_links(workspace, parent, display_path)?;
     }
     ensure_creatable_path_no_links(workspace, target, display_path)?;
@@ -182,7 +182,7 @@ pub async fn replace_file_confined(
             if meta.is_dir() {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 return Err(ToolError::Rejected(format!(
-                    "{display_path} est un répertoire, pas un fichier"
+                    "{display_path} is a directory, not a file"
                 )));
             }
             tokio::fs::remove_file(target)

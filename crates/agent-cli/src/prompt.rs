@@ -34,15 +34,14 @@ mod tests {
     use super::*;
 
     /// Section présente UNIQUEMENT dans le prompt long (marqueur discriminant).
-    const LONG_ONLY: &str = "## Spécification AGENTS.md";
+    const LONG_ONLY: &str = "## AGENTS.md Specification";
 
     #[test]
     fn generic_slug_gets_long_prompt() {
         let p = select_system_prompt("gpt-5.5");
-        assert!(p.contains(LONG_ONLY), "prompt long attendu");
-        assert!(p.contains("## Autonomie et persistance"));
-        // instruction anti-relecture présente (AC).
-        assert!(p.contains("Ne relis PAS") && p.contains("réussi"));
+        assert!(p.contains(LONG_ONLY), "long prompt expected");
+        assert!(p.contains("## Autonomy and Persistence"));
+        assert!(p.contains("Do NOT reread") && p.contains("confirmed success"));
     }
 
     #[test]
@@ -50,16 +49,14 @@ mod tests {
         let p = select_system_prompt("gpt-5-codex");
         assert!(
             !p.contains(LONG_ONLY),
-            "prompt court (pas les sections longues)"
+            "short prompt should omit long sections"
         );
-        assert!(p.contains("Sois autonome"));
-        // autre variante `-codex`.
+        assert!(p.contains("Be autonomous"));
         assert!(!select_system_prompt("gpt-5.2-codex-max").contains(LONG_ONLY));
     }
 
     #[test]
     fn unknown_slug_falls_back_to_long_prompt() {
-        // défaut sûr : un slug inconnu reçoit le prompt long.
         assert!(select_system_prompt("some-future-model").contains(LONG_ONLY));
         assert!(select_system_prompt("").contains(LONG_ONLY));
     }

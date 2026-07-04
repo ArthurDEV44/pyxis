@@ -373,7 +373,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
             iterations += 1;
             if iterations > iter_cap {
                 yield AgentEvent::Error(AgentError::Provider(ProviderFailure::contract(
-                    "garde-fou d'itérations atteint",
+                    "iteration guard reached",
                 )));
                 return;
             }
@@ -758,8 +758,8 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                             // tool_result par tool_use → transcript valide.
                             for c in &calls {
                                 let msg = format!(
-                                    "Boucle détectée sur {} (×{}) — arrêt. Reformulez l'approche \
-                                     ou demandez une intervention.",
+                                    "Loop detected on {} (x{}). Stopping. Reframe the approach \
+                                     or ask for intervention.",
                                     c.name,
                                     loop_guard.count(),
                                 );

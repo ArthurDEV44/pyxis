@@ -33,7 +33,7 @@ pub use glob::Glob;
 pub use grep::Grep;
 pub use permission::{
     Approver, AutoApprove, AutoDeny, PermCtx, PermissionDecision, PermissionMode,
-    PermissionRequest, Resolved, resolve_permission,
+    PermissionModeState, PermissionRequest, Resolved, resolve_permission,
 };
 pub use read::Read;
 pub use registry::{Registry, RegistryBuilder};

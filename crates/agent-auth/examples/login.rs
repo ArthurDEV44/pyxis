@@ -15,10 +15,10 @@ const ACCOUNT: &str = "oauth:openai_chatgpt";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    println!("Autorisation de Pyxis via ton abonnement ChatGPT…");
+    println!("Authorize Pyxis with your ChatGPT subscription...");
     let cred = openai_chatgpt::login_browser(&client).await?;
     store::save(ACCOUNT, &Credential::Oauth(cred))?;
-    println!("Connecté. Credential stockée dans le keyring ({ACCOUNT}).");
-    println!("Smoke test : cargo run -p agent-provider --example smoke -- \"dis bonjour\"");
+    println!("Connected. Credential stored in the keyring ({ACCOUNT}).");
+    println!("Smoke test: cargo run -p agent-provider --example smoke -- \"say hello\"");
     Ok(())
 }

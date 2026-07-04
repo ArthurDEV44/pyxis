@@ -239,7 +239,7 @@ impl<T: Tool> DynTool for DynToolAdapter<T> {
         let estimated = estimate_json_bytes(raw);
         if estimated > MAX_TOOL_INPUT_BYTES {
             return Err(ToolError::Validation(ValidationError::new(format!(
-                "entrée outil trop volumineuse: {estimated} octets estimés > {MAX_TOOL_INPUT_BYTES}"
+                "tool input too large: estimated {estimated} bytes > {MAX_TOOL_INPUT_BYTES}"
             ))));
         }
         let input: T::Input =

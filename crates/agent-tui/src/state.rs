@@ -4,7 +4,7 @@
 //! que la boucle agent-cli interprète (soumission, permission, quit, scroll).
 
 use std::cell::{Cell, RefCell};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_core::AgentEvent;
 use agent_core::message::{ContentBlock, Message, Role, ToolCallId, ToolErrorKind};
@@ -55,28 +55,21 @@ pub enum Status {
 /// la commande ouvre un sous-menu / attend un argument (Entrée complète au lieu
 /// d'exécuter). Ajouter = une ligne ici + une branche dans le dispatch.
 pub const COMMANDS: &[(&str, &str, bool)] = &[
-    ("/help", "Affiche les commandes disponibles", false),
-    ("/models", "Choisit le modèle parmi ceux disponibles", true),
-    ("/skills", "Insère un skill dans le message", true),
+    ("/help", "Show available commands", false),
+    ("/models", "Choose the active model", true),
     (
-        "/goal",
-        "Lance un objectif et travaille jusqu'à l'atteindre",
+        "/permissions",
+        "Choose when Pyxis asks for confirmation",
         true,
     ),
-    (
-        "/providers",
-        "Configure le fournisseur d'authentification",
-        true,
-    ),
-    ("/mcp", "Diagnostics des serveurs MCP", true),
-    ("/resume", "Reprend une conversation passée", true),
-    (
-        "/new",
-        "Démarre une nouvelle session (efface le contexte)",
-        false,
-    ),
-    ("/clear", "Efface le contexte et repart à neuf", false),
-    ("/quit", "Quitte Pyxis", false),
+    ("/skills", "Insert a skill into the message", true),
+    ("/goal", "Set a goal and work until it is done", true),
+    ("/providers", "Configure the authentication provider", true),
+    ("/mcp", "Inspect MCP servers", true),
+    ("/resume", "Resume a past conversation", true),
+    ("/new", "Start a new session and clear context", false),
+    ("/clear", "Clear context and start fresh", false),
+    ("/quit", "Quit Pyxis", false),
 ];
 
 /// Niveau 1 de `/providers` : (id, libellé, actif). Seul l'abonnement est
@@ -102,6 +95,54 @@ pub const MODELS: &[(&str, &str)] = &[
     ("gpt-5.4-mini", "[openai-codex]"),
     ("gpt-5.3-codex-spark", "[openai-codex]"),
 ];
+
+pub const DEFAULT_PERMISSION_MODE_ID: &str = "ask";
+pub const QUIT_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionModeMeta {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub hint: &'static str,
+}
+
+pub const PERMISSION_MODES: &[PermissionModeMeta] = &[
+    PermissionModeMeta {
+        id: "ask",
+        label: "Ask for approval",
+        hint: "ask before sensitive actions",
+    },
+    PermissionModeMeta {
+        id: "accept-edits",
+        label: "Auto-approve edits",
+        hint: "auto-approve write/edit, ask for sensitive actions",
+    },
+    PermissionModeMeta {
+        id: "auto",
+        label: "Approve for me",
+        hint: "do not interrupt except after recent taint",
+    },
+    PermissionModeMeta {
+        id: "full-access",
+        label: "Full Access",
+        hint: "bypass confirmations, sandbox unchanged",
+    },
+    PermissionModeMeta {
+        id: "read-only",
+        label: "Read Only",
+        hint: "strict read-only mode",
+    },
+];
+
+pub fn permission_mode_meta(id: &str) -> Option<&'static PermissionModeMeta> {
+    PERMISSION_MODES.iter().find(|mode| mode.id == id)
+}
+
+pub fn permission_mode_label(id: &str) -> &'static str {
+    permission_mode_meta(id)
+        .map(|mode| mode.label)
+        .unwrap_or("Ask for approval")
+}
 
 /// Le texte est-il une vraie commande Pyxis ? (1er mot ∈ COMMANDS). Un message
 /// qui commence par un `/<skill>` n'en est PAS une → il part à l'agent.
@@ -150,6 +191,7 @@ enum Menu {
     Resume,
     Skills,
     Files,
+    Permissions,
     ProviderAuth,
     ProviderList,
     /// Niveau 3 : actions sur un provider (connect/disconnect).
@@ -325,6 +367,8 @@ pub struct AppState {
     pub context_pct: Option<u8>,
     /// Effort de raisonnement affiché avec le modèle dans le footer.
     pub reasoning_effort: Option<String>,
+    /// Mode de permission affiché dans le footer et le sous-menu `/permissions`.
+    permission_mode: String,
     /// Index sélectionné dans le menu de commandes slash (0 = première ligne).
     pub completion_index: usize,
     /// Sessions reprenables (sous-menu `/resume`), remplies par agent-cli.
@@ -345,6 +389,7 @@ pub struct AppState {
     history_pos: Option<usize>,
     draft: String,
     pub should_quit: bool,
+    quit_shortcut_expires_at: Option<Instant>,
     // ── Progression vivante (EP-013) ────────────────────────────────────────────
     /// Tick d'animation du spinner, avancé par la boucle (~10 fps) tant qu'un tour
     /// est actif. Le rendu choisit la frame depuis ce compteur (reste pur).
@@ -373,6 +418,7 @@ pub enum InputAction {
     Submit(String),
     /// Commande slash à exécuter (ligne complète, args inclus : `/model gpt-5.5`).
     Command(String),
+    Interrupt,
     Quit,
     Permission(bool),
     ScrollUp,
@@ -395,6 +441,7 @@ impl AppState {
             workspace: String::new(),
             context_pct: None,
             reasoning_effort: None,
+            permission_mode: DEFAULT_PERMISSION_MODE_ID.to_string(),
             completion_index: 0,
             sessions: Vec::new(),
             skills: Vec::new(),
@@ -405,6 +452,7 @@ impl AppState {
             history_pos: None,
             draft: String::new(),
             should_quit: false,
+            quit_shortcut_expires_at: None,
             spinner_tick: 0,
             turn_elapsed: None,
             turn_chars: 0,
@@ -442,6 +490,62 @@ impl AppState {
     pub fn set_input(&mut self, value: String) {
         self.cursor = value.len();
         self.input = value;
+    }
+
+    pub fn permission_mode_id(&self) -> &str {
+        &self.permission_mode
+    }
+
+    pub fn permission_mode_label(&self) -> &'static str {
+        permission_mode_label(&self.permission_mode)
+    }
+
+    pub fn set_permission_mode(&mut self, id: impl Into<String>) {
+        let id = id.into();
+        self.permission_mode = if permission_mode_meta(&id).is_some() {
+            id
+        } else {
+            DEFAULT_PERMISSION_MODE_ID.to_string()
+        };
+    }
+
+    pub fn quit_shortcut_hint_visible(&self) -> bool {
+        self.quit_shortcut_expires_at
+            .is_some_and(|expires_at| Instant::now() < expires_at)
+    }
+
+    pub fn quit_shortcut_remaining(&self) -> Option<Duration> {
+        self.quit_shortcut_expires_at
+            .and_then(|expires_at| expires_at.checked_duration_since(Instant::now()))
+    }
+
+    pub fn clear_quit_shortcut_hint(&mut self) {
+        self.quit_shortcut_expires_at = None;
+    }
+
+    fn arm_quit_shortcut(&mut self) {
+        self.quit_shortcut_expires_at = Instant::now()
+            .checked_add(QUIT_SHORTCUT_TIMEOUT)
+            .or_else(|| Some(Instant::now()));
+    }
+
+    fn quit_shortcut_active(&self) -> bool {
+        self.quit_shortcut_hint_visible()
+    }
+
+    fn on_ctrl_c(&mut self) -> InputAction {
+        if self.quit_shortcut_active() {
+            self.clear_quit_shortcut_hint();
+            self.should_quit = true;
+            return InputAction::Quit;
+        }
+
+        self.arm_quit_shortcut();
+        if self.status == Status::Thinking {
+            InputAction::Interrupt
+        } else {
+            InputAction::None
+        }
     }
 
     fn clear_input(&mut self) {
@@ -579,18 +683,24 @@ impl AppState {
                     error_kind: view.error_kind,
                 });
             }
-            AgentEvent::Compacted(_) => self.blocks.push(Block::Notice("contexte compacté".into())),
+            AgentEvent::Compacted(_) => self.blocks.push(Block::Notice("context compacted".into())),
             AgentEvent::PermissionAsk(req) => self
                 .blocks
-                .push(Block::Notice(format!("permission : {}", req.tool))),
+                .push(Block::Notice(format!("permission: {}", req.tool))),
             AgentEvent::EndTurn => {
                 self.finalize_streaming();
+                self.status = Status::Idle;
+            }
+            AgentEvent::Interrupted => {
+                self.finalize_streaming();
+                self.pending = None;
+                self.blocks.push(Block::Notice("interrupted".into()));
                 self.status = Status::Idle;
             }
             AgentEvent::Exhausted(reason) => {
                 self.finalize_streaming();
                 self.blocks
-                    .push(Block::Notice(format!("arrêt : {reason:?}")));
+                    .push(Block::Notice(format!("stopped: {reason:?}")));
                 self.status = Status::Idle;
             }
             AgentEvent::Error(e) => {
@@ -780,6 +890,8 @@ impl AppState {
             Menu::Resume
         } else if i.starts_with("/models ") {
             Menu::Models
+        } else if i.starts_with("/permissions ") {
+            Menu::Permissions
         } else if i.starts_with("/skills ") {
             Menu::Skills
         } else if self.active_file_query().is_some() {
@@ -812,6 +924,21 @@ impl AppState {
                     items.push(MenuItem::new(q, q, "custom", true));
                 }
                 items
+            }
+            Menu::Permissions => {
+                let q = self.input.strip_prefix("/permissions ").unwrap_or("");
+                PERMISSION_MODES
+                    .iter()
+                    .filter(|mode| q.is_empty() || mode.id.starts_with(q) || mode.label.contains(q))
+                    .map(|mode| {
+                        let label = if mode.id == self.permission_mode {
+                            format!("{} (current)", mode.label)
+                        } else {
+                            mode.label.to_string()
+                        };
+                        MenuItem::new(mode.id, &label, mode.hint, true)
+                    })
+                    .collect()
             }
             Menu::Resume => self
                 .sessions
@@ -847,7 +974,7 @@ impl AppState {
                     .map(|path| MenuItem::new(path, path, "file", true))
                     .collect::<Vec<_>>();
                 if items.is_empty() {
-                    items.push(MenuItem::new("", "Aucun fichier", "", false));
+                    items.push(MenuItem::new("", "No files", "", false));
                 }
                 items
             }
@@ -857,7 +984,7 @@ impl AppState {
                     .iter()
                     .filter(|(id, _, _)| id.starts_with(q))
                     .map(|(id, label, en)| {
-                        MenuItem::new(id, label, if *en { "" } else { "bientôt" }, *en)
+                        MenuItem::new(id, label, if *en { "" } else { "coming soon" }, *en)
                     })
                     .collect()
             }
@@ -872,14 +999,14 @@ impl AppState {
                     .map(|(id, label, en)| {
                         let hint = if *id == "codex" {
                             if self.provider_connected {
-                                "✓ connecté"
+                                "connected"
                             } else {
-                                "non connecté"
+                                "not connected"
                             }
                         } else if *en {
                             ""
                         } else {
-                            "bientôt"
+                            "coming soon"
                         };
                         MenuItem::new(id, label, hint, *en)
                     })
@@ -892,13 +1019,13 @@ impl AppState {
                     MenuItem::new(
                         "connect",
                         "Connect",
-                        if c { "déjà connecté" } else { "" },
+                        if c { "already connected" } else { "" },
                         !c,
                     ),
                     MenuItem::new(
                         "disconnect",
                         "Disconnect",
-                        if c { "" } else { "déjà déconnecté" },
+                        if c { "" } else { "already disconnected" },
                         c,
                     ),
                 ]
@@ -908,8 +1035,8 @@ impl AppState {
                 if self.mcp_servers.is_empty() {
                     return vec![MenuItem::new(
                         "",
-                        "Aucun serveur MCP",
-                        "ajoute .mcp.json au workspace",
+                        "No MCP servers",
+                        "add .mcp.json to the workspace",
                         false,
                     )];
                 }
@@ -919,14 +1046,14 @@ impl AppState {
                     .map(|m| {
                         let hint = match m.status {
                             McpStatus::Connected => {
-                                format!("✓ {} · connecté · {} outils", m.source, m.tool_count)
+                                format!("{} · connected · {} tools", m.source, m.tool_count)
                             }
-                            McpStatus::Connecting => format!("◯ {} · connexion…", m.source),
-                            McpStatus::Failed => format!("✗ {} · échec", m.source),
+                            McpStatus::Connecting => format!("{} · connecting...", m.source),
+                            McpStatus::Failed => format!("{} · failed", m.source),
                             McpStatus::Disconnected if m.needs_trust => {
-                                format!("{} · trust requis", m.source)
+                                format!("{} · trust required", m.source)
                             }
-                            McpStatus::Disconnected => format!("{} · non connecté", m.source),
+                            McpStatus::Disconnected => format!("{} · not connected", m.source),
                         };
                         MenuItem::new(&m.name, &m.name, &hint, true)
                     })
@@ -952,9 +1079,9 @@ impl AppState {
                         "trust",
                         "Trust connect",
                         if connecting {
-                            "connexion en cours…"
+                            "connecting..."
                         } else {
-                            "outils MCP non exposés"
+                            "MCP tools not exposed"
                         },
                         false,
                     )]
@@ -963,9 +1090,9 @@ impl AppState {
                         "connect",
                         "Connect",
                         if connecting {
-                            "connexion en cours…"
+                            "connecting..."
                         } else {
-                            "outils MCP non exposés"
+                            "MCP tools not exposed"
                         },
                         false,
                     )]
@@ -1039,6 +1166,7 @@ impl AppState {
         let value = match kind {
             Menu::Commands => format!("{} ", item.id),
             Menu::Models => format!("/models {}", item.id),
+            Menu::Permissions => format!("/permissions {}", item.id),
             Menu::Skills => format!("/{} ", item.id),
             Menu::ProviderAuth if item.id == "subscription" => "/providers subscription ".into(),
             Menu::ProviderAuth => format!("/providers {} ", item.id),
@@ -1076,6 +1204,10 @@ impl AppState {
             Menu::Models => {
                 self.clear_input();
                 InputAction::Command(format!("/models {}", item.id))
+            }
+            Menu::Permissions => {
+                self.clear_input();
+                InputAction::Command(format!("/permissions {}", item.id))
             }
             Menu::Resume => {
                 self.clear_input();
@@ -1129,34 +1261,16 @@ impl AppState {
         }
     }
 
-    /// Gestion clavier. En attente de permission, seules o/n/Enter/Esc comptent.
+    /// Gestion clavier. En attente de permission, seules o/n/Enter/Esc/Ctrl+C comptent.
     pub fn on_key(&mut self, key: KeyEvent) -> InputAction {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
-            return InputAction::Quit;
-        }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('a') => {
-                    self.move_home();
-                    InputAction::None
-                }
-                KeyCode::Char('e') => {
-                    self.move_end();
-                    InputAction::None
-                }
-                KeyCode::Char('u') => {
-                    self.clear_input();
-                    self.completion_index = 0;
-                    InputAction::None
-                }
-                KeyCode::Char('w') => {
-                    self.delete_prev_word();
-                    self.completion_index = 0;
-                    InputAction::None
-                }
-                _ => InputAction::None,
-            };
+        let is_ctrl_c = matches!(
+            key.code,
+            KeyCode::Char(c)
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && c.eq_ignore_ascii_case(&'c')
+        );
+        if !is_ctrl_c {
+            self.clear_quit_shortcut_hint();
         }
 
         if self.pending.is_some() {
@@ -1167,6 +1281,11 @@ impl AppState {
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
                     self.pending = None;
+                    InputAction::Permission(false)
+                }
+                _ if is_ctrl_c => {
+                    self.pending = None;
+                    self.clear_quit_shortcut_hint();
                     InputAction::Permission(false)
                 }
                 _ => InputAction::None,
@@ -1207,11 +1326,47 @@ impl AppState {
                     self.completion_index = 0;
                     return InputAction::None;
                 }
+                _ if is_ctrl_c => {
+                    self.clear_input();
+                    self.completion_index = 0;
+                    self.clear_quit_shortcut_hint();
+                    return InputAction::None;
+                }
                 _ => {}
             }
         }
 
+        if is_ctrl_c {
+            return self.on_ctrl_c();
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('a') => {
+                    self.move_home();
+                    InputAction::None
+                }
+                KeyCode::Char('e') => {
+                    self.move_end();
+                    InputAction::None
+                }
+                KeyCode::Char('u') => {
+                    self.clear_input();
+                    self.completion_index = 0;
+                    InputAction::None
+                }
+                KeyCode::Char('w') => {
+                    self.delete_prev_word();
+                    self.completion_index = 0;
+                    InputAction::None
+                }
+                _ => InputAction::None,
+            };
+        }
+
         match key.code {
+            KeyCode::Esc if self.status == Status::Thinking && key.modifiers.is_empty() => {
+                InputAction::Interrupt
+            }
             KeyCode::Enter => {
                 let text = self.input.trim().to_string();
                 if text.is_empty() {
@@ -1318,7 +1473,7 @@ mod tests {
     #[test]
     fn stream_reset_removes_uncommitted_blocks() {
         let mut s = AppState::new("gpt-5", false);
-        s.apply(&AgentEvent::Text("préfixe".into()));
+        s.apply(&AgentEvent::Text("prefix".into()));
         s.apply(&AgentEvent::Reasoning("raison".into()));
         s.apply(&AgentEvent::StreamReset);
         assert!(s.blocks.is_empty());
@@ -1408,18 +1563,39 @@ mod tests {
     fn slash_opens_and_filters_command_menu() {
         let mut s = AppState::new("gpt-5", false);
         s.on_key(key('/'));
-        assert!(s.menu_open(), "le menu doit s'ouvrir sur «/»");
+        assert!(s.menu_open(), "menu should open on /");
         assert_eq!(s.menu_items().len(), COMMANDS.len());
         s.on_key(key('m'));
         // «/m» matche /models ET /mcp.
         let m = s.menu_items();
-        assert_eq!(m.len(), 2, "«/m» matche /models et /mcp");
+        assert_eq!(m.len(), 2, "/m matches /models and /mcp");
         assert!(m.iter().all(|it| it.id.starts_with("/m")));
         // «/mo» désambiguïse vers /models seul.
         s.on_key(key('o'));
         let m = s.menu_items();
         assert_eq!(m.len(), 1, "«/mo» ne matche que /models");
         assert_eq!(m[0].id, "/models");
+    }
+
+    #[test]
+    fn permissions_submenu_marks_current_and_routes_selection() {
+        let mut s = AppState::new("gpt-5", false);
+        s.set_permission_mode("read-only");
+        s.set_input("/permissions ".into());
+
+        let items = s.menu_items();
+        assert_eq!(items.len(), PERMISSION_MODES.len());
+        let current = items.iter().find(|item| item.id == "read-only").unwrap();
+        assert!(current.label.contains("(current)"));
+
+        s.set_input("/permissions full".into());
+        let items = s.menu_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "full-access");
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::Command("/permissions full-access".into())
+        );
     }
 
     #[test]
@@ -1447,10 +1623,10 @@ mod tests {
         let items = s.menu_items();
         assert_eq!(items.len(), 2);
         let fs = items.iter().find(|i| i.id == "filesystem").unwrap();
-        assert!(fs.hint.starts_with('✓'), "connecté → badge ✓");
-        assert!(fs.hint.contains("3 outils"));
+        assert!(fs.hint.contains("connected"), "connected status expected");
+        assert!(fs.hint.contains("3 tools"));
         let fetch = items.iter().find(|i| i.id == "fetch").unwrap();
-        assert_eq!(fetch.hint, "user · non connecté");
+        assert_eq!(fetch.hint, "user · not connected");
     }
 
     #[test]
@@ -1651,11 +1827,11 @@ mod tests {
     #[test]
     fn unicode_cursor_moves_and_deletes_graphemes() {
         let mut s = AppState::new("gpt-5", false);
-        s.insert_str("aé🙂");
-        assert_eq!(s.cursor, "aé🙂".len());
+        s.insert_str("a¢🙂");
+        assert_eq!(s.cursor, "a¢🙂".len());
 
         s.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert_eq!(s.cursor, "aé".len());
+        assert_eq!(s.cursor, "a¢".len());
 
         s.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(s.input, "a🙂");
@@ -1697,7 +1873,7 @@ mod tests {
         assert_eq!(s.input, "/providers subscription ");
         let lvl2 = s.menu_items();
         assert_eq!(lvl2[0].id, "codex");
-        assert_eq!(lvl2[0].hint, "✓ connecté", "badge connecté sur codex");
+        assert_eq!(lvl2[0].hint, "connected", "connected badge on codex");
         // Codex (branché) descend au niveau 3 (actions).
         assert_eq!(
             s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -1707,9 +1883,9 @@ mod tests {
         let lvl3 = s.menu_items();
         // Connecté → Connect grisé, Disconnect actif.
         assert_eq!(lvl3[0].id, "connect");
-        assert!(!lvl3[0].enabled, "Connect grisé si connecté");
+        assert!(!lvl3[0].enabled, "Connect disabled while connected");
         assert_eq!(lvl3[1].id, "disconnect");
-        assert!(lvl3[1].enabled, "Disconnect actif si connecté");
+        assert!(lvl3[1].enabled, "Disconnect enabled while connected");
         // Sélectionner Disconnect → exécute la commande pleine.
         s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1725,8 +1901,8 @@ mod tests {
         s.provider_connected = false;
         s.input = "/providers subscription codex ".into();
         let lvl3 = s.menu_items();
-        assert!(lvl3[0].enabled, "Connect actif si déconnecté");
-        assert!(!lvl3[1].enabled, "Disconnect grisé si déconnecté");
+        assert!(lvl3[0].enabled, "Connect enabled while disconnected");
+        assert!(!lvl3[1].enabled, "Disconnect disabled while disconnected");
     }
 
     #[test]
@@ -1910,11 +2086,121 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits() {
+    fn plain_esc_interrupts_running_turn_without_modal() {
         let mut s = AppState::new("gpt-5", false);
+        s.push_user("work");
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            InputAction::Interrupt
+        );
+    }
+
+    #[test]
+    fn esc_keeps_permission_priority_over_interrupt() {
+        let mut s = AppState::new("gpt-5", false);
+        s.push_user("work");
+        s.pending = Some(PermissionPrompt::new(
+            "bash",
+            "needs approval",
+            crate::diff::Diff::default(),
+        ));
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            InputAction::Permission(false)
+        );
+    }
+
+    #[test]
+    fn interrupted_event_clears_pending_and_returns_idle() {
+        let mut s = AppState::new("gpt-5", false);
+        s.apply(&AgentEvent::Text("partial".into()));
+        s.pending = Some(PermissionPrompt::new(
+            "bash",
+            "needs approval",
+            crate::diff::Diff::default(),
+        ));
+
+        s.apply(&AgentEvent::Interrupted);
+
+        assert!(s.pending.is_none());
+        assert_eq!(s.status, Status::Idle);
+        assert!(matches!(
+            s.blocks.last(),
+            Some(Block::Notice(message)) if message == "interrupted"
+        ));
+        assert!(matches!(
+            s.blocks.first(),
+            Some(Block::Assistant {
+                streaming: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn first_ctrl_c_arms_quit_shortcut_second_ctrl_c_quits() {
+        let mut s = AppState::new("gpt-5", false);
+        let action = s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(action, InputAction::None);
+        assert!(!s.should_quit);
+        assert!(s.quit_shortcut_hint_visible());
+
         let action = s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(action, InputAction::Quit);
         assert!(s.should_quit);
+        assert!(!s.quit_shortcut_hint_visible());
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_running_turn_before_quit() {
+        let mut s = AppState::new("gpt-5", false);
+        s.push_user("work");
+
+        let action = s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(action, InputAction::Interrupt);
+        assert!(s.quit_shortcut_hint_visible());
+        assert!(!s.should_quit);
+
+        s.apply(&AgentEvent::Interrupted);
+        let action = s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(action, InputAction::Quit);
+        assert!(s.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_keeps_permission_priority_over_interrupt() {
+        let mut s = AppState::new("gpt-5", false);
+        s.push_user("work");
+        s.pending = Some(PermissionPrompt::new(
+            "bash",
+            "needs approval",
+            crate::diff::Diff::default(),
+        ));
+
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            InputAction::Permission(false)
+        );
+        assert!(!s.should_quit);
+        assert!(!s.quit_shortcut_hint_visible());
+    }
+
+    #[test]
+    fn ctrl_c_dismisses_menu_before_quit_shortcut() {
+        let mut s = AppState::new("gpt-5", false);
+        s.on_key(key('/'));
+
+        assert!(s.menu_open());
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            InputAction::None
+        );
+        assert!(s.input.is_empty());
+        assert!(!s.menu_open());
+        assert!(!s.should_quit);
+        assert!(!s.quit_shortcut_hint_visible());
     }
 
     // US-044/045 : cycle de vie de la progression d'un tour.
@@ -1969,13 +2255,13 @@ mod tests {
     #[test]
     fn unseen_floors_on_pure_stream_append() {
         let mut s = AppState::new("gpt-5", true);
-        s.apply(&AgentEvent::Text("début ".into())); // crée le bloc Assistant streaming
+        s.apply(&AgentEvent::Text("start ".into()));
         s.scroll = 2; // l'utilisateur remonte PENDANT le stream
         s.apply(&AgentEvent::Text("suite".into())); // APPEND (pas de nouveau bloc)
         assert_eq!(s.blocks.len(), 1, "un seul bloc Assistant (append)");
         assert_eq!(
             s.unseen, 1,
-            "le stream signale du contenu même sans nouveau bloc"
+            "stream signals content even without a new block"
         );
     }
 }

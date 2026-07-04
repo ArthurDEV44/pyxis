@@ -238,7 +238,7 @@ mod tests {
             inv("bash", serde_json::json!({"cmd": "ls"})),
             inv("read", serde_json::json!({"path": "a"})),
         ]);
-        assert_eq!(s1, s2, "l'ordre des appels ne doit pas compter");
+        assert_eq!(s1, s2, "call order should not matter");
         let s3 = batch_signature(&[inv("bash", serde_json::json!({"cmd": "pwd"}))]);
         assert_ne!(s1, s3);
     }

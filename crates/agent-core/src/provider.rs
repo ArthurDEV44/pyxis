@@ -353,13 +353,13 @@ pub enum ProviderError {
         message: String,
         retry_after_ms: Option<u64>,
     },
-    #[error("décodage: {0}")]
+    #[error("decode: {0}")]
     Decode(String),
-    #[error("flux interrompu: {0}")]
+    #[error("stream interrupted: {0}")]
     Stream(String),
     /// Erreur de CONTEXTE (PTL / 413). N'est PAS une classe transitoire : elle
     /// alimente le withholding (ARCHITECTURE §3.4), pas le backoff.
-    #[error("contexte trop long (PTL/413)")]
+    #[error("context too long (PTL/413)")]
     ContextLengthExceeded,
 }
 

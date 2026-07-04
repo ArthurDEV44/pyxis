@@ -27,17 +27,17 @@ impl Tool for Write {
         "write"
     }
     fn description(&self) -> String {
-        "Crée ou remplace intégralement un fichier du workspace. Paramètres : \
-         path (relatif au workspace), content (contenu complet). Les dossiers \
-         parents manquants sont créés."
+        "Create or fully replace a workspace file. Parameters: path (relative \
+         to the workspace), content (complete content). Missing parent \
+         directories are created."
             .to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Chemin du fichier (relatif au workspace)." },
-                "content": { "type": "string", "description": "Contenu complet à écrire." }
+                "path": { "type": "string", "description": "File path relative to the workspace." },
+                "content": { "type": "string", "description": "Complete content to write." }
             },
             "required": ["path", "content"],
             "additionalProperties": false
@@ -59,7 +59,7 @@ impl Tool for Write {
         let bytes = input.content.len();
         if bytes > MAX_WRITE_BYTES {
             return Err(ValidationError::new(format!(
-                "content trop volumineux: {bytes} octets > {MAX_WRITE_BYTES}"
+                "content too large: {bytes} bytes > {MAX_WRITE_BYTES}"
             )));
         }
         Ok(())
@@ -73,7 +73,7 @@ impl Tool for Write {
         let bytes = input.content.len();
         replace_file_confined(&ctx.workspace, &path, &input.path, input.content.as_bytes()).await?;
         Ok(ToolOutput::text(format!(
-            "Fichier écrit : {} ({bytes} octets)",
+            "Wrote file: {} ({bytes} bytes)",
             input.path
         )))
     }

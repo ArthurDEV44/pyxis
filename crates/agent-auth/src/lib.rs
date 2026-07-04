@@ -98,7 +98,7 @@ mod tests {
         assert!(blob.contains("\"kind\":\"oauth\""));
         let back: Credential = serde_json::from_str(&blob).unwrap();
         let Credential::Oauth(o) = back else {
-            unreachable!("variante oauth attendue")
+            unreachable!("expected oauth variant")
         };
         assert_eq!(o.account_id.as_deref(), Some("acct_1"));
         assert!(o.is_expired(1_000));

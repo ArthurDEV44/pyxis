@@ -37,19 +37,18 @@ impl Tool for Read {
         "read"
     }
     fn description(&self) -> String {
-        "Lit un fichier texte du workspace et retourne son contenu préfixé des \
-         numéros de ligne. Paramètres : path (relatif au workspace), offset \
-         (ligne de départ 1-indexée, optionnel), limit (nombre de lignes, \
-         optionnel)."
+        "Read a workspace text file and return its contents prefixed with line \
+         numbers. Parameters: path (relative to the workspace), offset \
+         (1-indexed start line, optional), limit (line count, optional)."
             .to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Chemin du fichier (relatif au workspace)." },
-                "offset": { "type": ["integer", "null"], "minimum": 1, "description": "Ligne de départ (1-indexée), ou null." },
-                "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Nombre de lignes maximum, ou null." }
+                "path": { "type": "string", "description": "File path relative to the workspace." },
+                "offset": { "type": ["integer", "null"], "minimum": 1, "description": "Start line (1-indexed), or null." },
+                "limit": { "type": ["integer", "null"], "minimum": 1, "description": "Maximum number of lines, or null." }
             },
             "required": ["path", "offset", "limit"],
             "additionalProperties": false
@@ -80,7 +79,7 @@ impl Tool for Read {
             .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
         if meta.is_dir() {
             return Err(ToolError::Rejected(format!(
-                "{} est un répertoire, pas un fichier",
+                "{} is a directory, not a file",
                 input.path
             )));
         }
@@ -91,7 +90,7 @@ impl Tool for Read {
             .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
         if bytes.contains(&0) {
             return Err(ToolError::Rejected(format!(
-                "{} semble être un fichier binaire (octets NUL)",
+                "{} appears to be a binary file (NUL bytes)",
                 input.path
             )));
         }
@@ -138,22 +137,22 @@ fn render_read(text: &str, start: usize, limit: Option<usize>, oversize: bool) -
     }
     if out.is_empty() {
         if total == 0 {
-            out.push_str("(fichier vide)");
+            out.push_str("(empty file)");
         } else {
             out.push_str(&format!(
-                "[plage hors limites : offset={start} > {total} lignes]"
+                "[range out of bounds: offset={start} > {total} lines]"
             ));
         }
         return out;
     }
     if oversize {
         out.push_str(&format!(
-            "[fichier tronqué à {MAX_BYTES} octets ({emitted} lignes lues) — lisez par \
-             plages avec offset/limit]"
+            "[file truncated at {MAX_BYTES} bytes ({emitted} lines read); read by \
+             ranges with offset/limit]"
         ));
     } else if truncated_by_limit {
         out.push_str(&format!(
-            "[lignes {start}-{last_line} sur {total} ; offset={} pour continuer]",
+            "[lines {start}-{last_line} of {total}; offset={} to continue]",
             last_line + 1
         ));
     }
@@ -175,20 +174,19 @@ mod tests {
         assert!(out.contains("     5\tl5"));
         assert!(
             !out.contains("offset="),
-            "lecture complète → pas de hint: {out}"
+            "full read should have no hint: {out}"
         );
     }
 
     #[test]
     fn limit_truncation_emits_continuation_hint() {
-        // 5 lignes, limit 2 depuis offset 1 → lignes 1-2, hint offset=3.
         let out = render_read(text5(), 1, Some(2), false);
         assert!(out.contains("     1\tl1"));
         assert!(out.contains("     2\tl2"));
         assert!(!out.contains("\tl3"));
         assert!(
-            out.contains("[lignes 1-2 sur 5 ; offset=3 pour continuer]"),
-            "hint de pagination attendu: {out}"
+            out.contains("[lines 1-2 of 5; offset=3 to continue]"),
+            "pagination hint expected: {out}"
         );
     }
 
@@ -196,8 +194,8 @@ mod tests {
     fn out_of_range_offset_hints_instead_of_vague_message() {
         let out = render_read(text5(), 99, None, false);
         assert!(
-            out.contains("[plage hors limites : offset=99 > 5 lignes]"),
-            "hint hors-plage attendu: {out}"
+            out.contains("[range out of bounds: offset=99 > 5 lines]"),
+            "out-of-range hint expected: {out}"
         );
     }
 
@@ -206,13 +204,13 @@ mod tests {
         let out = render_read("a\nb\n", 1, None, true);
         assert!(out.contains("     1\ta"));
         assert!(
-            out.contains("fichier tronqué à") && out.contains("lisez par plages"),
-            "hint de lecture partielle attendu: {out}"
+            out.contains("file truncated at") && out.contains("read by ranges"),
+            "partial read hint expected: {out}"
         );
     }
 
     #[test]
     fn empty_file_reports_empty() {
-        assert_eq!(render_read("", 1, None, false), "(fichier vide)");
+        assert_eq!(render_read("", 1, None, false), "(empty file)");
     }
 }

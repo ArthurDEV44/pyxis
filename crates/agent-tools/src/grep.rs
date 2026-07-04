@@ -43,19 +43,18 @@ impl Tool for Grep {
         "grep"
     }
     fn description(&self) -> String {
-        "Recherche une expression régulière dans les fichiers du workspace et \
-         retourne les correspondances au format chemin:ligne: contenu. \
-         Paramètres : pattern (regex), path (base, optionnel), glob (filtre de \
-         noms de fichiers, optionnel)."
+        "Search for a regular expression in workspace files and return matches \
+         as path:line: content. Parameters: pattern (regex), path (optional base), \
+         glob (optional filename filter)."
             .to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Expression régulière." },
-                "path": { "type": ["string", "null"], "description": "Base de recherche (relative au workspace), ou null." },
-                "glob": { "type": ["string", "null"], "description": "Filtre glob sur les noms de fichiers, ex. *.rs, ou null." }
+                "pattern": { "type": "string", "description": "Regular expression." },
+                "path": { "type": ["string", "null"], "description": "Search base relative to the workspace, or null." },
+                "glob": { "type": ["string", "null"], "description": "Filename glob filter, for example *.rs, or null." }
             },
             "required": ["pattern", "path", "glob"],
             "additionalProperties": false
@@ -73,11 +72,11 @@ impl Tool for Grep {
     fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
         Regex::new(&input.pattern)
             .map(|_| ())
-            .map_err(|e| ValidationError::new(format!("regex invalide: {e}")))?;
+            .map_err(|e| ValidationError::new(format!("invalid regex: {e}")))?;
         if let Some(g) = &input.glob {
             GlobPattern::new(g)
                 .map(|_| ())
-                .map_err(|e| ValidationError::new(format!("motif glob invalide: {e}")))?;
+                .map_err(|e| ValidationError::new(format!("invalid glob pattern: {e}")))?;
         }
         Ok(())
     }
@@ -87,11 +86,11 @@ impl Tool for Grep {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let re = Regex::new(&input.pattern)
-            .map_err(|e| ToolError::Rejected(format!("regex invalide: {e}")))?;
+            .map_err(|e| ToolError::Rejected(format!("invalid regex: {e}")))?;
         let name_filter = match &input.glob {
             Some(g) => Some(
                 GlobPattern::new(g)
-                    .map_err(|e| ToolError::Rejected(format!("motif glob invalide: {e}")))?
+                    .map_err(|e| ToolError::Rejected(format!("invalid glob pattern: {e}")))?
                     .compile_matcher(),
             ),
             None => None,
@@ -151,7 +150,7 @@ impl Tool for Grep {
 
         if lines.is_empty() {
             return Ok(ToolOutput::text(format!(
-                "(aucune correspondance pour « {} »)",
+                "(no matches for \"{}\")",
                 input.pattern
             )));
         }
@@ -160,8 +159,8 @@ impl Tool for Grep {
             // US-026 : signaler la troncation ET le moyen de paginer (grep n'a pas
             // d'offset → on guide vers un resserrage de la recherche).
             body.push_str(&format!(
-                "\n[truncated: {MAX_MATCHES} correspondances atteintes — affinez avec un \
-                 pattern plus précis, un glob, ou un path plus étroit pour voir la suite]"
+                "\n[truncated: reached {MAX_MATCHES} matches; narrow with a more precise \
+                 pattern, glob, or path to see the rest]"
             ));
         }
         Ok(ToolOutput::text(body))
@@ -202,7 +201,7 @@ mod tests {
     fn multibyte_boundary_does_not_panic_and_stays_valid_utf8() {
         // "a" + 150 × 'é' = 301 octets : l'octet 300 tombe au MILIEU du 150ᵉ 'é'
         // → `&line[..300]` paniquerait. La coupe recule sur la frontière (299).
-        let line = format!("a{}", "é".repeat(150));
+        let line = format!("a{}", "¢".repeat(150));
         assert!(line.len() > MAX_LINE_BYTES && !line.is_char_boundary(MAX_LINE_BYTES));
         let cut = truncate_line(&line, MAX_LINE_BYTES);
         assert!(cut.len() <= MAX_LINE_BYTES, "borné");

@@ -28,6 +28,7 @@ pub enum AgentEvent {
     /// le cœur en EP-002 ; présent pour fixer le contrat).
     PermissionAsk(PermissionReq),
     EndTurn,
+    Interrupted,
     Exhausted(ExhaustReason),
     Error(AgentError),
 }

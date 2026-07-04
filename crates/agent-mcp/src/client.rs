@@ -82,7 +82,7 @@ impl McpConnection {
                 .await
                 .map_err(|_| McpError::Connect {
                     server: name.to_string(),
-                    message: format!("timeout après {}s", CONNECT_TIMEOUT.as_secs()),
+                    message: format!("timeout after {}s", CONNECT_TIMEOUT.as_secs()),
                 })?
                 .map_err(|e| McpError::Connect {
                     server: name.to_string(),
@@ -97,11 +97,11 @@ impl McpConnection {
             .await
             .map_err(|_| McpError::Connect {
                 server: name.to_string(),
-                message: format!("list_tools timeout après {}s", LIST_TOOLS_TIMEOUT.as_secs()),
+                message: format!("list_tools timeout after {}s", LIST_TOOLS_TIMEOUT.as_secs()),
             })?
             .map_err(|e| McpError::Connect {
                 server: name.to_string(),
-                message: format!("list_tools : {e}"),
+                message: format!("list_tools: {e}"),
             })?;
         Ok(tools
             .into_iter()

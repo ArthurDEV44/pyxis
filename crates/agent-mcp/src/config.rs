@@ -81,22 +81,22 @@ impl McpConfigIssue {
                 format!("{} ({}) disabled", self.server, self.source.short_label())
             }
             McpConfigIssueKind::UnsupportedTransport => format!(
-                "{} ({}) transport non-stdio ignoré",
+                "{} ({}) non-stdio transport ignored",
                 self.server,
                 self.source.short_label()
             ),
             McpConfigIssueKind::InvalidEntry(err) => format!(
-                "{} ({}) entrée invalide: {err}",
+                "{} ({}) invalid entry: {err}",
                 self.server,
                 self.source.short_label()
             ),
             McpConfigIssueKind::EmptyCommand => format!(
-                "{} ({}) commande vide ignorée",
+                "{} ({}) empty command ignored",
                 self.server,
                 self.source.short_label()
             ),
             McpConfigIssueKind::Shadowed { kept_source } => format!(
-                "{} ({}) masqué par {}",
+                "{} ({}) shadowed by {}",
                 self.server,
                 self.source.short_label(),
                 kept_source.short_label()

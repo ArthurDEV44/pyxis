@@ -328,12 +328,12 @@ mod tests {
 
     #[test]
     fn user_text_maps_to_input_text_message() {
-        let body = request_body(&req(vec![Message::user("bonjour")], vec![], None));
+        let body = request_body(&req(vec![Message::user("hello")], vec![], None));
         let item = &body["input"][0];
         assert_eq!(item["type"], "message");
         assert_eq!(item["role"], "user");
         assert_eq!(item["content"][0]["type"], "input_text");
-        assert_eq!(item["content"][0]["text"], "bonjour");
+        assert_eq!(item["content"][0]["text"], "hello");
     }
 
     #[test]
@@ -341,14 +341,14 @@ mod tests {
         let summary = Message {
             role: Role::User,
             content: vec![ContentBlock::Summary {
-                text: "résumé".into(),
+                text: "summary".into(),
                 source_untrusted: false,
             }],
         };
         let body = request_body(&req(vec![summary], vec![], None));
         let item = &body["input"][0];
         assert_eq!(item["content"][0]["type"], "input_text");
-        assert_eq!(item["content"][0]["text"], "résumé");
+        assert_eq!(item["content"][0]["text"], "summary");
     }
 
     #[test]
@@ -370,7 +370,7 @@ mod tests {
     fn assistant_tooluse_and_tool_result_correlate_by_call_id() {
         let assistant = Message::assistant(vec![
             ContentBlock::Text {
-                text: "j'appelle".into(),
+                text: "calling".into(),
             },
             ContentBlock::ToolUse {
                 id: "call_42".into(),
@@ -378,7 +378,7 @@ mod tests {
                 input: json!({ "cmd": "ls" }),
             },
         ]);
-        let tool = Message::tool_result("call_42", "fichiers...", false);
+        let tool = Message::tool_result("call_42", "files...", false);
         let body = request_body(&req(vec![assistant, tool], vec![], None));
         let input = body["input"].as_array().unwrap();
 
@@ -399,12 +399,12 @@ mod tests {
         assert_eq!(out["call_id"], "call_42");
         let output = out["output"].as_str().unwrap();
         assert!(output.contains("untrusted_tool_output"));
-        assert!(output.contains("fichiers..."));
+        assert!(output.contains("files..."));
     }
 
     #[test]
     fn trusted_tool_result_stays_raw_for_provider() {
-        let tool = Message::tool_result_with_trust("call_1", "confirmé", false, false);
+        let tool = Message::tool_result_with_trust("call_1", "confirmed", false, false);
         let body = request_body(&req(vec![tool], vec![], None));
         let out = body["input"]
             .as_array()
@@ -412,14 +412,14 @@ mod tests {
             .iter()
             .find(|i| i["type"] == "function_call_output")
             .unwrap();
-        assert_eq!(out["output"], "confirmé");
+        assert_eq!(out["output"], "confirmed");
     }
 
     #[test]
     fn tools_map_to_flat_function_with_strict_schema() {
         let spec = ToolSpec {
             name: "read".into(),
-            description: "lit un fichier".into(),
+            description: "reads a file".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": { "path": {"type":"string"} },
@@ -453,7 +453,7 @@ mod tests {
         let emojis: String = "🦀".repeat(70);
         let clamped = clamp_cache_key(&emojis);
         assert_eq!(clamped.chars().count(), 64);
-        assert!(clamped.ends_with('🦀'), "pas de coupe mid-codepoint");
+        assert!(clamped.ends_with('🦀'), "no mid-codepoint cut");
     }
 
     #[test]
@@ -527,14 +527,14 @@ mod tests {
             .iter()
             .position(|i| i["type"] == "function_call")
             .unwrap();
-        assert!(rs < fc, "reasoning avant function_call (paire rs/fc)");
+        assert!(rs < fc, "reasoning before function_call");
         assert_eq!(input[rs]["id"], "rs_1");
         assert_eq!(input[rs]["encrypted_content"], "ENC");
 
         // reasoning ORPHELIN (message sans tool_use) → sauté (pas de 400).
         let orphan = Message::assistant(vec![
             ContentBlock::Text {
-                text: "juste du texte".into(),
+                text: "just text".into(),
             },
             ContentBlock::EncryptedReasoning {
                 id: "rs_x".into(),
@@ -548,7 +548,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|i| i["type"] != "reasoning"),
-            "reasoning orphelin sauté"
+            "orphan reasoning skipped"
         );
     }
 
@@ -562,7 +562,7 @@ mod tests {
                 input: json!({}),
             },
             ContentBlock::Text {
-                text: "après".into(),
+                text: "after".into(),
             },
         ]);
         let body = request_body(&req(vec![assistant], vec![], None));

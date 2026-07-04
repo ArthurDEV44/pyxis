@@ -54,15 +54,15 @@ pub enum AgentError {
     Provider(ProviderFailure),
     #[error("auth: {0:?}")]
     Auth(AuthError),
-    #[error("contexte irrécupérable (compaction échouée): {0}")]
+    #[error("unrecoverable context (compaction failed): {0}")]
     ContextUnrecoverable(String),
-    #[error("compaction: circuit breaker ({0} échecs consécutifs)")]
+    #[error("compaction: circuit breaker ({0} consecutive failures)")]
     CompactionCircuitBreaker(u32),
     #[error("compaction: {0}")]
     Compaction(String),
     #[error("session: {0}")]
     Session(String),
-    #[error("requête invalide: {0}")]
+    #[error("invalid request: {0}")]
     InvalidRequest(String),
 }
 
@@ -112,7 +112,7 @@ impl From<&ProviderError> for ProviderFailure {
             ProviderError::ContextLengthExceeded => Self {
                 kind: ProviderFailureKind::ContextLengthExceeded,
                 status: Some(413),
-                message: "contexte trop long (PTL/413)".to_string(),
+                message: "context too long (PTL/413)".to_string(),
                 retry_after_ms: None,
             },
         }

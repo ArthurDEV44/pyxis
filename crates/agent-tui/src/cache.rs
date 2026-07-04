@@ -68,7 +68,7 @@ impl RenderCache {
     ) -> &[Line<'static>] {
         debug_assert!(
             i < self.slots.len(),
-            "begin() doit dimensionner le cache à >= i+1 slots avant block_lines"
+            "begin() should size the cache to >= i+1 slots before block_lines"
         );
         let slot = &mut self.slots[i];
         if slot.fp != Some(fp) {

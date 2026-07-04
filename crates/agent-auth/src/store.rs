@@ -13,9 +13,9 @@ const SERVICE: &str = "pyxis";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
-    #[error("secret store indisponible : {0} (fallback : variable d'env, cf. doc)")]
+    #[error("secret store unavailable: {0} (fallback: env var, see docs)")]
     Keyring(#[from] keyring::Error),
-    #[error("(dé)sérialisation credential : {0}")]
+    #[error("credential serialization/deserialization: {0}")]
     Serde(#[from] serde_json::Error),
 }
 

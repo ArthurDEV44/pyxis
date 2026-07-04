@@ -32,20 +32,20 @@ impl Tool for Bash {
     }
     fn description(&self) -> String {
         #[cfg(windows)]
-        let description = "Exécute une commande PowerShell (powershell.exe -NoProfile -NonInteractive -Command) dans le workspace et retourne \
-         stdout/stderr et le code de sortie. La commande tourne sous timeout. \
-         Paramètre : command.";
+        let description = "Run a PowerShell command (powershell.exe -NoProfile -NonInteractive -Command) in the workspace and return \
+         stdout/stderr plus the exit code. The command runs under a timeout. \
+         Parameter: command.";
         #[cfg(not(windows))]
-        let description = "Exécute une commande shell (sh -c) dans le workspace et retourne \
-         stdout/stderr et le code de sortie. La commande tourne sous timeout. \
-         Paramètre : command.";
+        let description = "Run a shell command (sh -c) in the workspace and return \
+         stdout/stderr plus the exit code. The command runs under a timeout. \
+         Parameter: command.";
         description.to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "command": { "type": "string", "description": "Commande shell à exécuter." }
+                "command": { "type": "string", "description": "Shell command to execute." }
             },
             "required": ["command"],
             "additionalProperties": false
@@ -67,12 +67,12 @@ impl Tool for Bash {
     }
     fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
         if input.command.trim().is_empty() {
-            return Err(ValidationError::new("commande vide"));
+            return Err(ValidationError::new("empty command"));
         }
         let bytes = input.command.len();
         if bytes > MAX_COMMAND_BYTES {
             return Err(ValidationError::new(format!(
-                "commande trop longue: {bytes} octets > {MAX_COMMAND_BYTES}"
+                "command too large: {bytes} bytes > {MAX_COMMAND_BYTES}"
             )));
         }
         Ok(())
@@ -126,7 +126,7 @@ impl Tool for Bash {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| ToolError::Io(format!("lancement du shell: {e}")))?;
+            .map_err(|e| ToolError::Io(format!("shell launch: {e}")))?;
         let pid = child.id();
 
         let stdout = child.stdout.take();
@@ -147,7 +147,7 @@ impl Tool for Bash {
         let mut cleanup_timed_out = false;
         let (status, timed_out) = match tokio::time::timeout(ctx.timeout, child.wait()).await {
             Ok(res) => (
-                Some(res.map_err(|e| ToolError::Io(format!("attente du shell: {e}")))?),
+                Some(res.map_err(|e| ToolError::Io(format!("shell wait: {e}")))?),
                 false,
             ),
             Err(_) => {
@@ -172,10 +172,10 @@ impl Tool for Bash {
         } else {
             let stdout = stdout_task
                 .await
-                .map_err(|e| ToolError::Io(format!("lecture stdout: {e}")))?;
+                .map_err(|e| ToolError::Io(format!("stdout read: {e}")))?;
             let stderr = stderr_task
                 .await
-                .map_err(|e| ToolError::Io(format!("lecture stderr: {e}")))?;
+                .map_err(|e| ToolError::Io(format!("stderr read: {e}")))?;
             (stdout, stderr)
         };
 
@@ -184,7 +184,7 @@ impl Tool for Bash {
         let stderr_text = String::from_utf8_lossy(&stderr.bytes);
         if stdout.omitted > 0 {
             body.push_str(&format!(
-                "[... stdout tronqué, {} octets, début omis]\n",
+                "[... stdout truncated, {} bytes, beginning omitted]\n",
                 stdout.omitted
             ));
         }
@@ -197,7 +197,7 @@ impl Tool for Bash {
             }
             if stderr.omitted > 0 {
                 body.push_str(&format!(
-                    "[... stderr tronqué, {} octets, début omis]\n",
+                    "[... stderr truncated, {} bytes, beginning omitted]\n",
                     stderr.omitted
                 ));
             }
@@ -211,9 +211,9 @@ impl Tool for Bash {
             if !body.is_empty() && !body.ends_with('\n') {
                 body.push('\n');
             }
-            body.push_str("[timeout outil dépassé]");
+            body.push_str("[tool timeout exceeded]");
             if cleanup_timed_out {
-                body.push_str("\n[cleanup process-tree incomplet après timeout]");
+                body.push_str("\n[process-tree cleanup incomplete after timeout]");
             }
             return Ok(ToolOutput::error(body));
         }
@@ -222,16 +222,16 @@ impl Tool for Bash {
         match code {
             Some(0) => {
                 if body.is_empty() {
-                    body.push_str("(aucune sortie, succès)");
+                    body.push_str("(no output, success)");
                 }
                 Ok(ToolOutput::text(body))
             }
             Some(n) => {
-                body.push_str(&format!("\n[code de sortie {n}]"));
+                body.push_str(&format!("\n[exit code {n}]"));
                 Ok(ToolOutput::error(body))
             }
             None => {
-                body.push_str("\n[terminé par signal]");
+                body.push_str("\n[terminated by signal]");
                 Ok(ToolOutput::error(body))
             }
         }
@@ -316,7 +316,7 @@ fn truncate_tail(body: &str, max: usize) -> String {
         cut += 1;
     }
     format!(
-        "[... sortie tronquée, {cut} octets, début omis]\n{}",
+        "[... output truncated, {cut} bytes, beginning omitted]\n{}",
         &body[cut..]
     )
 }
@@ -327,27 +327,27 @@ mod tests {
 
     #[test]
     fn tail_truncation_keeps_the_end_and_marks_omission() {
-        // 10 lignes ; on tronque pour ne garder que la fin (où vivent erreurs/exit).
-        let body: String = (0..10).map(|i| format!("ligne{i}\n")).collect();
+        let body: String = (0..10).map(|i| format!("line{i}\n")).collect();
         let out = truncate_tail(&body, 20);
-        assert!(out.starts_with("[... sortie tronquée, "));
-        assert!(out.contains("octets, début omis]"));
-        assert!(out.contains("ligne9"), "la fin doit être conservée: {out}");
-        assert!(!out.contains("ligne0"), "le début doit être omis: {out}");
+        assert!(out.starts_with("[... output truncated, "));
+        assert!(out.contains("bytes, beginning omitted]"));
+        assert!(out.contains("line9"), "the end should be preserved: {out}");
+        assert!(
+            !out.contains("line0"),
+            "the beginning should be omitted: {out}"
+        );
     }
 
     #[test]
     fn tail_truncation_is_char_boundary_safe() {
-        // coupe au milieu d'un flux multi-octets → pas de panic, frontière respectée.
-        let body = "é".repeat(100); // 200 octets
+        let body = "¢".repeat(100);
         let out = truncate_tail(&body, 51);
-        assert!(out.contains("début omis]"));
-        // le suffixe conservé est de l'UTF-8 valide (aucune coupe mid-codepoint).
-        assert!(out.ends_with('é'));
+        assert!(out.contains("beginning omitted]"));
+        assert!(out.ends_with('¢'));
     }
 
     #[test]
     fn short_output_is_untouched() {
-        assert_eq!(truncate_tail("court", 30_000), "court");
+        assert_eq!(truncate_tail("short", 30_000), "short");
     }
 }

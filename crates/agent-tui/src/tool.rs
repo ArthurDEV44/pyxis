@@ -119,9 +119,9 @@ pub fn error_summary(content: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("(échec sans message)");
+        .unwrap_or("(failure without message)");
     let first = trunc(first, 120);
-    if first.starts_with("Error") || first.starts_with("error") || first.starts_with("Erreur") {
+    if first.starts_with("Error") || first.starts_with("error") {
         first
     } else {
         format!("Error: {first}")
@@ -148,7 +148,7 @@ pub fn extra_lines(content: &str) -> usize {
 /// « connexion refusée ») ne doit pas être prise pour un refus volontaire.
 pub fn is_user_rejection(content: &str) -> bool {
     let t = content.trim_start();
-    (t.starts_with("permission refusée pour") || t.starts_with("action «")) && t.contains("refusée")
+    t.starts_with("permission denied for") || t.starts_with("action \"")
 }
 
 /// Libellé d'un rejet (ton atténué) : 1re ligne non vide, ANSI strippé.
@@ -158,7 +158,7 @@ pub fn reject_summary(content: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())
-        .unwrap_or("action refusée");
+        .unwrap_or("action rejected");
     trunc(first, 120)
 }
 
@@ -249,7 +249,7 @@ mod tests {
                 "edit",
                 &json!({"old_string": "x\ny", "new_string": "a\nb\nc"}),
             )),
-            "Édité : f (niveau 1)",
+            "Edited: f (level 1)",
             &theme,
         );
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -280,51 +280,47 @@ mod tests {
     #[test]
     fn orphan_result_degrades_without_panic() {
         let theme = Theme::new(false);
-        let spans = result_summary(None, "sortie quelconque\nsuite", &theme);
+        let spans = result_summary(None, "some output\nnext", &theme);
         assert_eq!(
             spans.iter().map(|s| s.content.as_ref()).collect::<String>(),
-            "sortie quelconque"
+            "some output"
         );
     }
 
     #[test]
     fn error_summary_prefixes_once() {
+        assert_eq!(error_summary("anchor not found"), "Error: anchor not found");
         assert_eq!(
-            error_summary("ancre introuvable"),
-            "Error: ancre introuvable"
+            error_summary("Error: already prefixed"),
+            "Error: already prefixed"
         );
-        assert_eq!(error_summary("Error: déjà préfixé"), "Error: déjà préfixé");
-        assert_eq!(error_summary("   \n  vrai message"), "Error: vrai message");
+        assert_eq!(error_summary("   \n  real message"), "Error: real message");
     }
 
     #[test]
     fn error_summary_strips_ansi() {
-        let out = error_summary("\u{1b}[31mErreur rouge\u{1b}[0m");
-        assert_eq!(out, "Erreur rouge");
-        assert!(!out.contains('\u{1b}'), "résidu ANSI: {out:?}");
+        let out = error_summary("\u{1b}[31mRed error\u{1b}[0m");
+        assert_eq!(out, "Error: Red error");
+        assert!(!out.contains('\u{1b}'), "ANSI residue: {out:?}");
     }
 
     #[test]
     fn extra_lines_counts_beyond_first() {
-        assert_eq!(extra_lines("seule"), 0);
+        assert_eq!(extra_lines("single"), 0);
         assert_eq!(extra_lines("a\nb\nc"), 2);
         assert_eq!(extra_lines("a\n\n  \nb"), 1);
     }
 
     #[test]
     fn rejection_detected_from_registry_messages() {
+        assert!(is_user_rejection("action \"edit\" rejected by user"));
         assert!(is_user_rejection(
-            "action « edit » refusée par l'utilisateur"
+            "permission denied for \"bash\" (mode Plan)"
         ));
-        assert!(is_user_rejection(
-            "permission refusée pour « bash » (mode Plan)"
-        ));
-        assert!(!is_user_rejection("ancre introuvable"));
-        // Faux positif écarté : une vraie erreur d'outil qui cite « refusée » (sortie
-        // bash, hôte distant) n'est PAS un rejet volontaire (US-036).
-        assert!(!is_user_rejection("curl: (7) connexion refusée par l'hôte"));
+        assert!(!is_user_rejection("anchor not found"));
+        assert!(!is_user_rejection("curl: (7) connection refused by host"));
         assert!(!is_user_rejection(
-            "la connexion a été refusée par le serveur"
+            "the connection was refused by the server"
         ));
     }
 }

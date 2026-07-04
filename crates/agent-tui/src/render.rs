@@ -24,6 +24,8 @@ use crate::tool;
 const INDENT: &str = "  ";
 /// Zone de saisie : box bordée (3 lignes) + ligne de statut (1).
 const INPUT_HEIGHT: u16 = 4;
+const PROGRESS_HEIGHT: u16 = 1;
+const PROGRESS_GAP_HEIGHT: u16 = 1;
 const MENU_MAX_ITEMS: u16 = 8;
 
 /// Rendu complet d'une frame.
@@ -34,7 +36,7 @@ pub fn render(frame: &mut Frame, state: &AppState) {
     // En bas : soit le dialog de permission, soit (status + input).
     let bottom_height = match &state.pending {
         Some(p) => permission_height(p, area.width),
-        None => INPUT_HEIGHT,
+        None => input_height(state),
     };
     // Menu de commandes slash : popup intercalé entre transcript et input (jamais
     // pendant un dialog de permission). +1 ligne pour le rappel des raccourcis.
@@ -81,7 +83,7 @@ pub fn render_parity(
 
     let bottom_height = match &state.pending {
         Some(p) => permission_height(p, area.width),
-        None => INPUT_HEIGHT,
+        None => input_height(state),
     };
     let matches = state.menu_items();
     let menu_open = state.pending.is_none() && !matches.is_empty();
@@ -323,7 +325,7 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             theme.accent().add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "ton agent de code en terminal",
+            "your terminal coding agent",
             theme.dim().add_modifier(Modifier::ITALIC),
         )),
         Line::default(),
@@ -336,16 +338,18 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         meta.push(Span::styled("  ·  ", theme.faint()));
         meta.push(Span::styled(state.workspace.clone(), theme.dim()));
     }
+    meta.push(Span::styled("  ·  ", theme.faint()));
+    meta.push(Span::styled(state.permission_mode_label(), theme.dim()));
     info.push(Line::from(meta));
     if state.provider_connected {
         info.push(Line::from(vec![
             Span::styled("✓ codex", theme.accent()),
-            Span::styled("  abonnement ChatGPT", theme.dim()),
+            Span::styled("  ChatGPT subscription", theme.dim()),
         ]));
     } else {
         info.push(Line::from(vec![
-            Span::styled("○ non connecté", theme.accent()),
-            Span::styled("  relance pyxis pour reconnecter", theme.dim()),
+            Span::styled("○ not connected", theme.accent()),
+            Span::styled("  restart pyxis to reconnect", theme.dim()),
         ]));
     }
     info.push(Line::default());
@@ -354,10 +358,12 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         Span::styled("  ·  ", theme.faint()),
         Span::styled("/models", theme.accent()),
         Span::styled("  ·  ", theme.faint()),
+        Span::styled("/permissions", theme.accent()),
+        Span::styled("  ·  ", theme.faint()),
         Span::styled("/goal", theme.accent()),
     ]));
     info.push(Line::from(Span::styled(
-        "⌃C quitter   ·   ↑ historique",
+        format!("{}   ·   ↑ history", shortcut_hint(state)),
         theme.faint(),
     )));
 
@@ -440,7 +446,7 @@ fn render_command_menu(
     if visible_items == 0 {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("{INDENT}↑↓ naviguer · ⏎ exécuter · ⇥ compléter · esc annuler"),
+                format!("{INDENT}↑↓ navigate · enter run · tab complete · esc cancel"),
                 theme.faint(),
             ))),
             area,
@@ -509,13 +515,13 @@ fn render_command_menu(
     }
     let footer = if matches.len() > visible_items {
         format!(
-            "{INDENT}{}-{}/{} · ↑↓ naviguer · ⏎ exécuter · ⇥ compléter · esc annuler",
+            "{INDENT}{}-{}/{} · ↑↓ navigate · enter run · tab complete · esc cancel",
             start + 1,
             end,
             matches.len()
         )
     } else {
-        format!("{INDENT}↑↓ naviguer · ⏎ exécuter · ⇥ compléter · esc annuler")
+        format!("{INDENT}↑↓ navigate · enter run · tab complete · esc cancel")
     };
     lines.push(Line::from(Span::styled(footer, theme.faint())));
 
@@ -601,8 +607,8 @@ fn render_scroll_pill(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     if state.scroll == 0 || state.unseen == 0 || area.height == 0 {
         return;
     }
-    let plural = if state.unseen > 1 { "x" } else { "" };
-    let label = format!(" ↓ {} nouveau{plural} · ⇟ ", state.unseen);
+    let noun = if state.unseen > 1 { "items" } else { "item" };
+    let label = format!(" ↓ {} new {noun} · ⇟ ", state.unseen);
     let w = (measure::width(&label) as u16).min(area.width);
     let pill = Rect {
         x: area.x + area.width.saturating_sub(w),
@@ -669,7 +675,7 @@ fn push_block<'a>(
             // aperçu des dernières lignes pensées (façon « Thinking… »).
             lines.push(Line::from(vec![
                 Span::styled(format!("{INDENT}· "), theme.faint()),
-                Span::styled("réflexion", theme.faint().add_modifier(Modifier::ITALIC)),
+                Span::styled("thinking", theme.faint().add_modifier(Modifier::ITALIC)),
             ]));
             if is_last {
                 let preview_st = theme.faint().add_modifier(Modifier::ITALIC);
@@ -740,7 +746,7 @@ fn push_block<'a>(
                     if extra > 0 {
                         push_wrapped(
                             lines,
-                            vec![Span::styled(format!("… +{extra} lignes"), theme.faint())],
+                            vec![Span::styled(format!("... +{extra} lines"), theme.faint())],
                             Span::styled(format!("{INDENT}  "), theme.faint()),
                             Span::styled(format!("{INDENT}  "), theme.faint()),
                             width,
@@ -988,7 +994,7 @@ fn push_diff(
             }
             Row::Truncated(n) => {
                 lines.push(Line::from(Span::styled(
-                    format!("{INDENT}… +{n} lignes"),
+                    format!("{INDENT}… +{n} lines"),
                     theme.faint(),
                 )));
             }
@@ -1182,17 +1188,33 @@ fn strip_md(line: &str) -> String {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    let rows = Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).split(area);
+    let (progress_area, composer_area, footer_area) = if progress_visible(state) {
+        let rows = Layout::vertical([
+            Constraint::Length(PROGRESS_HEIGHT),
+            Constraint::Length(PROGRESS_GAP_HEIGHT),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        (Some(rows[0]), rows[2], rows[3])
+    } else {
+        let rows = Layout::vertical([Constraint::Length(3), Constraint::Length(1)]).split(area);
+        (None, rows[0], rows[1])
+    };
 
-    let fill = (0..rows[0].height)
-        .map(|_| Line::from(Span::raw(" ".repeat(rows[0].width as usize))))
+    if let Some(progress_area) = progress_area {
+        render_progress_line(frame, progress_area, state, theme);
+    }
+
+    let fill = (0..composer_area.height)
+        .map(|_| Line::from(Span::raw(" ".repeat(composer_area.width as usize))))
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(fill).style(theme.composer()), rows[0]);
+    frame.render_widget(Paragraph::new(fill).style(theme.composer()), composer_area);
 
     let inner = Rect {
-        x: rows[0].x,
-        y: rows[0].y + rows[0].height / 2,
-        width: rows[0].width,
+        x: composer_area.x,
+        y: composer_area.y + composer_area.height / 2,
+        width: composer_area.width,
         height: 1,
     };
 
@@ -1213,7 +1235,19 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
         .min(inner.right().saturating_sub(1));
     frame.set_cursor_position((col, inner.y));
 
-    render_status_line(frame, rows[1], state, theme);
+    render_status_line(frame, footer_area, state, theme);
+}
+
+fn input_height(state: &AppState) -> u16 {
+    if progress_visible(state) {
+        INPUT_HEIGHT + PROGRESS_HEIGHT + PROGRESS_GAP_HEIGHT
+    } else {
+        INPUT_HEIGHT
+    }
+}
+
+fn progress_visible(state: &AppState) -> bool {
+    matches!(state.status, Status::Thinking)
 }
 
 /// Découpe l'input en spans : chaque token `/<skill>` reconnu passe en
@@ -1266,16 +1300,15 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         left.push(Span::styled(" · ", theme.faint()));
         left.push(Span::styled(state.workspace.clone(), theme.success()));
     }
+    left.push(Span::styled(" · ", theme.faint()));
+    left.push(Span::styled(state.permission_mode_label(), theme.dim()));
     if let Some(pct) = state.context_pct {
         left.push(Span::styled(" · ", theme.faint()));
         left.push(Span::styled(context_gauge(pct), theme.faint()));
-        left.push(Span::styled(format!(" {pct}% contexte"), theme.dim()));
+        left.push(Span::styled(format!(" {pct}% context"), theme.dim()));
     }
 
-    let mut right: Vec<Span> = match state.status {
-        Status::Thinking => progress_spans(state, theme, area.width as usize),
-        Status::Idle => Vec::new(),
-    };
+    let right = vec![Span::styled(shortcut_hint(state), theme.faint())];
     // Clampé à `area.width - 1` : sur terminal étroit, le segment droit est tronqué
     // plutôt que d'évincer la colonne gauche (workspace/modèle).
     let right_w = (right
@@ -1287,40 +1320,59 @@ fn render_status_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     let cols = Layout::horizontal([Constraint::Min(1), Constraint::Length(right_w)]).split(area);
 
     frame.render_widget(Paragraph::new(Line::from(left)), cols[0]);
-    right.push(Span::raw(INDENT));
     frame.render_widget(
         Paragraph::new(Line::from(right)).alignment(Alignment::Right),
         cols[1],
     );
 }
 
-/// Spans de progression (status line, pendant un tour) : spinner animé + verbe, et —
-/// si la status line est assez large — durée écoulée (au-delà d'un seuil) + estimation
-/// de tokens (US-044/045). Terminal étroit → seuls spinner + verbe sont gardés.
-fn progress_spans(state: &AppState, theme: &Theme, width: usize) -> Vec<Span<'static>> {
-    let (glyph, gstyle) = crate::spinner::frame(state.spinner_tick, state.reduced_motion, theme);
-    let verb = crate::spinner::verb(state.spinner_tick);
-    let mut spans = vec![
-        Span::styled(glyph, gstyle),
-        Span::styled(format!(" {verb}"), theme.dim()),
-    ];
-    if width >= 56 {
-        if let Some(d) = state.turn_elapsed
-            && d >= crate::spinner::DURATION_MIN
-        {
-            spans.push(Span::styled(
-                format!("  {}", crate::spinner::fmt_duration(d)),
-                theme.faint(),
-            ));
-        }
-        let toks = state.turn_chars / 4;
-        if toks > 0 {
-            spans.push(Span::styled(
-                format!("  ~{}", crate::spinner::fmt_tokens(toks)),
-                theme.faint(),
-            ));
-        }
+fn shortcut_hint(state: &AppState) -> &'static str {
+    if state.quit_shortcut_hint_visible() {
+        "ctrl+c again to quit"
+    } else if matches!(state.status, Status::Thinking) {
+        "ctrl+c interrupt"
+    } else {
+        "ctrl+c twice to quit"
     }
+}
+
+fn render_progress_line(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let line = clip(progress_spans(state, theme), area.width as usize);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn progress_spans(state: &AppState, theme: &Theme) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if !state.reduced_motion {
+        spans.extend(crate::spinner::shimmer_text(
+            "•",
+            state.spinner_tick,
+            false,
+            theme,
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.extend(crate::spinner::shimmer_text(
+        "Working",
+        state.spinner_tick,
+        state.reduced_motion,
+        theme,
+    ));
+    spans.push(Span::raw(" "));
+
+    let elapsed = state.turn_elapsed.unwrap_or_default();
+    spans.push(Span::styled(
+        format!(
+            "({} • esc to interrupt)",
+            crate::spinner::fmt_duration(elapsed)
+        ),
+        theme.dim(),
+    ));
+
     spans
 }
 
@@ -1349,7 +1401,7 @@ fn render_permission(frame: &mut Frame, area: Rect, prompt: &PermissionPrompt, t
         title.push(Span::styled(format!(" · {mode}"), theme.faint()));
     }
     if prompt.taint_forced {
-        title.push(Span::styled(" · sortie non fiable", theme.error()));
+        title.push(Span::styled(" · untrusted output", theme.error()));
     }
     lines.push(clip(title, width));
 
@@ -1365,16 +1417,16 @@ fn render_permission(frame: &mut Frame, area: Rect, prompt: &PermissionPrompt, t
         let hidden = preview.len() - keep;
         lines.extend(preview.into_iter().take(keep));
         lines.push(Line::from(Span::styled(
-            format!("{INDENT}… +{hidden} lignes"),
+            format!("{INDENT}… +{hidden} lines"),
             theme.faint(),
         )));
     }
 
     lines.push(Line::from(vec![
         Span::styled("  [o]", theme.accent()),
-        Span::styled(" autoriser   ", theme.dim()),
+        Span::styled(" allow   ", theme.dim()),
         Span::styled("[n]", theme.accent()),
-        Span::styled(" refuser", theme.dim()),
+        Span::styled(" deny", theme.dim()),
     ]));
 
     // Lignes déjà clippées à la largeur → pas de `Wrap` (hauteur exacte).
@@ -1395,6 +1447,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use agent_core::AgentEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -1447,7 +1500,7 @@ mod tests {
         let mut s = AppState::new("gpt-5.5", true);
         s.workspace = "pyxis".into();
         s.provider_connected = true;
-        assert!(s.is_welcome(), "transcript vide → accueil");
+        assert!(s.is_welcome(), "empty transcript shows welcome");
         let out = draw(&s, 80, 24);
         assert!(out.contains("PYXIS"), "marque absente:\n{out}");
         // Le logo est en points braille (U+2801..=U+28FF, hors blanc U+2800).
@@ -1456,7 +1509,7 @@ mod tests {
             "logo braille absent:\n{out}"
         );
         assert!(out.contains("/help"), "raccourcis absents:\n{out}");
-        assert!(out.contains("gpt-5.5"), "modèle absent:\n{out}");
+        assert!(out.contains("gpt-5.5"), "model missing:\n{out}");
     }
 
     #[test]
@@ -1464,10 +1517,10 @@ mod tests {
         let mut s = AppState::new("gpt-5.5", true);
         s.workspace = "pyxis".into();
         let out = draw(&s, 80, 24);
-        assert!(out.contains("non connecté"), "statut auth absent:\n{out}");
+        assert!(out.contains("not connected"), "auth status missing:\n{out}");
         assert!(
-            out.contains("relance pyxis"),
-            "message de reconnexion absent:\n{out}"
+            out.contains("restart pyxis"),
+            "reconnection message missing:\n{out}"
         );
     }
 
@@ -1475,11 +1528,11 @@ mod tests {
     #[test]
     fn welcome_disappears_after_first_message() {
         let mut s = AppState::new("gpt-5.5", true);
-        s.push_user("salut");
+        s.push_user("hello");
         assert!(!s.is_welcome());
         let out = draw(&s, 80, 24);
-        assert!(out.contains("salut"));
-        assert!(!out.contains("PYXIS"), "accueil doit s'effacer:\n{out}");
+        assert!(out.contains("hello"));
+        assert!(!out.contains("PYXIS"), "welcome should disappear:\n{out}");
     }
 
     #[test]
@@ -1487,8 +1540,8 @@ mod tests {
         let mut s = AppState::new("gpt-5.5", true);
         s.push_user("hello\x1b]0;pwned\x07world");
         let out = draw(&s, 80, 24);
-        assert!(!out.contains('\u{1b}'), "ESC résiduel:\n{out}");
-        assert!(out.contains("helloworld"), "texte assaini absent:\n{out}");
+        assert!(!out.contains('\u{1b}'), "ESC residue:\n{out}");
+        assert!(out.contains("helloworld"), "sanitized text missing:\n{out}");
     }
 
     // Terminal trop étroit pour la carte → repli compact, sans panic, marque visible.
@@ -1499,7 +1552,7 @@ mod tests {
         let out = draw(&s, 30, 8);
         assert!(
             out.contains("PYXIS"),
-            "repli compact doit garder la marque:\n{out}"
+            "compact fallback should keep the brand:\n{out}"
         );
     }
 
@@ -1507,11 +1560,11 @@ mod tests {
     #[test]
     fn markdown_bold_is_not_shown_raw() {
         let mut s = AppState::new("gpt-5", true);
-        s.apply(&AgentEvent::Text("Voici **important** ici".into()));
+        s.apply(&AgentEvent::Text("This is **important** here".into()));
         s.apply(&AgentEvent::EndTurn);
         let out = draw(&s, 50, 10);
         assert!(out.contains("important"), "{out}");
-        assert!(!out.contains("**"), "markdown brut non rendu:\n{out}");
+        assert!(!out.contains("**"), "raw markdown not rendered:\n{out}");
     }
 
     // US-019 AC2 : un diff avec gouttière (numéros) s'affiche dans le dialog.
@@ -1531,15 +1584,9 @@ mod tests {
             preview,
         ));
         let out = draw(&s, 90, 14);
-        assert!(
-            out.contains("autoriser") && out.contains("refuser"),
-            "{out}"
-        );
-        assert!(
-            out.contains("let x = 1;"),
-            "ligne supprimée absente:\n{out}"
-        );
-        assert!(out.contains("let x = 2;"), "ligne ajoutée absente:\n{out}");
+        assert!(out.contains("allow") && out.contains("deny"), "{out}");
+        assert!(out.contains("let x = 1;"), "removed line missing:\n{out}");
+        assert!(out.contains("let x = 2;"), "added line missing:\n{out}");
         assert!(out.contains("edit src/main.rs"));
     }
 
@@ -1550,25 +1597,22 @@ mod tests {
         let mut s = AppState::new("gpt-5", true);
         s.pending = Some(PermissionPrompt::new(
             "edit \x1b]0;pwned\x07evil.rs",
-            "motif\x1b[31m",
+            "reason\x1b[31m",
             crate::diff::Diff::default(),
         ));
         let out = draw(&s, 50, 8);
-        assert!(
-            !out.contains('\u{1b}'),
-            "ESC résiduel dans le dialog:\n{out}"
-        );
-        assert!(out.contains("evil.rs"), "titre assaini préservé:\n{out}");
-        assert!(out.contains("autoriser"), "actions présentes:\n{out}");
+        assert!(!out.contains('\u{1b}'), "ESC residue in dialog:\n{out}");
+        assert!(out.contains("evil.rs"), "sanitized title preserved:\n{out}");
+        assert!(out.contains("allow"), "actions present:\n{out}");
     }
 
     // US-019 AC4 : dégradation sans truecolor — pas de panic, layout intact.
     #[test]
     fn monochrome_degradation_renders_without_panic() {
         let mut s = AppState::new("gpt-5", false);
-        s.apply(&AgentEvent::Text("texte mono".into()));
+        s.apply(&AgentEvent::Text("mono text".into()));
         let out = draw(&s, 30, 8);
-        assert!(out.contains("texte mono"));
+        assert!(out.contains("mono text"));
     }
 
     // US-019 AC4 (bis) : terminal étroit → reflow sans corruption (pas de panic).
@@ -1576,8 +1620,7 @@ mod tests {
     fn narrow_terminal_does_not_corrupt() {
         let mut s = AppState::new("gpt-5", true);
         s.apply(&AgentEvent::Text(
-            "un texte assez long pour devoir wrapper sur plusieurs lignes dans un terminal étroit"
-                .into(),
+            "long enough text to wrap across several lines in a narrow terminal".into(),
         ));
         let _ = draw(&s, 16, 10);
         let _ = draw(&s, 8, 6);
@@ -1590,23 +1633,23 @@ mod tests {
     fn scroll_up_reaches_top_of_wrapped_transcript() {
         let mut s = AppState::new("gpt-5", true);
         for i in 0..10 {
-            s.push_user(format!("message numéro {i} avec un peu de texte en plus"));
-            s.apply(&AgentEvent::Text(format!("réponse {i}")));
+            s.push_user(format!("message number {i} with a little extra text"));
+            s.apply(&AgentEvent::Text(format!("answer {i}")));
             s.apply(&AgentEvent::EndTurn);
         }
         // 1er rendu : publie scroll_max (le transcript déborde la fenêtre étroite).
         let _ = draw(&s, 24, 8);
         assert!(
             s.scroll_max.get() > 0,
-            "transcript débordant → scroll_max > 0"
+            "overflowing transcript should set scroll_max"
         );
         // remonter au-delà de la borne est clampé ; le 1er tour devient visible.
         s.scroll_up(1000);
-        assert_eq!(s.scroll, s.scroll_max.get(), "scroll clampé à la borne");
+        assert_eq!(s.scroll, s.scroll_max.get(), "scroll clamped to bound");
         let out = draw(&s, 24, 8);
         assert!(
-            out.contains("message numéro 0"),
-            "le haut du transcript doit être atteignable:\n{out}"
+            out.contains("message number 0"),
+            "top of transcript should be reachable:\n{out}"
         );
     }
 
@@ -1686,7 +1729,9 @@ mod tests {
             .expect("welcome title should render");
         let prompt_row = out
             .lines()
-            .position(|line| line.contains("›"))
+            .enumerate()
+            .filter_map(|(idx, line)| line.contains("›").then_some(idx))
+            .last()
             .expect("composer prompt should render");
         assert!(
             title_row <= 4,
@@ -1716,7 +1761,7 @@ mod tests {
         }
         let out = draw(&s, 50, 14);
         assert!(out.contains("skill-10"), "{out}");
-        assert!(out.contains("4-11/20"), "fenêtre non scrollée:\n{out}");
+        assert!(out.contains("4-11/20"), "window did not scroll:\n{out}");
     }
 
     // Refus de permission interrompt proprement (état nettoyé) — AC3.
@@ -1770,7 +1815,7 @@ mod tests {
         }));
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),
-            content: "Édité : src/main.rs (niveau 1 : exact)".into(),
+            content: "Edited: src/main.rs (level 1: exact)".into(),
             is_error: false,
             untrusted: false,
             error_kind: None,
@@ -1781,7 +1826,7 @@ mod tests {
         assert!(out.contains('⎿'), "connecteur ⎿ absent:\n{out}");
         assert!(
             out.contains("Added") && out.contains("removed"),
-            "résumé diff absent:\n{out}"
+            "diff summary missing:\n{out}"
         );
     }
 
@@ -1803,7 +1848,7 @@ mod tests {
         }));
         let out = draw(&s, 50, 10);
         assert!(out.contains("Read"), "verbe Read absent:\n{out}");
-        assert!(out.contains("lines"), "compte de lignes absent:\n{out}");
+        assert!(out.contains("lines"), "line count missing:\n{out}");
     }
 
     // US-036 : une erreur d'outil est rendue avec le préfixe Error:.
@@ -1812,14 +1857,14 @@ mod tests {
         let mut s = AppState::new("gpt-5", true);
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "x1".into(),
-            content: "ancre introuvable dans src/x.rs".into(),
+            content: "anchor not found in src/x.rs".into(),
             is_error: true,
             untrusted: true,
             error_kind: None,
         }));
         let out = draw(&s, 60, 8);
-        assert!(out.contains("Error:"), "grammaire d'erreur absente:\n{out}");
-        assert!(out.contains("ancre introuvable"));
+        assert!(out.contains("Error:"), "error grammar missing:\n{out}");
+        assert!(out.contains("anchor not found"));
     }
 
     // US-036 : un rejet utilisateur est distinct d'une erreur (pas de « Error: »).
@@ -1828,16 +1873,16 @@ mod tests {
         let mut s = AppState::new("gpt-5", true);
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "x2".into(),
-            content: "action « edit » refusée par l'utilisateur".into(),
+            content: "action \"edit\" rejected by user".into(),
             is_error: true,
             untrusted: false,
             error_kind: Some(agent_core::ToolErrorKind::PermissionDenied),
         }));
         let out = draw(&s, 64, 8);
-        assert!(out.contains("refusée"), "libellé de rejet absent:\n{out}");
+        assert!(out.contains("rejected"), "rejection label missing:\n{out}");
         assert!(
             !out.contains("Error:"),
-            "le rejet ne doit pas être rendu comme une erreur:\n{out}"
+            "rejection should not render as an error:\n{out}"
         );
     }
 
@@ -1858,7 +1903,7 @@ mod tests {
         assert_eq!(sanitize("fin\x1b"), "fin");
         // Aucun ESC résiduel quel que soit le payload.
         let dirty = "\x1b]0;\x07\x1b[1m\u{9d}\x7f\x1bc texte";
-        assert!(!sanitize(dirty).contains('\u{1b}'), "résidu ESC");
+        assert!(!sanitize(dirty).contains('\u{1b}'), "ESC residue");
     }
 
     // US-038 : un edit réussi affiche le diff coloré (lignes +/-) sous le résumé.
@@ -1874,17 +1919,14 @@ mod tests {
         }));
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),
-            content: "Édité : a.rs (niveau 1)".into(),
+            content: "Edited: a.rs (level 1)".into(),
             is_error: false,
             untrusted: false,
             error_kind: None,
         }));
         let out = draw(&s, 60, 12);
-        assert!(
-            out.contains("let x = 1;"),
-            "ligne supprimée absente:\n{out}"
-        );
-        assert!(out.contains("let x = 2;"), "ligne ajoutée absente:\n{out}");
+        assert!(out.contains("let x = 1;"), "removed line missing:\n{out}");
+        assert!(out.contains("let x = 2;"), "added line missing:\n{out}");
         assert!(
             out.contains('+') && out.contains('-'),
             "signes de diff absents:\n{out}"
@@ -1902,16 +1944,16 @@ mod tests {
         }));
         s.apply(&AgentEvent::ToolResult(agent_core::event::ToolResultView {
             id: "c1".into(),
-            content: "ancre introuvable dans a.rs".into(),
+            content: "anchor not found in a.rs".into(),
             is_error: true,
             untrusted: true,
             error_kind: None,
         }));
         let out = draw(&s, 60, 10);
-        assert!(out.contains("Error:"), "erreur absente:\n{out}");
+        assert!(out.contains("Error:"), "error missing:\n{out}");
         assert!(
             !out.contains("YYY"),
-            "aucun diff ne doit s'afficher sur un edit échoué:\n{out}"
+            "no diff should render for a failed edit:\n{out}"
         );
     }
 
@@ -1920,7 +1962,7 @@ mod tests {
     fn permission_dialog_keeps_actions_visible_on_long_diff() {
         let mut s = AppState::new("gpt-5", true);
         let content = (0..40)
-            .map(|i| format!("ligne {i}"))
+            .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
         let preview = crate::diff::from_tool(
@@ -1928,16 +1970,13 @@ mod tests {
             &serde_json::json!({ "path": "big.rs", "content": content }),
         )
         .unwrap();
-        s.pending = Some(PermissionPrompt::new("write big.rs", "création", preview));
+        s.pending = Some(PermissionPrompt::new("write big.rs", "creation", preview));
         let out = draw(&s, 50, 20);
         assert!(
-            out.contains("autoriser") && out.contains("refuser"),
-            "actions masquées par un diff long:\n{out}"
+            out.contains("allow") && out.contains("deny"),
+            "actions hidden by a long diff:\n{out}"
         );
-        assert!(
-            out.contains("lignes"),
-            "marqueur de troncature absent:\n{out}"
-        );
+        assert!(out.contains("lines"), "truncation marker missing:\n{out}");
     }
 
     // US-041 : le cache ne reconstruit que le bloc qui change ; un resize invalide
@@ -2013,7 +2052,7 @@ mod tests {
             spans
                 .iter()
                 .any(|s| s.content.as_ref() == "x" && s.style == theme.diff_add_word()),
-            "le segment emphasé doit garder le style word-diff"
+            "emphasized segment should keep word-diff style"
         );
 
         // Avec une couleur par caractère : les non-emphasés prennent la teinte fournie
@@ -2029,13 +2068,13 @@ mod tests {
             spans2
                 .iter()
                 .any(|s| s.style.fg == Some(Color::Rgb(1, 2, 3))),
-            "la teinte de syntaxe doit s'appliquer aux segments non emphasés"
+            "syntax tint should apply to non-emphasized segments"
         );
         assert!(
             spans2
                 .iter()
                 .any(|s| s.content.as_ref() == "x" && s.style == theme.diff_add_word()),
-            "l'emphase word-diff prime sur la coloration"
+            "word-diff emphasis takes priority over syntax coloring"
         );
     }
 
@@ -2045,7 +2084,7 @@ mod tests {
     fn diff_segs_spans_aligns_colors_with_multibyte() {
         let theme = Theme::new(true);
         let segs = [crate::diff::Seg {
-            text: "let café = 1; // ☕".into(),
+            text: "let tea = 1; // ☕".into(),
             emphasized: false,
         }];
         let line: String = segs.iter().map(|s| s.text.as_str()).collect();
@@ -2064,27 +2103,50 @@ mod tests {
             spans
                 .iter()
                 .all(|s| s.style.fg == Some(Color::Rgb(9, 9, 9))),
-            "tint complet : pas de désalignement sur les caractères multi-octets"
+            "complete tint, no misalignment on multibyte characters"
         );
     }
 
-    // US-044/045 : pendant un tour, la status line montre spinner + verbe, la durée
-    // (au-delà du seuil) et une estimation de tokens.
+    // US-044/045 : pendant un tour, une ligne Codex-like s'affiche au-dessus du composer.
     #[test]
-    fn progress_shows_verb_duration_tokens_while_thinking() {
+    fn progress_shows_working_status_above_composer() {
         let mut s = AppState::new("gpt-5", true);
         s.push_user("?");
         s.apply(&AgentEvent::Text(
-            "réponse assez longue pour estimer des tokens".into(),
+            "answer long enough to estimate tokens".into(),
         ));
         s.tick_progress(std::time::Duration::from_secs(3));
         let out = draw(&s, 80, 12);
+        assert!(out.contains("Working"), "working status missing:\n{out}");
+        assert!(out.contains("3s"), "duration missing:\n{out}");
         assert!(
-            out.contains("réfléchit"),
-            "verbe de progression absent:\n{out}"
+            out.contains("esc to interrupt"),
+            "interrupt hint missing:\n{out}"
         );
-        assert!(out.contains("3s"), "durée absente:\n{out}");
-        assert!(out.contains('~'), "estimation de tokens absente:\n{out}");
+        assert!(
+            !out.contains('~'),
+            "Codex-like status should not show token estimate:\n{out}"
+        );
+        let status_row = out
+            .lines()
+            .position(|line| line.contains("Working"))
+            .expect("status row should render");
+        let prompt_row = out
+            .lines()
+            .enumerate()
+            .filter_map(|(idx, line)| line.contains("›").then_some(idx))
+            .last()
+            .expect("composer prompt should render");
+        assert!(
+            status_row < prompt_row,
+            "working status should render above the composer:\n{out}"
+        );
+        let rows = out.lines().collect::<Vec<_>>();
+        assert!(
+            rows.get(status_row + 1)
+                .is_some_and(|line| line.trim().is_empty()),
+            "working status should breathe before the composer:\n{out}"
+        );
     }
 
     // US-045 : à la fin du tour, les indicateurs de droite disparaissent.
@@ -2092,14 +2154,47 @@ mod tests {
     fn idle_footer_omits_ready_state() {
         let mut s = AppState::new("gpt-5", true);
         s.push_user("?");
-        s.apply(&AgentEvent::Text("réponse".into()));
+        s.apply(&AgentEvent::Text("answer".into()));
         s.apply(&AgentEvent::EndTurn);
         let out = draw(&s, 80, 12);
+        assert!(out.contains("gpt-5"), "model expected in footer:\n{out}");
+        assert!(!out.contains("ready"), "idle state too verbose:\n{out}");
+    }
+
+    #[test]
+    fn footer_shows_double_ctrl_c_quit_hint() {
+        let s = AppState::new("gpt-5", true);
+        let out = draw(&s, 80, 12);
         assert!(
-            out.contains("gpt-5"),
-            "modèle attendu dans le footer:\n{out}"
+            out.contains("ctrl+c twice to quit"),
+            "double ctrl+c hint missing:\n{out}"
         );
-        assert!(!out.contains("prêt"), "état idle trop verbeux:\n{out}");
+        assert!(
+            !out.contains("^C quit"),
+            "footer should not advertise single ctrl+c quit:\n{out}"
+        );
+    }
+
+    #[test]
+    fn footer_shows_ctrl_c_interrupt_while_running() {
+        let mut s = AppState::new("gpt-5", true);
+        s.push_user("?");
+        let out = draw(&s, 80, 12);
+        assert!(
+            out.contains("ctrl+c interrupt"),
+            "ctrl+c interrupt hint missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn footer_shows_ctrl_c_again_after_first_press() {
+        let mut s = AppState::new("gpt-5", true);
+        s.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        let out = draw(&s, 80, 12);
+        assert!(
+            out.contains("ctrl+c again to quit"),
+            "ctrl+c again hint missing:\n{out}"
+        );
     }
 
     // US-046 : la pill « nouveaux messages » n'apparaît QUE remonté ET contenu arrivé.
@@ -2108,32 +2203,31 @@ mod tests {
         let mut s = AppState::new("gpt-5", true);
         for i in 0..30 {
             s.push_user(format!("q{i}"));
-            s.apply(&AgentEvent::Text(format!("réponse {i}")));
+            s.apply(&AgentEvent::Text(format!("answer {i}")));
             s.apply(&AgentEvent::EndTurn);
         }
         // Collé en bas (scroll == 0) : pas de pill.
         let bottom = draw(&s, 60, 10);
         assert!(
-            !bottom.contains("nouveau"),
-            "pas de pill collé en bas:\n{bottom}"
+            !bottom.contains("new"),
+            "no pill while pinned to bottom:\n{bottom}"
         );
         // L'utilisateur remonte (scroll_max posé par le draw précédent), du contenu arrive.
         s.scroll_up(3);
-        s.apply(&AgentEvent::Text("contenu frais hors de la vue".into()));
+        s.apply(&AgentEvent::Text("fresh content outside the view".into()));
         let up = draw(&s, 60, 10);
         assert!(
-            up.contains("nouveau"),
-            "pill attendue après scroll + contenu:\n{up}"
+            up.contains("new"),
+            "pill expected after scroll plus content:\n{up}"
         );
     }
 
-    // US-044 (robustesse) : la status line en cours de tour ne panique pas et
-    // n'évince pas tout sur un terminal très étroit (right_w clampé).
+    // US-044 (robustesse) : la ligne de progression ne panique pas en terminal étroit.
     #[test]
     fn progress_status_line_survives_narrow_terminal() {
         let mut s = AppState::new("gpt-5", true);
         s.push_user("?");
-        s.apply(&AgentEvent::Text("réponse".into()));
+        s.apply(&AgentEvent::Text("answer".into()));
         s.tick_progress(std::time::Duration::from_secs(3));
         // Largeur 8 : le draw doit aboutir (pas de panic, pas de corruption).
         let out = draw(&s, 8, 6);

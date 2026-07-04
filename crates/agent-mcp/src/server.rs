@@ -111,7 +111,7 @@ impl McpRegistry {
         if matches!(server, McpServer::Connecting { .. }) {
             return Err(McpError::Connect {
                 server: name.to_string(),
-                message: "connexion déjà en cours".to_string(),
+                message: "connection already in progress".to_string(),
             });
         }
         let config = server.config().clone();
@@ -141,7 +141,7 @@ impl McpRegistry {
     /// Applique le succès d'une connexion. N'applique que si le serveur est
     /// toujours `Connecting` (sinon l'utilisateur a déconnecté entre-temps : la
     /// connexion est renvoyée à l'appelant pour fermeture).
-    #[must_use = "la connexion renvoyée doit être fermée (cancel)"]
+    #[must_use = "the returned connection must be closed (cancel)"]
     pub fn finish_connect(
         &mut self,
         name: &str,

@@ -30,13 +30,13 @@ impl SandboxStatus {
         match self {
             SandboxStatus::Enforced => None,
             SandboxStatus::PartiallyEnforced => Some(
-                "sandbox FS partiellement appliqué (Landlock incomplet sur ce kernel) : garanties réduites",
+                "filesystem sandbox partially applied (incomplete Landlock support on this kernel): reduced guarantees",
             ),
             SandboxStatus::NotEnforced => Some(
-                "sandbox FS NON appliqué (kernel sans Landlock effectif) : écritures non confinées",
+                "filesystem sandbox NOT applied (kernel lacks effective Landlock support): writes are not confined",
             ),
             SandboxStatus::UnsupportedPlatform => Some(
-                "sandbox FS désactivé (hors Linux) : Pyxis est Linux-first ; écritures non confinées",
+                "filesystem sandbox disabled (non-Linux): Pyxis is Linux-first; writes are not confined",
             ),
         }
     }

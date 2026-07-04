@@ -33,18 +33,17 @@ impl Tool for Glob {
         "glob"
     }
     fn description(&self) -> String {
-        "Liste les fichiers du workspace correspondant à un motif glob (ex. \
-         \"**/*.rs\", \"src/*.toml\"). Paramètres : pattern (le motif), path \
-         (sous-dossier de base, optionnel). Chemins retournés relatifs au \
-         workspace."
+        "List workspace files matching a glob pattern (for example \"**/*.rs\" \
+         or \"src/*.toml\"). Parameters: pattern (the glob), path (optional base \
+         subdirectory). Returned paths are relative to the workspace."
             .to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": { "type": "string", "description": "Motif glob, ex. **/*.rs" },
-                "path": { "type": ["string", "null"], "description": "Sous-dossier de base (relatif au workspace), ou null." }
+                "pattern": { "type": "string", "description": "Glob pattern, for example **/*.rs." },
+                "path": { "type": ["string", "null"], "description": "Base subdirectory relative to the workspace, or null." }
             },
             "required": ["pattern", "path"],
             "additionalProperties": false
@@ -62,7 +61,7 @@ impl Tool for Glob {
     fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
         GlobPattern::new(&input.pattern)
             .map(|_| ())
-            .map_err(|e| ValidationError::new(format!("motif glob invalide: {e}")))
+            .map_err(|e| ValidationError::new(format!("invalid glob pattern: {e}")))
     }
     fn permission(&self, _input: &Self::Input, _ctx: &PermCtx) -> PermissionDecision {
         PermissionDecision::Allow
@@ -70,7 +69,7 @@ impl Tool for Glob {
 
     async fn call(&self, input: Self::Input, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let matcher = GlobPattern::new(&input.pattern)
-            .map_err(|e| ToolError::Rejected(format!("motif glob invalide: {e}")))?
+            .map_err(|e| ToolError::Rejected(format!("invalid glob pattern: {e}")))?
             .compile_matcher();
         let base = match &input.path {
             Some(p) => confine(&ctx.workspace, p)?,
@@ -105,13 +104,11 @@ impl Tool for Glob {
         .map_err(|e| ToolError::Io(format!("walk: {e}")))?;
 
         if matches.is_empty() {
-            return Ok(ToolOutput::text(format!(
-                "(aucun fichier ne correspond à « {pattern} »)"
-            )));
+            return Ok(ToolOutput::text(format!("(no files match \"{pattern}\")")));
         }
         let mut body = matches.join("\n");
         if matches.len() >= MAX_MATCHES {
-            body.push_str(&format!("\n… (tronqué à {MAX_MATCHES} résultats)"));
+            body.push_str(&format!("\n... (truncated at {MAX_MATCHES} results)"));
         }
         Ok(ToolOutput::text(body))
     }

@@ -530,6 +530,22 @@ impl TranscriptMapper {
                 })
             }
             AgentEvent::EndTurn => self.complete_active_streams(),
+            AgentEvent::Interrupted => {
+                let mut updates = self.drain_active_streams();
+                updates.push(TranscriptUpdate::new(
+                    TranscriptLifecycle::Completed,
+                    TranscriptItem::new(
+                        Some(self.next_local("notice")),
+                        TranscriptRole::System,
+                        TranscriptItemKind::Notice,
+                        TranscriptItemStatus::Complete,
+                        TranscriptPayload::Notice {
+                            message: "interrupted".to_string(),
+                        },
+                    ),
+                ));
+                updates
+            }
             AgentEvent::Exhausted(reason) => {
                 let mut updates = self.drain_active_streams();
                 updates.push(TranscriptUpdate::new(
@@ -595,6 +611,21 @@ impl TranscriptMapper {
             ),
         ));
         updates
+    }
+
+    pub fn map_notice(&mut self, message: impl Into<String>) -> TranscriptUpdate {
+        TranscriptUpdate::new(
+            TranscriptLifecycle::Completed,
+            TranscriptItem::new(
+                Some(self.next_local("notice")),
+                TranscriptRole::System,
+                TranscriptItemKind::Notice,
+                TranscriptItemStatus::Complete,
+                TranscriptPayload::Notice {
+                    message: message.into(),
+                },
+            ),
+        )
     }
 
     pub fn map_approval_decision(&mut self, allow: bool) -> TranscriptUpdate {
@@ -936,14 +967,15 @@ impl AppEventDispatcher {
                 state.push_user(prompt.clone());
                 self.surface
                     .apply_update(self.mapper.map_user_message(prompt));
-                state
-                    .blocks
-                    .push(Block::Notice("Message ajouté à la file d'attente.".into()));
+                state.blocks.push(Block::Notice("Message queued.".into()));
             }
             AppEvent::Agent(event) => {
                 outcome.agent_stopped = matches!(
                     event,
-                    AgentEvent::EndTurn | AgentEvent::Error(_) | AgentEvent::Exhausted(_)
+                    AgentEvent::EndTurn
+                        | AgentEvent::Interrupted
+                        | AgentEvent::Error(_)
+                        | AgentEvent::Exhausted(_)
                 );
                 state.apply(&event);
                 for update in self.mapper.map_event(&event) {
@@ -958,9 +990,9 @@ impl AppEventDispatcher {
                 self.surface
                     .apply_update(self.mapper.map_approval_decision(allow));
                 let label = if allow {
-                    "permission approuvée"
+                    "permission approved"
                 } else {
-                    "permission refusée"
+                    "permission denied"
                 };
                 state.blocks.push(Block::Notice(label.into()));
             }
@@ -1283,7 +1315,7 @@ mod tests {
             state
                 .blocks
                 .iter()
-                .any(|b| matches!(b, Block::Notice(t) if t.contains("refus")))
+                .any(|b| matches!(b, Block::Notice(t) if t.contains("permission denied")))
         );
 
         dispatcher.dispatch(&mut state, AppEvent::HistoryInsertFailed("io".into()));

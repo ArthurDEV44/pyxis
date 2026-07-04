@@ -432,11 +432,11 @@ mod tests {
 
     #[test]
     fn text_delta_maps() {
-        let ev = ingest_all(&[r#"{"type":"response.output_text.delta","delta":"Bonjour"}"#]);
+        let ev = ingest_all(&[r#"{"type":"response.output_text.delta","delta":"Hello"}"#]);
         assert_eq!(
             ev,
             vec![StreamEvent::TextDelta {
-                text: "Bonjour".into()
+                text: "Hello".into()
             }]
         );
     }
@@ -444,14 +444,14 @@ mod tests {
     #[test]
     fn reasoning_deltas_map() {
         let ev = ingest_all(&[
-            r#"{"type":"response.reasoning_summary_text.delta","delta":"je réfléchis"}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#,
             r#"{"type":"response.reasoning_text.delta","delta":" encore"}"#,
         ]);
         assert_eq!(
             ev,
             vec![
                 StreamEvent::ReasoningDelta {
-                    text: "je réfléchis".into()
+                    text: "thinking".into()
                 },
                 StreamEvent::ReasoningDelta {
                     text: " encore".into()

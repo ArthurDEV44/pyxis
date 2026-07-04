@@ -46,17 +46,17 @@ fn invalid_session(e: impl std::fmt::Display) -> SessionError {
 
 fn validate_checkpoint(messages: &[Message]) -> Result<(), SessionError> {
     if messages.is_empty() {
-        return Err(invalid_session("checkpoint de compaction vide"));
+        return Err(invalid_session("empty compaction checkpoint"));
     }
     if !is_summary_message(&messages[0]) {
         return Err(invalid_session(
-            "checkpoint de compaction sans résumé en premier message",
+            "compaction checkpoint without a summary as the first message",
         ));
     }
     for (i, message) in messages.iter().enumerate() {
         message
             .validate()
-            .map_err(|e| invalid_session(format!("checkpoint message {i} invalide: {e}")))?;
+            .map_err(|e| invalid_session(format!("invalid checkpoint message {i}: {e}")))?;
     }
     Ok(())
 }
@@ -90,7 +90,7 @@ fn open_prepared(path: &Path) -> Result<(WriterState, bool), SessionError> {
         .open(path)
         .map_err(io_err)?;
     file.try_lock()
-        .map_err(|e| io_err(format!("session déjà ouverte ou verrou indisponible: {e}")))?;
+        .map_err(|e| io_err(format!("session already open or lock unavailable: {e}")))?;
 
     let mut resumed = resume_locked_file(&mut file)?;
     if resumed.skipped_partial {
@@ -131,7 +131,7 @@ fn resume_locked_file(file: &mut File) -> Result<ResumedSession, SessionError> {
 fn write_buf_locked(state: &mut WriterState, buf: &str) -> Result<(), SessionError> {
     if state.poisoned {
         return Err(SessionError::Io(
-            "writer session empoisonné après une erreur d'append ; rouvrir la session".into(),
+            "session writer poisoned after an append error; reopen the session".into(),
         ));
     }
     if let Err(e) = state.file.seek(SeekFrom::End(0)) {
@@ -203,14 +203,14 @@ impl JsonlSession {
         let (state, is_empty) = open_prepared(path)?;
         if state.cursor != cursor {
             return Err(invalid_session(format!(
-                "curseur resume incohérent : attendu {}, reçu {cursor}",
+                "incoherent resume cursor: expected {}, got {cursor}",
                 state.cursor
             )));
         }
         *self
             .state
             .lock()
-            .map_err(|_| SessionError::Io("verrou session empoisonné".into()))? = state;
+            .map_err(|_| SessionError::Io("poisoned session lock".into()))? = state;
         if is_empty {
             self.append(&SessionEntry::Meta {
                 schema_version: SESSION_SCHEMA_VERSION,
@@ -223,7 +223,7 @@ impl JsonlSession {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| SessionError::Io("verrou session empoisonné".into()))?;
+            .map_err(|_| SessionError::Io("poisoned session lock".into()))?;
         write_entry_locked(&mut state, entry)
     }
 }
@@ -234,7 +234,7 @@ impl Session for JsonlSession {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| SessionError::Io("verrou session empoisonné".into()))?;
+            .map_err(|_| SessionError::Io("poisoned session lock".into()))?;
         let start = state.cursor.min(messages.len());
         for (offset, m) in messages[start..].iter().enumerate() {
             let mut persisted = m.clone();
@@ -254,7 +254,7 @@ impl Session for JsonlSession {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| SessionError::Io("verrou session empoisonné".into()))?;
+            .map_err(|_| SessionError::Io("poisoned session lock".into()))?;
         let mut persisted = messages.to_vec();
         redact_encrypted_reasoning(&mut persisted);
         write_entry_locked(
@@ -343,7 +343,7 @@ fn apply_entry(
         SessionEntry::Meta { schema_version } => {
             if schema_version > SESSION_SCHEMA_VERSION {
                 return Err(invalid_session(format!(
-                    "schema_version {schema_version} non supporté (max {SESSION_SCHEMA_VERSION})"
+                    "unsupported schema_version {schema_version} (max {SESSION_SCHEMA_VERSION})"
                 )));
             }
             out.schema_version = Some(schema_version);
@@ -414,7 +414,7 @@ fn replay_line(
                 out.valid_bytes = start as u64;
                 Ok(())
             } else {
-                Err(SessionError::Serde(format!("ligne corrompue: {e}")))
+                Err(SessionError::Serde(format!("corrupt line: {e}")))
             }
         }
     }
@@ -444,7 +444,7 @@ fn scan_session(path: &Path) -> Result<SessionScan, SessionError> {
         match serde_json::from_str::<SessionEntry>(parsed) {
             Ok(entry) => apply_scan_entry(&mut scan, &mut pending_clear, entry)?,
             Err(_) if !has_newline => break,
-            Err(e) => return Err(SessionError::Serde(format!("ligne corrompue: {e}"))),
+            Err(e) => return Err(SessionError::Serde(format!("corrupt line: {e}"))),
         }
     }
     Ok(scan)
@@ -488,7 +488,7 @@ fn apply_scan_entry(
         SessionEntry::Meta { schema_version } => {
             if schema_version > SESSION_SCHEMA_VERSION {
                 return Err(invalid_session(format!(
-                    "schema_version {schema_version} non supporté (max {SESSION_SCHEMA_VERSION})"
+                    "unsupported schema_version {schema_version} (max {SESSION_SCHEMA_VERSION})"
                 )));
             }
         }
@@ -666,23 +666,19 @@ mod tests {
         s.sync(&[Message::user("vieux 1"), Message::assistant_text("vieux 2")])
             .await
             .unwrap();
-        s.checkpoint(CompactKind::Auto, &[summary("[résumé]")])
+        s.checkpoint(CompactKind::Auto, &[summary("[summary]")])
             .await
             .unwrap();
         drop(s);
 
         let resumed = resume_dir(&dir).unwrap();
         assert_eq!(resumed.compactions, 1);
-        assert_eq!(
-            resumed.messages.len(),
-            1,
-            "les vieux messages sont compactés"
-        );
-        assert_eq!(resumed.messages[0].text(), "[résumé]");
+        assert_eq!(resumed.messages.len(), 1, "old messages are compacted");
+        assert_eq!(resumed.messages[0].text(), "[summary]");
         let raw = std::fs::read_to_string(dir.join(SESSION_FILE)).unwrap();
         assert!(
             raw.contains("\"entry\":\"compact_checkpoint\""),
-            "nouveaux checkpoints en entrée unique"
+            "new checkpoints as one entry"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -738,7 +734,7 @@ mod tests {
                 input: serde_json::json!({}),
             },
         ]);
-        s.checkpoint(CompactKind::Auto, &[summary("[résumé]"), assistant])
+        s.checkpoint(CompactKind::Auto, &[summary("[summary]"), assistant])
             .await
             .unwrap();
         drop(s);
@@ -771,7 +767,7 @@ mod tests {
         let err = s
             .checkpoint(
                 CompactKind::Auto,
-                &[Message::assistant_text("pas un résumé")],
+                &[Message::assistant_text("not a summary")],
             )
             .await
             .unwrap_err();
@@ -867,10 +863,7 @@ mod tests {
         .unwrap();
 
         let resumed = resume_file(&path).unwrap();
-        assert!(
-            resumed.skipped_partial,
-            "la ligne tronquée doit être ignorée"
-        );
+        assert!(resumed.skipped_partial, "truncated line should be ignored");
         assert_eq!(resumed.messages.len(), 1);
         assert_eq!(resumed.messages[0].text(), "ok");
         let _ = std::fs::remove_dir_all(&dir);
@@ -889,7 +882,7 @@ mod tests {
         .unwrap();
 
         let s = JsonlSession::create_at(&path).unwrap();
-        s.sync(&[Message::user("ok"), Message::assistant_text("suite")])
+        s.sync(&[Message::user("ok"), Message::assistant_text("next")])
             .await
             .unwrap();
         drop(s);
@@ -898,7 +891,7 @@ mod tests {
         assert!(!resumed.skipped_partial);
         assert_eq!(resumed.messages.len(), 2);
         assert_eq!(resumed.messages[0].text(), "ok");
-        assert_eq!(resumed.messages[1].text(), "suite");
+        assert_eq!(resumed.messages[1].text(), "next");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -907,20 +900,20 @@ mod tests {
         let dir = tmp("reopen-cursor");
         let path = dir.join("same.jsonl");
         let first = JsonlSession::create_at(&path).unwrap();
-        first.sync(&[Message::user("ancien")]).await.unwrap();
+        first.sync(&[Message::user("old")]).await.unwrap();
         drop(first);
 
         let second = JsonlSession::create_at(&path).unwrap();
         second
-            .sync(&[Message::user("ancien"), Message::assistant_text("suite")])
+            .sync(&[Message::user("old"), Message::assistant_text("next")])
             .await
             .unwrap();
         drop(second);
 
         let resumed = resume_file(&path).unwrap();
         assert_eq!(resumed.messages.len(), 2, "pas de duplication au reopen");
-        assert_eq!(resumed.messages[0].text(), "ancien");
-        assert_eq!(resumed.messages[1].text(), "suite");
+        assert_eq!(resumed.messages[0].text(), "old");
+        assert_eq!(resumed.messages[1].text(), "next");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -933,7 +926,7 @@ mod tests {
             Ok(_) => "unexpected success".to_string(),
             Err(e) => e.to_string(),
         };
-        assert!(err.contains("verrou"));
+        assert!(err.contains("session already open"));
         drop(_first);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -948,7 +941,7 @@ mod tests {
 
         assert!(
             resume_file(&path).is_err(),
-            "une ligne finale corrompue terminée par newline n'est pas une troncature"
+            "a corrupt final line ending with newline is not a truncation"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1045,8 +1038,8 @@ mod tests {
             pos("a1").unwrap() < pos("a2").unwrap(),
             "ordre intra-session"
         );
-        assert_eq!(prompts.iter().filter(|p| *p == "a2").count(), 1, "dédup");
-        assert!(pos("b1").is_some(), "agrégé depuis une autre session");
+        assert_eq!(prompts.iter().filter(|p| *p == "a2").count(), 1, "dedup");
+        assert!(pos("b1").is_some(), "aggregated from another session");
         assert!(pos("courant").is_none(), "session courante exclue");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1055,20 +1048,20 @@ mod tests {
     async fn switch_to_appends_to_resumed_file() {
         let dir = tmp("switch");
         let old = JsonlSession::create_at(&dir.join("old.jsonl")).unwrap();
-        old.sync(&[Message::user("ancien")]).await.unwrap();
+        old.sync(&[Message::user("old")]).await.unwrap();
         drop(old);
 
         // session courante, puis bascule vers `old` au curseur 1 (1 msg présent).
         let s = JsonlSession::create_at(&dir.join("cur.jsonl")).unwrap();
         s.switch_to(&dir.join("old.jsonl"), 1).unwrap();
-        s.sync(&[Message::user("ancien"), Message::assistant_text("suite")])
+        s.sync(&[Message::user("old"), Message::assistant_text("next")])
             .await
             .unwrap();
         drop(s);
 
         let resumed = resume_file(&dir.join("old.jsonl")).unwrap();
-        assert_eq!(resumed.messages.len(), 2, "le delta s'est appendé à old");
-        assert_eq!(resumed.messages[1].text(), "suite");
+        assert_eq!(resumed.messages.len(), 2, "the delta was appended to old");
+        assert_eq!(resumed.messages[1].text(), "next");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

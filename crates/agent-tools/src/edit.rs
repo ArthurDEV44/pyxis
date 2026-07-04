@@ -19,7 +19,7 @@ use crate::tool::{MAX_EDIT_ANCHOR_BYTES, MAX_EDIT_FILE_BYTES, Tool, ToolCtx, Too
 #[serde(deny_unknown_fields)]
 pub struct EditInput {
     pub path: String,
-    /// Texte à remplacer — doit être unique dans le fichier.
+    /// Text to replace. Must be unique in the file.
     pub old_string: String,
     pub new_string: String,
 }
@@ -34,20 +34,19 @@ impl Tool for Edit {
         "edit"
     }
     fn description(&self) -> String {
-        "Remplace une occurrence unique de texte dans un fichier. old_string doit \
-         localiser une cible unique (sinon l'édition échoue sans rien modifier). \
-         La localisation tolère les divergences d'espaces en fin de ligne et de \
-         caractères Unicode (tirets/guillemets typographiques, NBSP). Paramètres : \
-         path, old_string, new_string."
+        "Replace one unique occurrence of text in a file. old_string must locate \
+         a unique target (otherwise the edit fails without modifying anything). \
+         Matching tolerates trailing-space differences and Unicode variants \
+         (typographic dashes/quotes, NBSP). Parameters: path, old_string, new_string."
             .to_string()
     }
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Chemin du fichier (relatif au workspace)." },
-                "old_string": { "type": "string", "description": "Texte à remplacer (ancre unique)." },
-                "new_string": { "type": "string", "description": "Texte de remplacement." }
+                "path": { "type": "string", "description": "File path relative to the workspace." },
+                "old_string": { "type": "string", "description": "Text to replace (unique anchor)." },
+                "new_string": { "type": "string", "description": "Replacement text." }
             },
             "required": ["path", "old_string", "new_string"],
             "additionalProperties": false
@@ -68,23 +67,23 @@ impl Tool for Edit {
     fn validate_input(&self, input: &Self::Input) -> Result<(), ValidationError> {
         if input.old_string.is_empty() {
             return Err(ValidationError::new(
-                "old_string vide : impossible d'ancrer l'édition",
+                "old_string is empty: cannot anchor the edit",
             ));
         }
         if input.old_string == input.new_string {
             return Err(ValidationError::new(
-                "old_string == new_string : édition sans effet",
+                "old_string == new_string: edit has no effect",
             ));
         }
         if input.old_string.len() > MAX_EDIT_ANCHOR_BYTES {
             return Err(ValidationError::new(format!(
-                "old_string trop volumineux: {} octets > {MAX_EDIT_ANCHOR_BYTES}",
+                "old_string too large: {} bytes > {MAX_EDIT_ANCHOR_BYTES}",
                 input.old_string.len()
             )));
         }
         if input.new_string.len() > MAX_EDIT_ANCHOR_BYTES {
             return Err(ValidationError::new(format!(
-                "new_string trop volumineux: {} octets > {MAX_EDIT_ANCHOR_BYTES}",
+                "new_string too large: {} bytes > {MAX_EDIT_ANCHOR_BYTES}",
                 input.new_string.len()
             )));
         }
@@ -102,7 +101,7 @@ impl Tool for Edit {
             .map_err(|e| ToolError::Io(format!("{}: {e}", input.path)))?;
         if meta.len() > MAX_EDIT_FILE_BYTES {
             return Err(ToolError::Rejected(format!(
-                "{} est trop volumineux pour edit: {} octets > {MAX_EDIT_FILE_BYTES}",
+                "{} is too large for edit: {} bytes > {MAX_EDIT_FILE_BYTES}",
                 input.path,
                 meta.len()
             )));
@@ -122,15 +121,15 @@ impl Tool for Edit {
             ),
             Err(LocateError::Ambiguous { count }) => {
                 return Err(ToolError::Rejected(format!(
-                    "ancre ambiguë dans {} : {} correspondances — ajoutez du contexte \
-                     unique autour de old_string",
+                    "ambiguous anchor in {}: {} matches; add unique context \
+                     around old_string",
                     input.path, count
                 )));
             }
             Err(LocateError::NotFound) => {
                 return Err(ToolError::Rejected(format!(
-                    "ancre introuvable dans {} après 4 passes (exact, trim_end, trim, \
-                     Unicode) — vérifiez old_string ou ajoutez du contexte",
+                    "anchor not found in {} after 4 passes (exact, trim_end, trim, \
+                     Unicode); verify old_string or add context",
                     input.path
                 )));
             }
@@ -138,7 +137,7 @@ impl Tool for Edit {
 
         replace_file_confined(&ctx.workspace, &path, &input.path, updated.as_bytes()).await?;
         Ok(ToolOutput::text(format!(
-            "Édité : {} ({})",
+            "Edited: {} ({})",
             input.path,
             level.label()
         )))
@@ -148,9 +147,9 @@ impl Tool for Edit {
 /// Invariant comportemental co-localisé avec l'outil (US-026), collecté par le
 /// Registry et injecté dans le system prompt.
 const EDIT_GUIDELINES: &[&str] = &[
-    "edit : old_string est cherché dans le contenu ACTUEL du fichier sur disque, \
-     pas après tes autres edits du même tour ; ré-ancre chaque edit sur l'état \
-     courant et inclus assez de contexte pour une ancre unique.",
+    "edit: old_string is searched in the CURRENT file contents on disk, not after \
+     your other edits in the same turn. Re-anchor each edit on the current state \
+     and include enough context for a unique anchor.",
 ];
 
 /// Niveau de passe de localisation atteint (observabilité, US-025 AC4).
@@ -165,10 +164,10 @@ enum MatchLevel {
 impl MatchLevel {
     fn label(self) -> &'static str {
         match self {
-            MatchLevel::Exact => "niveau 1 : exact",
-            MatchLevel::TrimEnd => "niveau 2 : trim_end",
-            MatchLevel::Trim => "niveau 3 : trim",
-            MatchLevel::Unicode => "niveau 4 : normalisation Unicode",
+            MatchLevel::Exact => "level 1: exact",
+            MatchLevel::TrimEnd => "level 2: trim_end",
+            MatchLevel::Trim => "level 3: trim",
+            MatchLevel::Unicode => "level 4: Unicode normalization",
         }
     }
 }
@@ -366,7 +365,7 @@ mod tests {
                     len: 1
                 })
             ),
-            "la passe Unicode doit absorber NBSP/dash/quotes"
+            "Unicode pass should absorb NBSP, dash, and quotes"
         );
     }
 
@@ -392,9 +391,9 @@ mod tests {
             Ok(Anchor::Lines { start, len, .. }) => {
                 assert_eq!((start, len), (1, 2));
                 let out = apply_line_window(content, start, len, "NEW");
-                assert_eq!(out, "a\nNEW\nz\n", "lignes hors-cible intactes");
+                assert_eq!(out, "a\nNEW\nz\n", "untargeted lines intact");
             }
-            _ => unreachable!("localisation par fenêtre attendue"),
+            _ => unreachable!("expected window localization"),
         }
     }
 
@@ -406,9 +405,12 @@ mod tests {
         match locate(content, "foo\nbar") {
             Ok(Anchor::Lines { start, len, .. }) => {
                 let out = apply_line_window(content, start, len, "NEW1\nNEW2");
-                assert_eq!(out, "a\r\nNEW1\r\nNEW2\r\nz\r\n", "CRLF préservé partout");
+                assert_eq!(
+                    out, "a\r\nNEW1\r\nNEW2\r\nz\r\n",
+                    "CRLF preserved throughout"
+                );
             }
-            _ => unreachable!("localisation par fenêtre attendue"),
+            _ => unreachable!("expected window localization"),
         }
     }
 

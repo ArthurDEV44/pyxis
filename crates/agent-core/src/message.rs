@@ -199,7 +199,7 @@ impl Message {
                 && self
                     .content
                     .iter()
-                    .any(|b| matches!(b, ContentBlock::Text { text } if text.starts_with("[Résumé de la conversation précédente]\n"))))
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text.starts_with("[Previous conversation summary]\n"))))
     }
 
     pub fn validate(&self) -> Result<(), MessageValidationError> {
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn summary_source_untrusted_defaults_to_true_for_old_json() {
-        let json = r#"{"type":"summary","text":"résumé"}"#;
+        let json = r#"{"type":"summary","text":"summary"}"#;
         let block: ContentBlock = serde_json::from_str(json).unwrap();
         assert!(matches!(
             block,

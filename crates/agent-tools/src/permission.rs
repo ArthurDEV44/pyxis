@@ -11,6 +11,7 @@
 
 use agent_core::message::ToolCallId;
 use async_trait::async_trait;
+use std::sync::{Arc, RwLock};
 
 /// Les 5 modes de permission (ARCHITECTURE §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -26,6 +27,43 @@ pub enum PermissionMode {
     BypassPermissions,
     /// Lecture seule : aucune mutation autorisée (phase de planification).
     Plan,
+}
+
+/// État partagé du mode de permission courant.
+///
+/// Le registre garde ce handle et la TUI peut le mettre à jour en session via
+/// `/permissions` sans reconstruire les outils.
+#[derive(Debug, Clone)]
+pub struct PermissionModeState {
+    inner: Arc<RwLock<PermissionMode>>,
+}
+
+impl PermissionModeState {
+    pub fn new(mode: PermissionMode) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(mode)),
+        }
+    }
+
+    pub fn get(&self) -> PermissionMode {
+        match self.inner.read() {
+            Ok(mode) => *mode,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    pub fn set(&self, mode: PermissionMode) {
+        match self.inner.write() {
+            Ok(mut current) => *current = mode,
+            Err(poisoned) => *poisoned.into_inner() = mode,
+        }
+    }
+}
+
+impl Default for PermissionModeState {
+    fn default() -> Self {
+        Self::new(PermissionMode::default())
+    }
 }
 
 /// Décision *baseline* d'un outil pour une entrée donnée, avant application des
@@ -324,7 +362,7 @@ mod tests {
                 false
             ),
             Resolved::Allow,
-            "sans taint, DontAsk n'interrompt pas"
+            "without taint, DontAsk does not interrupt"
         );
         assert_eq!(
             res(
@@ -334,7 +372,7 @@ mod tests {
                 true
             ),
             Resolved::Ask,
-            "avec taint récent, l'action sensible force la confirmation"
+            "with recent taint, the sensitive action forces confirmation"
         );
     }
 

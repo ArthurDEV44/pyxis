@@ -577,7 +577,7 @@ mod tests {
         assert!(
             text.iter()
                 .any(|l| l.contains("Header One") && l.contains(':')),
-            "repli clé/valeur attendu, obtenu: {text:?}"
+            "expected key/value fallback, got: {text:?}"
         );
     }
 

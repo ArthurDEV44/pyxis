@@ -229,7 +229,7 @@ impl ListSelectionView {
             active_tab: 0,
             selected: 0,
             query: String::new(),
-            footer_hints: vec!["Enter accepter".into(), "Esc annuler".into()],
+            footer_hints: vec!["Enter accept".into(), "Esc cancel".into()],
             completion: ViewCompletion::Pending,
             dismiss_parent_on_accept: false,
             requires_action: false,

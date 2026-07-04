@@ -130,7 +130,7 @@ fn convert_auth_err(e: AuthError) -> ProviderError {
         AuthError::Http(re) => match re.status() {
             Some(s) if s.as_u16() == 401 || s.as_u16() == 403 => ProviderError::Http {
                 status: s.as_u16(),
-                message: "refresh OAuth rejeté (token révoqué ?)".to_string(),
+                message: "OAuth refresh rejected (revoked token?)".to_string(),
                 retry_after_ms: None,
             },
             Some(s) => ProviderError::Http {

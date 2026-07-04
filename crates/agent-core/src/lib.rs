@@ -125,7 +125,7 @@ mod loop_tests {
         ) -> Result<CanonicalResponse, ProviderError> {
             self.log.lock().unwrap().push("complete");
             if self.summary_fails {
-                return Err(ProviderError::Transport("résumé KO".into()));
+                return Err(ProviderError::Transport("summary failed".into()));
             }
             Ok(CanonicalResponse {
                 content: vec![ContentBlock::Text {
@@ -293,7 +293,7 @@ mod loop_tests {
                 ..Capabilities::default()
             },
             turns: Mutex::new(turns.into()),
-            summary: "RÉSUMÉ".to_string(),
+            summary: "SUMMARY".to_string(),
             summary_usage,
             summary_fails,
             log: Arc::clone(&log),
@@ -376,13 +376,13 @@ mod loop_tests {
     #[tokio::test]
     async fn transcript_synced_before_stream() {
         let h = harness(vec![text_turn("ok")], false, 100_000);
-        let ctx = AgentContext::new("mock").push(Message::user("salut"));
+        let ctx = AgentContext::new("mock").push(Message::user("hello"));
         let _ = run_headless(ctx, h.deps).await;
         let log = h.log.lock().unwrap().clone();
         let sync_at = log.iter().position(|e| *e == "sync");
         let stream_at = log.iter().position(|e| *e == "stream");
         assert!(sync_at.is_some() && stream_at.is_some());
-        assert!(sync_at < stream_at, "sync doit précéder stream: {log:?}");
+        assert!(sync_at < stream_at, "sync should precede stream: {log:?}");
     }
 
     // US-024 : le DERNIER message assistant est syncé AVANT EndTurn — sinon
@@ -390,7 +390,7 @@ mod loop_tests {
     // `synced.len() == 2` prouve l'absence de doublon du message user déjà syncé.
     #[tokio::test]
     async fn final_assistant_turn_synced_before_endturn() {
-        let h = harness(vec![text_turn("réponse finale")], false, 100_000);
+        let h = harness(vec![text_turn("final answer")], false, 100_000);
         let ctx = AgentContext::new("mock").push(Message::user("question"));
         let events = drive(ctx, h.deps).await;
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
@@ -399,13 +399,13 @@ mod loop_tests {
         assert_eq!(
             synced.len(),
             2,
-            "user + assistant final, sans doublon: {synced:?}"
+            "user plus final assistant, without duplicate: {synced:?}"
         );
         let last = synced.last().unwrap();
         assert_eq!(last.role, crate::message::Role::Assistant);
         assert!(
-            last.text().contains("réponse finale"),
-            "le dernier message persisté doit être la réponse finale: {synced:?}"
+            last.text().contains("final answer"),
+            "the last persisted message should be the final answer: {synced:?}"
         );
     }
 
@@ -413,30 +413,30 @@ mod loop_tests {
     // requête mais JAMAIS persistés ni accumulés dans le transcript (rechargés).
     #[tokio::test]
     async fn context_messages_injected_per_request_never_persisted() {
-        let h = harness(vec![tool_turn("c1"), text_turn("fini")], false, 100_000);
+        let h = harness(vec![tool_turn("c1"), text_turn("done")], false, 100_000);
         let ctx = AgentContext::new("mock")
             .with_context_messages(vec![
                 Message::user("# AGENTS.md instructions\nCTX_AGENTS"),
                 Message::user("<environment>CTX_ENV</environment>"),
             ])
-            .push(Message::user("fais X"));
+            .push(Message::user("do X"));
         let events = drive(ctx, h.deps).await;
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
 
         // 1. Chaque requête envoyée au provider commence par les 2 messages de contexte.
         let reqs = h.requests.lock().unwrap();
-        assert!(reqs.len() >= 2, "au moins 2 tours");
+        assert!(reqs.len() >= 2, "at least 2 turns");
         for (i, msgs) in reqs.iter().enumerate() {
             assert!(
                 msgs[0].text().contains("CTX_AGENTS") && msgs[1].text().contains("CTX_ENV"),
-                "tour {i} : le contexte doit préfixer la requête"
+                "turn {i}: context should prefix the request"
             );
             assert!(
                 msgs.iter()
                     .filter(|m| m.text().contains("CTX_AGENTS"))
                     .count()
                     == 1,
-                "tour {i} : pas d'accumulation du contexte (une seule occurrence)"
+                "turn {i}: no context accumulation, one occurrence only"
             );
         }
 
@@ -446,28 +446,28 @@ mod loop_tests {
             !synced
                 .iter()
                 .any(|m| m.text().contains("CTX_AGENTS") || m.text().contains("CTX_ENV")),
-            "le contexte éphémère ne doit jamais être persisté: {synced:?}"
+            "ephemeral context should never be persisted: {synced:?}"
         );
     }
 
     #[tokio::test]
     async fn ephemeral_messages_suffix_request_never_persisted() {
-        let h = harness(vec![text_turn("fini")], false, 100_000);
+        let h = harness(vec![text_turn("done")], false, 100_000);
         let ctx = AgentContext::new("mock")
             .with_context_messages(vec![Message::user("CTX")])
             .with_ephemeral_messages(vec![Message::user("CONTROL")])
-            .push(Message::user("humain"));
+            .push(Message::user("human"));
         let events = drive(ctx, h.deps).await;
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
 
         let reqs = h.requests.lock().unwrap();
-        let first = reqs.first().expect("requête provider");
+        let first = reqs.first().expect("provider request");
         assert_eq!(first[0].text(), "CTX");
-        assert_eq!(first[first.len() - 2].text(), "humain");
+        assert_eq!(first[first.len() - 2].text(), "human");
         assert_eq!(first[first.len() - 1].text(), "CONTROL");
 
         let synced = h.boundaries.synced.lock().unwrap();
-        assert!(synced.iter().any(|m| m.text() == "humain"));
+        assert!(synced.iter().any(|m| m.text() == "human"));
         assert!(!synced.iter().any(|m| m.text() == "CONTROL"));
     }
 
@@ -478,26 +478,26 @@ mod loop_tests {
         let h = harness(
             vec![
                 MockTurn::Err(ProviderError::ContextLengthExceeded),
-                text_turn("repris après compaction"),
+                text_turn("resumed after compaction"),
             ],
             false,
             100_000,
         );
         // historique réel (≥ 2 messages) → la compaction a de quoi résumer.
         let ctx = AgentContext::new("mock")
-            .push(Message::user("contexte initial"))
+            .push(Message::user("initial context"))
             .push(Message::assistant_text("compris"))
-            .push(Message::user("tâche longue"));
+            .push(Message::user("long task"));
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Reactive),
-            "compaction réactive attendue: {events:?}"
+            "reactive compaction expected: {events:?}"
         );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::Text(t) if t.contains("repris"))),
-            "la conversation doit continuer après recovery"
+                .any(|e| matches!(e, AgentEvent::Text(t) if t.contains("resumed"))),
+            "conversation should continue after recovery"
         );
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
         assert!(
@@ -525,7 +525,7 @@ mod loop_tests {
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Auto),
-            "autocompaction attendue: {events:?}"
+            "autocompaction expected: {events:?}"
         );
     }
 
@@ -544,7 +544,7 @@ mod loop_tests {
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Auto),
-            "le seuil doit être alimenté par l'estimation locale: {events:?}"
+            "threshold should be fed by the local estimate: {events:?}"
         );
     }
 
@@ -572,7 +572,7 @@ mod loop_tests {
                     crate::AgentError::CompactionCircuitBreaker(_)
                 ))
             ),
-            "circuit breaker attendu en fin: {events:?}"
+            "circuit breaker expected at the end: {events:?}"
         );
     }
 
@@ -589,9 +589,9 @@ mod loop_tests {
         // historique ≥ 2 messages : provider.complete EST appelé (et échoue), ce
         // n'est pas le guard "rien à résumer" qui court-circuite.
         let ctx = AgentContext::new("mock")
-            .push(Message::user("contexte"))
+            .push(Message::user("context"))
             .push(Message::assistant_text("ok"))
-            .push(Message::user("tâche"));
+            .push(Message::user("task"));
         let events = drive(ctx, h.deps).await;
         assert!(
             matches!(
@@ -600,7 +600,7 @@ mod loop_tests {
                     _
                 )))
             ),
-            "échec de recovery doit propager ContextUnrecoverable: {events:?}"
+            "recovery failure should propagate ContextUnrecoverable: {events:?}"
         );
     }
 
@@ -620,24 +620,24 @@ mod loop_tests {
                         retry_after_ms: None,
                     },
                 ),
-                text_turn("repris après 413"),
+                text_turn("resumed after 413"),
             ],
             false,
             100_000,
         );
         let ctx = AgentContext::new("mock")
-            .push(Message::user("contexte"))
+            .push(Message::user("context"))
             .push(Message::assistant_text("ok"))
-            .push(Message::user("tâche"));
+            .push(Message::user("task"));
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Reactive),
-            "réactive attendue: {events:?}"
+            "reactive expected: {events:?}"
         );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::Text(t) if t.contains("repris")))
+                .any(|e| matches!(e, AgentEvent::Text(t) if t.contains("resumed")))
         );
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
     }
@@ -655,20 +655,20 @@ mod loop_tests {
         let events = drive(ctx, h.deps).await;
         assert!(
             events.iter().any(|e| matches!(e, AgentEvent::StreamReset)),
-            "les deltas visibles doivent être retirés: {events:?}"
+            "visible deltas should be removed: {events:?}"
         );
         assert!(
             matches!(
                 events.last(),
                 Some(AgentEvent::Error(crate::AgentError::Provider(_)))
             ),
-            "fin sans terminal doit fail-closed: {events:?}"
+            "missing terminal event should fail closed: {events:?}"
         );
     }
 
     #[tokio::test]
     async fn invalid_context_geometry_fails_before_provider_call() {
-        let h = harness(vec![text_turn("jamais")], false, 100);
+        let h = harness(vec![text_turn("never")], false, 100);
         let ctx = AgentContext::new("mock")
             .with_config(RunConfig {
                 max_output_tokens: 100,
@@ -681,11 +681,11 @@ mod loop_tests {
                 events.first(),
                 Some(AgentEvent::Error(crate::AgentError::InvalidRequest(_)))
             ),
-            "géométrie contexte invalide attendue: {events:?}"
+            "invalid context geometry expected: {events:?}"
         );
         assert!(
             !h.log.lock().unwrap().contains(&"stream"),
-            "le provider ne doit pas être appelé"
+            "provider should not be called"
         );
     }
 
@@ -769,13 +769,13 @@ mod loop_tests {
                 overload_fallback_model: Some("small-context".into()),
                 ..RunConfig::default()
             })
-            .push(Message::user("historique très long"))
+            .push(Message::user("very long history"))
             .push(Message::assistant_text("ok"))
             .push(Message::user("x".repeat(3000)));
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Auto),
-            "la petite fenêtre fallback doit déclencher l'auto-compaction: {events:?}"
+            "small fallback window should trigger autocompaction: {events:?}"
         );
         assert_eq!(
             *request_models.lock().unwrap(),
@@ -789,7 +789,7 @@ mod loop_tests {
             vec![
                 MockTurn::StreamThenErr(
                     vec![StreamEvent::TextDelta {
-                        text: "fantôme ".into(),
+                        text: "ghost ".into(),
                     }],
                     ProviderError::Stream("reset".into()),
                 ),
@@ -809,7 +809,7 @@ mod loop_tests {
         let h = harness(
             vec![MockTurn::Stream(vec![
                 StreamEvent::TextDelta {
-                    text: "tronqué".into(),
+                    text: "truncated".into(),
                 },
                 StreamEvent::Done {
                     stop: StopReason::MaxTokens,
@@ -840,7 +840,7 @@ mod loop_tests {
                 events.last(),
                 Some(AgentEvent::Error(crate::AgentError::Provider(_)))
             ),
-            "outcome manquant doit casser le contrat: {events:?}"
+            "missing outcome should break the contract: {events:?}"
         );
     }
 
@@ -863,24 +863,24 @@ mod loop_tests {
                         stop: StopReason::MaxTokens,
                     },
                 ]),
-                text_turn("régénéré"),
+                text_turn("regenerated"),
             ],
             false,
             100_000,
         );
         let ctx = AgentContext::new("mock")
-            .push(Message::user("contexte initial"))
+            .push(Message::user("initial context"))
             .push(Message::assistant_text("ok"))
-            .push(Message::user("fais X"));
+            .push(Message::user("do X"));
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Reactive),
-            "réactive attendue: {events:?}"
+            "reactive expected: {events:?}"
         );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, AgentEvent::Text(t) if t.contains("régénéré")))
+                .any(|e| matches!(e, AgentEvent::Text(t) if t.contains("regenerated")))
         );
     }
 
@@ -923,7 +923,7 @@ mod loop_tests {
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Micro),
-            "micro attendue: {events:?}"
+            "microcompaction expected: {events:?}"
         );
         assert!(
             !has_compacted(&events, CompactKind::Auto),
@@ -979,9 +979,9 @@ mod loop_tests {
         assert!(
             events.iter().any(|e| matches!(
                 e,
-                AgentEvent::ToolResult(v) if v.content.contains("Boucle détectée") && v.is_error
+                AgentEvent::ToolResult(v) if v.content.contains("Loop detected") && v.is_error
             )),
-            "un signal de boucle explicite est attendu: {events:?}"
+            "explicit loop signal expected: {events:?}"
         );
         // Arrêt déterministe au-delà du signal.
         assert!(
@@ -989,7 +989,7 @@ mod loop_tests {
                 events.last(),
                 Some(AgentEvent::Exhausted(ExhaustReason::ToolLoop { .. }))
             ),
-            "fin attendue en ToolLoop: {events:?}"
+            "ToolLoop ending expected: {events:?}"
         );
     }
 
@@ -1022,13 +1022,13 @@ mod loop_tests {
             false,
             100_000,
         );
-        let ctx = AgentContext::new("mock").push(Message::user("trois actions distinctes"));
+        let ctx = AgentContext::new("mock").push(Message::user("three distinct actions"));
         let events = drive(ctx, h.deps).await;
         assert!(
             !events
                 .iter()
                 .any(|e| matches!(e, AgentEvent::Exhausted(ExhaustReason::ToolLoop { .. }))),
-            "aucune boucle ne doit être détectée: {events:?}"
+            "no loop should be detected: {events:?}"
         );
         assert!(matches!(events.last(), Some(AgentEvent::EndTurn)));
     }
@@ -1038,7 +1038,7 @@ mod loop_tests {
     async fn token_budget_kill_switch_stops_run() {
         // Tour 1 consomme 150 tokens (>120) ; le tour 2 ne doit jamais démarrer.
         let h = harness(
-            vec![tool_turn_usage("c1", 100, 50), text_turn("jamais atteint")],
+            vec![tool_turn_usage("c1", 100, 50), text_turn("never reached")],
             false,
             1_000_000,
         );
@@ -1058,7 +1058,7 @@ mod loop_tests {
                     limit: 120
                 }))
             ),
-            "kill-switch budget attendu: {events:?}"
+            "budget kill-switch expected: {events:?}"
         );
         // Le 1er tour d'outil a bien eu lieu avant le kill-switch.
         assert!(
@@ -1081,7 +1081,7 @@ mod loop_tests {
                     }],
                     ProviderError::Stream("reset".into()),
                 ),
-                text_turn("jamais atteint"),
+                text_turn("never reached"),
             ],
             false,
             1_000_000,
@@ -1093,7 +1093,7 @@ mod loop_tests {
                 max_output_tokens: 10,
                 ..RunConfig::default()
             })
-            .push(Message::user("contexte"))
+            .push(Message::user("context"))
             .push(Message::assistant_text("ok"))
             .push(Message::user("go"));
         let events = drive(ctx, h.deps).await;
@@ -1105,7 +1105,7 @@ mod loop_tests {
                     limit: 120
                 }))
             ),
-            "usage du stream échoué doit compter: {events:?}"
+            "failed stream usage should count: {events:?}"
         );
         assert_eq!(
             log.lock()
@@ -1114,7 +1114,7 @@ mod loop_tests {
                 .filter(|entry| **entry == "stream")
                 .count(),
             1,
-            "le retry doit être bloqué par le budget avant de rouvrir un stream"
+            "retry should be blocked by the budget before reopening a stream"
         );
     }
 
@@ -1123,7 +1123,7 @@ mod loop_tests {
         let h = harness_with_summary_usage(
             vec![
                 MockTurn::Err(ProviderError::ContextLengthExceeded),
-                text_turn("jamais atteint"),
+                text_turn("never reached"),
             ],
             false,
             100_000,
@@ -1139,13 +1139,13 @@ mod loop_tests {
                 max_output_tokens: 10,
                 ..RunConfig::default()
             })
-            .push(Message::user("contexte"))
+            .push(Message::user("context"))
             .push(Message::assistant_text("ok"))
             .push(Message::user("go"));
         let events = drive(ctx, h.deps).await;
         assert!(
             has_compacted(&events, CompactKind::Reactive),
-            "compaction réactive attendue: {events:?}"
+            "reactive compaction expected: {events:?}"
         );
         assert!(
             matches!(
@@ -1155,7 +1155,7 @@ mod loop_tests {
                     limit: 120
                 }))
             ),
-            "usage de compaction doit compter: {events:?}"
+            "compaction usage should count: {events:?}"
         );
         assert_eq!(
             log.lock()
@@ -1164,7 +1164,7 @@ mod loop_tests {
                 .filter(|entry| **entry == "stream")
                 .count(),
             1,
-            "aucun stream post-compaction ne doit démarrer après budget atteint"
+            "no post-compaction stream should start after the budget is reached"
         );
     }
 
@@ -1172,26 +1172,26 @@ mod loop_tests {
     // (aucun appel provider émis).
     #[tokio::test]
     async fn pre_turn_estimate_stops_before_expensive_turn() {
-        let h = harness(vec![text_turn("jamais")], false, 1_000_000);
+        let h = harness(vec![text_turn("never")], false, 1_000_000);
         let ctx = AgentContext::new("mock")
             .with_config(RunConfig {
                 token_budget: Some(5), // < max_output → la projection dépasse d'emblée
                 max_output_tokens: 100,
                 ..RunConfig::default()
             })
-            .push(Message::user("tâche"));
+            .push(Message::user("task"));
         let events = drive(ctx, h.deps).await;
         assert!(
             matches!(
                 events.first(),
                 Some(AgentEvent::Exhausted(ExhaustReason::TokenBudget { .. }))
             ),
-            "stop pré-tour attendu: {events:?}"
+            "pre-turn stop expected: {events:?}"
         );
         // Aucun stream provider ne doit avoir été ouvert.
         assert!(
             !h.log.lock().unwrap().contains(&"stream"),
-            "le provider ne doit PAS être appelé: {:?}",
+            "provider should not be called: {:?}",
             h.log.lock().unwrap()
         );
     }

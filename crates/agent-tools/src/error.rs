@@ -23,14 +23,14 @@ impl ValidationError {
 pub enum ToolError {
     /// L'entrée JSON ne se parse pas vers le schéma de l'outil (fail-closed :
     /// on n'exécute pas — US-010 AC3).
-    #[error("argument invalide: {0}")]
+    #[error("invalid argument: {0}")]
     Parse(String),
     /// `validate_input` a refusé l'entrée.
     #[error(transparent)]
     Validation(#[from] ValidationError),
     /// Chemin hors du workspace (confinement applicatif ; le kernel renforce via
     /// Landlock en US-020).
-    #[error("chemin hors du workspace: {0}")]
+    #[error("path outside workspace: {0}")]
     OutsideWorkspace(String),
     /// Erreur d'E/S (fichier introuvable, permission OS, etc.).
     #[error("io: {0}")]
@@ -39,7 +39,7 @@ pub enum ToolError {
     #[error("{0}")]
     Rejected(String),
     /// L'outil a dépassé son timeout (signalé par le Registry, pas par l'outil).
-    #[error("timeout dépassé")]
+    #[error("timeout exceeded")]
     Timeout,
 }
 

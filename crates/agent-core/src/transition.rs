@@ -125,7 +125,7 @@ pub fn post_stream_transition(acc: &Accumulator) -> Transition {
             visible_output: acc.has_visible_output(),
         }),
         Some(StopReason::Refusal) => Transition::Fail(AgentError::Provider(
-            ProviderFailure::contract("refus du modèle"),
+            ProviderFailure::contract("model refusal"),
         )),
         Some(StopReason::EndTurn | StopReason::StopSequence) => Transition::EndTurn,
     }
@@ -386,7 +386,7 @@ mod tests {
                 assert_eq!(calls[0].name, "bash");
                 assert_eq!(calls[0].input["cmd"], "ls");
             }
-            other => unreachable!("attendu RunTools, eu {other:?}"),
+            other => unreachable!("expected RunTools, got {other:?}"),
         }
 
         let refusal = acc_with(vec![StreamEvent::Done {
@@ -436,7 +436,7 @@ mod tests {
         // peut avoir consommé le budget avant une réponse complète.
         let a = acc_with(vec![
             StreamEvent::TextDelta {
-                text: "réponse coupée".into(),
+                text: "truncated answer".into(),
             },
             StreamEvent::Done {
                 stop: StopReason::MaxTokens,
@@ -491,7 +491,7 @@ mod tests {
             .iter()
             .position(|b| matches!(b, ContentBlock::ToolUse { .. }))
             .unwrap();
-        assert!(rs < tu, "reasoning avant tool_use");
+        assert!(rs < tu, "reasoning before tool_use");
     }
 
     #[test]
@@ -520,7 +520,7 @@ mod tests {
     fn fallback_output_estimate_counts_reasoning_and_tool_calls() {
         let a = acc_with(vec![
             StreamEvent::ReasoningDelta {
-                text: "reasoning caché".into(),
+                text: "hidden reasoning".into(),
             },
             StreamEvent::EncryptedReasoning {
                 id: "rs_1".into(),
@@ -541,7 +541,7 @@ mod tests {
         ]);
         assert!(
             a.estimate_output(&HeuristicCounter) > 0,
-            "une sortie sans texte visible doit quand même compter"
+            "output without visible text should still count"
         );
     }
 

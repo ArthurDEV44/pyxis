@@ -13,7 +13,9 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::ToolError;
-use crate::permission::{Approver, PermCtx, PermissionDecision, PermissionMode, PermissionRequest};
+use crate::permission::{
+    Approver, PermCtx, PermissionDecision, PermissionMode, PermissionModeState, PermissionRequest,
+};
 use crate::registry::Registry;
 use crate::tool::{
     MAX_COMMAND_BYTES, MAX_EDIT_FILE_BYTES, MAX_WRITE_BYTES, Tool, ToolCtx, ToolOutput,
@@ -260,7 +262,7 @@ impl Tool for Hang {
     }
     async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-        Ok(ToolOutput::text("jamais"))
+        Ok(ToolOutput::text("never"))
     }
 }
 
@@ -291,7 +293,7 @@ impl Tool for FailsUntrusted {
         PermissionDecision::Allow
     }
     async fn call(&self, _i: Self::Input, _c: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        Err(ToolError::Rejected("sortie externe invalide".into()))
+        Err(ToolError::Rejected("invalid external output".into()))
     }
 }
 
@@ -338,7 +340,7 @@ impl Tool for LongDescription {
         "long_description"
     }
     fn description(&self) -> String {
-        format!("{}é{}", "a".repeat(2047), "tail")
+        format!("{}¢{}", "a".repeat(2047), "tail")
     }
     fn input_schema(&self) -> serde_json::Value {
         empty_schema()
@@ -481,7 +483,7 @@ async fn non_concurrency_safe_tools_run_serially() {
     assert_eq!(
         max.load(Ordering::SeqCst),
         1,
-        "les outils non concurrency-safe ne doivent jamais tourner en parallèle"
+        "non-concurrency-safe tools should never run in parallel"
     );
 }
 
@@ -501,27 +503,23 @@ async fn parse_error_is_failclosed_no_execution() {
         .dispatch(vec![call(
             "a",
             "strict",
-            serde_json::json!({"n": "pas un nombre"}),
+            serde_json::json!({"n": "not a number"}),
         )])
         .await;
     assert_eq!(out.len(), 1);
-    assert!(out[0].is_error, "le parse KO doit produire une erreur");
-    assert_eq!(
-        ran.load(Ordering::SeqCst),
-        0,
-        "call() ne doit PAS être appelé"
-    );
+    assert!(out[0].is_error, "parse failure should produce an error");
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "call() should not be called");
 }
 
 #[tokio::test]
 async fn unknown_tool_is_failclosed_error() {
     let reg = Registry::builder("/tmp").approver(allow_approver()).build();
     let out = reg
-        .dispatch(vec![call("a", "inexistant", serde_json::json!({}))])
+        .dispatch(vec![call("a", "missing", serde_json::json!({}))])
         .await;
     assert_eq!(out.len(), 1);
     assert!(out[0].is_error);
-    assert!(out[0].content.contains("inconnu"));
+    assert!(out[0].content.contains("unknown"));
 }
 
 #[tokio::test]
@@ -539,10 +537,7 @@ async fn timeout_does_not_hang_the_dispatch() {
     assert!(out[0].is_error);
     assert!(out[0].content.contains("timeout"));
     assert_eq!(out[0].error_kind, Some(ToolErrorKind::Timeout));
-    assert!(
-        reg.taint_recent(),
-        "timeout untrusted doit marquer le taint"
-    );
+    assert!(reg.taint_recent(), "untrusted timeout should mark taint");
 }
 
 #[tokio::test]
@@ -570,7 +565,7 @@ async fn mixed_batch_respects_effect_order_before_later_reads() {
     assert!(!read.is_error, "{}", read.content);
     assert!(
         read.content.contains("new"),
-        "le read doit voir l'écriture précédente du même batch: {}",
+        "read should see the previous write from the same batch: {}",
         read.content
     );
 }
@@ -642,7 +637,7 @@ async fn permission_input_summary_truncates_on_utf8_boundaries() {
             concurrency_safe: false,
         })
         .build();
-    let payload = format!("{}é{}", "a".repeat(188), "tail");
+    let payload = format!("{}¢{}", "a".repeat(188), "tail");
     let out = reg
         .dispatch(vec![call(
             "a",
@@ -686,7 +681,7 @@ async fn permission_asks_for_safe_read_tools_are_serialized() {
     assert_eq!(
         approver.max_active.load(Ordering::SeqCst),
         1,
-        "les demandes de permission ne doivent pas se chevaucher"
+        "permission requests should not overlap"
     );
 }
 
@@ -717,10 +712,10 @@ async fn read_returns_numbered_lines_untrusted() {
         .await;
     let o = by_id(&out, "a");
     assert!(!o.is_error, "{}", o.content);
-    assert!(o.untrusted, "sortie de lecture = untrusted (taint)");
+    assert!(o.untrusted, "read output is untrusted (taint)");
     assert!(
         o.content.contains("1\tfn main"),
-        "numéro de ligne attendu: {}",
+        "line number expected: {}",
         o.content
     );
     assert!(o.content.contains("2\tprintln"));
@@ -750,7 +745,7 @@ async fn read_missing_and_binary_files_error_cleanly() {
         .await;
     let o = by_id(&out, "b");
     assert!(o.is_error);
-    assert!(o.content.contains("binaire"));
+    assert!(o.content.contains("binary"));
 }
 
 #[tokio::test]
@@ -848,7 +843,7 @@ async fn grep_returns_matches_with_location() {
     assert!(!o.is_error, "{}", o.content);
     assert!(
         o.content.contains("lib.rs:2:"),
-        "localisation attendue: {}",
+        "location expected: {}",
         o.content
     );
     assert!(o.content.contains("fn target"));
@@ -967,11 +962,11 @@ async fn edit_unique_anchor_replaces_ambiguous_fails() {
         .dispatch(vec![call(
             "a",
             "edit",
-            serde_json::json!({"path": "f.txt", "old_string": "UNIQUE", "new_string": "REMPLACÉ"}),
+            serde_json::json!({"path": "f.txt", "old_string": "UNIQUE", "new_string": "REPLACED"}),
         )])
         .await;
     assert!(!by_id(&out, "a").is_error, "{}", by_id(&out, "a").content);
-    assert_eq!(ws.read("f.txt"), "alpha REMPLACÉ beta\n");
+    assert_eq!(ws.read("f.txt"), "alpha REPLACED beta\n");
 
     // ancre ambiguë (2 occurrences) → échec, AUCUNE mutation.
     ws.write("g.txt", "dup\ndup\n");
@@ -984,12 +979,8 @@ async fn edit_unique_anchor_replaces_ambiguous_fails() {
         .await;
     let o = by_id(&out, "b");
     assert!(o.is_error);
-    assert!(o.content.contains("ambiguë"), "{}", o.content);
-    assert_eq!(
-        ws.read("g.txt"),
-        "dup\ndup\n",
-        "le fichier ne doit PAS changer"
-    );
+    assert!(o.content.contains("ambiguous"), "{}", o.content);
+    assert_eq!(ws.read("g.txt"), "dup\ndup\n", "the file must not change");
 }
 
 #[tokio::test]
@@ -1034,7 +1025,7 @@ async fn edit_rejects_oversized_target_file() {
         .await;
     let o = by_id(&out, "a");
     assert!(o.is_error);
-    assert!(o.content.contains("trop volumineux"));
+    assert!(o.content.contains("too large for edit"));
 }
 
 #[tokio::test]
@@ -1094,7 +1085,7 @@ async fn bash_timeout_is_reported_by_bash_cleanup_path() {
         .await;
     let o = by_id(&out, "a");
     assert!(o.is_error);
-    assert!(o.content.contains("timeout outil dépassé"), "{}", o.content);
+    assert!(o.content.contains("tool timeout exceeded"), "{}", o.content);
 }
 
 #[tokio::test]
@@ -1127,7 +1118,7 @@ async fn write_outside_workspace_is_refused() {
         .await;
     let o = by_id(&out, "a");
     assert!(o.is_error);
-    assert!(o.content.contains("hors du workspace"), "{}", o.content);
+    assert!(o.content.contains("outside workspace"), "{}", o.content);
     assert!(!ws.path().join("../escape.txt").exists());
 }
 
@@ -1153,8 +1144,12 @@ async fn default_mode_asks_bypass_skips() {
             serde_json::json!({"command": "echo hi"}),
         )])
         .await;
-    assert_eq!(deny_calls.lock().unwrap().len(), 1, "confirmation demandée");
-    assert!(by_id(&out, "a").is_error, "refus → outcome erreur");
+    assert_eq!(
+        deny_calls.lock().unwrap().len(),
+        1,
+        "confirmation requested"
+    );
+    assert!(by_id(&out, "a").is_error, "denial returns error outcome");
 
     // Bypass → pas de demande, Bash exécuté.
     let (appr, calls) = RecordingApprover::new(true);
@@ -1170,7 +1165,7 @@ async fn default_mode_asks_bypass_skips() {
             serde_json::json!({"command": "echo hi"}),
         )])
         .await;
-    assert_eq!(calls.lock().unwrap().len(), 0, "Bypass ne demande jamais");
+    assert_eq!(calls.lock().unwrap().len(), 0, "Bypass never asks");
     assert!(!by_id(&out, "b").is_error);
 }
 
@@ -1178,13 +1173,13 @@ async fn default_mode_asks_bypass_skips() {
 async fn tool_output_untrusted_and_taint_propagates() {
     // US-013 AC2 : sortie untrusted par défaut + le taint devient récent.
     let ws = TempWs::new("taint");
-    ws.write("f.txt", "contenu\n");
+    ws.write("f.txt", "content\n");
     let reg = Registry::builder(ws.path())
         .mode(PermissionMode::Default)
         .approver(allow_approver())
         .register(Read)
         .build();
-    assert!(!reg.taint_recent(), "pas de taint au départ");
+    assert!(!reg.taint_recent(), "no initial taint");
     let out = reg
         .dispatch(vec![call(
             "a",
@@ -1193,10 +1188,7 @@ async fn tool_output_untrusted_and_taint_propagates() {
         )])
         .await;
     assert!(by_id(&out, "a").untrusted);
-    assert!(
-        reg.taint_recent(),
-        "le taint doit être marqué après une lecture"
-    );
+    assert!(reg.taint_recent(), "taint should be marked after a read");
 }
 
 #[tokio::test]
@@ -1224,7 +1216,7 @@ async fn taint_forces_confirmation_even_in_dontask() {
     assert_eq!(
         calls.lock().unwrap().len(),
         0,
-        "sans taint, DontAsk n'interrompt pas"
+        "without taint, DontAsk does not interrupt"
     );
 
     // Batch [read (untrusted), bash] : le read marque le taint AVANT le bash série
@@ -1244,7 +1236,7 @@ async fn taint_forces_confirmation_even_in_dontask() {
     assert_eq!(
         calls2.lock().unwrap().len(),
         1,
-        "le taint récent doit forcer la confirmation de l'action sensible"
+        "recent taint should force sensitive action confirmation"
     );
 }
 
@@ -1272,7 +1264,7 @@ async fn taint_forces_confirmation_for_edits_in_accept_edits() {
     assert_eq!(
         calls.lock().unwrap().len(),
         0,
-        "AcceptEdits autorise write sans confirmation hors taint"
+        "AcceptEdits allows write without confirmation outside taint"
     );
 
     let (appr, calls) = RecordingApprover::new(true);
@@ -1296,7 +1288,7 @@ async fn taint_forces_confirmation_for_edits_in_accept_edits() {
     assert_eq!(
         calls.lock().unwrap().len(),
         1,
-        "le taint doit protéger les mutations non marquées sensitive"
+        "taint should protect mutations not marked sensitive"
     );
     assert_eq!(ws.read("target.txt"), "tainted");
 }
@@ -1329,6 +1321,37 @@ async fn auto_approve_refuses_taint_forced_confirmation() {
 
     assert!(by_id(&out, "w").is_error);
     assert_eq!(ws.read("target.txt"), "clean");
+}
+
+#[tokio::test]
+async fn registry_uses_live_permission_mode_state() {
+    let ws = TempWs::new("live-permission-mode");
+    let mode = PermissionModeState::new(PermissionMode::Plan);
+    let reg = Registry::builder(ws.path())
+        .mode_state(mode.clone())
+        .approver(Arc::new(crate::permission::AutoApprove::new()))
+        .register(Write)
+        .build();
+
+    let denied = reg
+        .dispatch(vec![call(
+            "w1",
+            "write",
+            serde_json::json!({"path": "target.txt", "content": "blocked"}),
+        )])
+        .await;
+    assert!(by_id(&denied, "w1").is_error);
+
+    mode.set(PermissionMode::AcceptEdits);
+    let allowed = reg
+        .dispatch(vec![call(
+            "w2",
+            "write",
+            serde_json::json!({"path": "target.txt", "content": "allowed"}),
+        )])
+        .await;
+    assert!(!by_id(&allowed, "w2").is_error);
+    assert_eq!(ws.read("target.txt"), "allowed");
 }
 
 #[tokio::test]
@@ -1430,7 +1453,7 @@ async fn plan_mode_blocks_mutations() {
         )])
         .await;
     assert!(by_id(&out, "w").is_error);
-    assert_eq!(ws.read("f.txt"), "abc", "Plan ne doit rien muter");
+    assert_eq!(ws.read("f.txt"), "abc", "Plan should not mutate anything");
 }
 
 #[tokio::test]
@@ -1475,7 +1498,7 @@ async fn untrusted_tool_error_marks_taint() {
         .approver(allow_approver())
         .register(FailsUntrusted)
         .build();
-    assert!(!reg.taint_recent(), "pas de taint au départ");
+    assert!(!reg.taint_recent(), "no initial taint");
     let out = reg
         .dispatch(vec![call("a", "fails_untrusted", serde_json::json!({}))])
         .await;
@@ -1483,7 +1506,7 @@ async fn untrusted_tool_error_marks_taint() {
     assert!(by_id(&out, "a").untrusted);
     assert!(
         reg.taint_recent(),
-        "une erreur d'outil untrusted entre dans le transcript"
+        "an untrusted tool error enters the transcript"
     );
 }
 
@@ -1510,8 +1533,8 @@ async fn edit_absorbs_unicode_divergence() {
     let o = by_id(&out, "a");
     assert!(!o.is_error, "{}", o.content);
     assert!(
-        o.content.contains("niveau 4"),
-        "le niveau de passe doit être rapporté: {}",
+        o.content.contains("level 4"),
+        "the match level should be reported: {}",
         o.content
     );
     assert_eq!(ws.read("u.rs"), "let x = REPLACED;\nkeep\n");
@@ -1534,8 +1557,8 @@ async fn grep_truncation_signals_pagination() {
     let o = by_id(&out, "a");
     assert!(!o.is_error, "{}", o.content);
     assert!(
-        o.content.contains("[truncated:") && o.content.contains("affinez"),
-        "signal de troncation + pagination attendus: {}",
+        o.content.contains("[truncated:") && o.content.contains("narrow"),
+        "truncation and pagination signal expected: {}",
         &o.content[o.content.len().saturating_sub(200)..]
     );
 }
@@ -1547,6 +1570,6 @@ async fn registry_collects_tool_behavioral_guidelines() {
     let guidelines = reg.behavioral_guidelines();
     assert!(
         guidelines.iter().any(|g| g.contains("old_string")),
-        "la guideline edit (ancre sur fichier original) doit être collectée: {guidelines:?}"
+        "the edit guideline should be collected: {guidelines:?}"
     );
 }

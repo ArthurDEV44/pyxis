@@ -5424,7 +5424,7 @@ mod tests {
     #[test]
     fn streaming_cell_reflows_from_raw_source_on_resize() {
         let cell = AgentMarkdownCell::new(
-            "un texte long qui doit wrapper differemment selon la largeur",
+            "long text that should wrap differently depending on width",
             true,
         );
 
@@ -5434,7 +5434,7 @@ mod tests {
         assert!(narrow > wide);
         assert_eq!(
             cell.stream_view().raw_source,
-            "un texte long qui doit wrapper differemment selon la largeur"
+            "long text that should wrap differently depending on width"
         );
     }
 

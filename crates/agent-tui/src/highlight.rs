@@ -220,11 +220,11 @@ mod tests {
     fn line_colors_match_char_count() {
         let ui = UiTheme::new(true);
         let line = "let x = 1;";
-        let cols = line_colors(line, "rust", &ui).expect("coloration attendue");
+        let cols = line_colors(line, "rust", &ui).expect("expected highlighting");
         assert_eq!(
             cols.len(),
             line.chars().count(),
-            "une couleur par caractère (alignement diff)"
+            "one color per character for diff alignment"
         );
     }
 
@@ -233,12 +233,12 @@ mod tests {
         // Contrat critique pour l'overlay du diff : UNE couleur par `char`, même sur
         // des caractères multi-octets (sinon la teinte se désaligne en silence).
         let ui = UiTheme::new(true);
-        let line = "let é = 1; // café au lait ☕";
-        let cols = line_colors(line, "rust", &ui).expect("coloration attendue");
+        let line = "let tea = 1; // ☕";
+        let cols = line_colors(line, "rust", &ui).expect("expected highlighting");
         assert_eq!(
             cols.len(),
             line.chars().count(),
-            "une couleur par char, multi-octet compris"
+            "one color per char, including multibyte"
         );
     }
 
@@ -250,7 +250,7 @@ mod tests {
         let giant = "a".repeat(MAX_HL_BYTES + 1);
         assert!(
             line_colors(&giant, "rust", &ui).is_none(),
-            "ligne géante ne doit pas être colorée"
+            "giant line should not be highlighted"
         );
     }
 

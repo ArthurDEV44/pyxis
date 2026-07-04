@@ -16,9 +16,10 @@ use agent_core::message::{ContentBlock, Message, recent_untrusted_content};
 use agent_core::provider::ToolSpec;
 use agent_core::{AgentContext, AgentEvent, Deps, RunConfig, Session, run_agent};
 use agent_provider::KEYRING_ACCOUNT;
+use agent_tools::PermissionModeState;
 use agent_tui::{
     AppState, Block, COMMANDS, InputAction, McpServerMeta, McpStatus, SessionMeta,
-    blocks_from_messages,
+    blocks_from_messages, permission_mode_label,
 };
 #[cfg(feature = "codex_tui_parity")]
 use agent_tui::{
@@ -28,9 +29,11 @@ use agent_tui::{
 use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 use futures_util::StreamExt;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 
 use crate::approver::{PermissionMsg, to_prompt};
 use crate::session::SharedSession;
+use crate::settings::{permission_mode_from_arg, permission_mode_id};
 
 /// Nombre maximal d'entrées d'historique de prompts agrégées par dossier.
 const PROMPT_HISTORY_CAP: usize = 200;
@@ -47,6 +50,67 @@ enum McpEvent {
         name: String,
         error: String,
     },
+}
+
+struct AgentTurnEvent {
+    turn_id: u64,
+    event: AgentEvent,
+}
+
+struct ActiveTurn {
+    next_id: u64,
+    id: Option<u64>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ActiveTurn {
+    fn new() -> Self {
+        Self {
+            next_id: 1,
+            id: None,
+            handle: None,
+        }
+    }
+
+    fn start(
+        &mut self,
+        conversation: &Arc<Mutex<Vec<Message>>>,
+        cfg: &InteractiveConfig,
+        deps: &Deps,
+        tx: &mpsc::Sender<AgentTurnEvent>,
+        user_msg: &str,
+        persist_user_message: bool,
+    ) {
+        self.abort();
+        let turn_id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.id = Some(turn_id);
+        self.handle = Some(launch_turn(
+            conversation,
+            cfg,
+            deps,
+            tx,
+            turn_id,
+            user_msg,
+            persist_user_message,
+        ));
+    }
+
+    fn is_current(&self, turn_id: u64) -> bool {
+        self.id == Some(turn_id)
+    }
+
+    fn finish(&mut self) {
+        self.handle.take();
+        self.id = None;
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        self.id = None;
+    }
 }
 
 pub struct InteractiveConfig {
@@ -73,6 +137,10 @@ pub struct InteractiveConfig {
     pub goal: Option<String>,
     /// Durcissement appliqué aux sous-process MCP (env scrub + proxy).
     pub command_hardener: agent_tools::CommandHardener,
+    /// Mode de permissions mutable, partagé avec le registre d'outils.
+    pub permission_mode: PermissionModeState,
+    /// Settings utilisateur globaux, utilisés pour persister le mode de permissions.
+    pub settings_path: Option<PathBuf>,
 }
 
 /// Marqueur de complétion émis par le modèle quand l'objectif est pleinement
@@ -83,12 +151,12 @@ pub const GOAL_DONE_MARKER: &str = "<<GOAL_DONE>>";
 const MAX_GOAL_ITERS: u32 = 25;
 
 /// Message injecté à chaque relance automatique tant que l'objectif n'est pas marqué atteint.
-const GOAL_CONTINUE_PROMPT: &str = "Poursuis l'objectif de session. S'il reste \
-    du travail, continue. S'il est pleinement atteint et vérifié, termine ta \
-    réponse par <<GOAL_DONE>> seul sur la dernière ligne.";
+const GOAL_CONTINUE_PROMPT: &str = "Continue the session goal. If work remains, \
+    keep going. If it is fully completed and verified, end your reply with \
+    <<GOAL_DONE>> alone on the final line.";
 
 const MCP_DISABLED_NOTICE: &str =
-    "MCP : diagnostic config uniquement. L'exécution d'outils MCP n'est pas exposée dans ce build.";
+    "MCP: config diagnostics only. MCP tool execution is not exposed in this build.";
 
 /// Compose le system prompt effectif : base + DIRECTIVE de complétion. L'objectif
 /// vit dans `instructions` (re-envoyé chaque tour) donc survit à la compaction —
@@ -97,14 +165,13 @@ pub fn compose_system(base: &str, goal: Option<&str>) -> String {
     match goal {
         Some(g) if !g.trim().is_empty() => format!(
             "{base}\n\n\
-             ## Objectif à accomplir — NE T'ARRÊTE PAS avant qu'il soit PLEINEMENT atteint\n\
+             ## Session Goal: DO NOT STOP before it is FULLY completed\n\
              {g}\n\n\
-             Travaille en continu (lis, édite, exécute) jusqu'à ce que cet objectif soit \
-             ENTIÈREMENT accompli, sans demander de confirmation. Tant qu'il reste quoi que ce \
-             soit à faire, continue. Quand — et SEULEMENT quand — l'objectif est pleinement \
-             atteint et vérifié, termine ta toute dernière réponse par le marqueur exact, seul \
-             sur sa dernière ligne :\n{GOAL_DONE_MARKER}\n\
-             N'écris JAMAIS ce marqueur tant que l'objectif n'est pas pleinement atteint."
+             Work continuously (read, edit, execute) until this goal is ENTIRELY \
+             complete, without asking for confirmation. As long as anything remains, \
+             continue. When, and only when, the goal is fully completed and verified, \
+             end your final reply with the exact marker alone on its final line:\n{GOAL_DONE_MARKER}\n\
+             NEVER write this marker until the goal is fully completed."
         ),
         _ => base.to_string(),
     }
@@ -119,7 +186,7 @@ pub fn with_tool_guidelines(base: &str, guidelines: &[String]) -> String {
         return base.to_string();
     }
     let mut s = String::from(base);
-    s.push_str("\n\n## Règles d'utilisation des outils\n");
+    s.push_str("\n\n## Tool Usage Rules\n");
     for g in guidelines {
         s.push_str("- ");
         s.push_str(g);
@@ -159,10 +226,11 @@ fn launch_turn(
     conversation: &Arc<Mutex<Vec<Message>>>,
     cfg: &InteractiveConfig,
     deps: &Deps,
-    tx: &mpsc::Sender<AgentEvent>,
+    tx: &mpsc::Sender<AgentTurnEvent>,
+    turn_id: u64,
     user_msg: &str,
     persist_user_message: bool,
-) {
+) -> JoinHandle<()> {
     let mut msgs = conversation.lock().map(|g| g.clone()).unwrap_or_default();
     let ephemeral_messages = if persist_user_message {
         msgs.push(Message::user(user_msg.to_string()));
@@ -192,11 +260,15 @@ fn launch_turn(
         let stream = run_agent(ctx, deps);
         futures_util::pin_mut!(stream);
         while let Some(ev) = stream.next().await {
-            if tx.send(ev).await.is_err() {
+            if tx
+                .send(AgentTurnEvent { turn_id, event: ev })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
-    });
+    })
 }
 
 /// Si la dernière réponse de l'assistant porte le marqueur de complétion, le
@@ -322,6 +394,7 @@ async fn event_loop(
     mcp: Arc<Mutex<agent_mcp::McpRegistry>>,
 ) -> anyhow::Result<()> {
     let mut state = AppState::new(cfg.model.clone(), cfg.truecolor);
+    state.set_permission_mode(permission_mode_id(cfg.permission_mode.get()));
     state.workspace = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
@@ -348,7 +421,7 @@ async fn event_loop(
     if !initial_messages.is_empty() {
         state.blocks = blocks_from_messages(&initial_messages);
         state.blocks.push(Block::Notice(format!(
-            "Session reprise ({} messages).",
+            "Session resumed ({} messages).",
             initial_messages.len()
         )));
     }
@@ -378,9 +451,10 @@ async fn event_loop(
         }
     });
 
-    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentEvent>(256);
+    let (agent_tx, mut agent_rx) = mpsc::channel::<AgentTurnEvent>(256);
     let (mcp_tx, mut mcp_rx) = mpsc::channel::<McpEvent>(16);
     let mut running = false;
+    let mut active_turn = ActiveTurn::new();
     // Compteur de relances automatiques de la boucle d'objectif (reset à chaque
     // saisie utilisateur / nouvel objectif).
     let mut goal_iters: u32 = if cfg.goal.is_some() {
@@ -480,7 +554,14 @@ async fn event_loop(
                         #[cfg(feature = "codex_tui_parity")]
                         parity_surface.apply_update(parity_mapper.map_user_message(prompt.clone()));
                         goal_iters = 0;
-                        launch_turn(&conversation, &cfg, &deps, &agent_tx, &prompt, true);
+                        active_turn.start(
+                            &conversation,
+                            &cfg,
+                            &deps,
+                            &agent_tx,
+                            &prompt,
+                            true,
+                        );
                         running = true;
                     }
                     InputAction::Submit(prompt) => {
@@ -488,7 +569,7 @@ async fn event_loop(
                         #[cfg(feature = "codex_tui_parity")]
                         parity_surface.apply_update(parity_mapper.map_user_message(prompt.clone()));
                         state.blocks.push(Block::Notice(
-                            "Message ajouté à la file d'attente.".into(),
+                            "Message queued.".into(),
                         ));
                         queued_prompts.push_back(prompt);
                     }
@@ -503,7 +584,7 @@ async fn event_loop(
                                     .map(|(n, _, _)| *n)
                                     .collect::<Vec<_>>()
                                     .join("  ");
-                                state.blocks.push(Block::Notice(format!("Commandes : {list}")));
+                                state.blocks.push(Block::Notice(format!("Commands: {list}")));
                             }
                             "/models" => {
                                 if arg.is_empty() {
@@ -531,22 +612,51 @@ async fn event_loop(
                                     cfg.model = arg.to_string();
                                     state.model = arg.to_string();
                                     let suffix = if removed > 0 {
-                                        format!(" ({removed} reasoning items retirés)")
+                                        format!(" ({removed} reasoning items removed)")
                                     } else {
                                         String::new()
                                     };
                                     state
                                         .blocks
-                                        .push(Block::Notice(format!("Modèle : {arg}{suffix}")));
+                                        .push(Block::Notice(format!("Model: {arg}{suffix}")));
+                                }
+                            }
+                            "/permissions" => {
+                                if arg.is_empty() {
+                                    state.blocks.push(Block::Notice(
+                                        "Usage : /permissions <ask|accept-edits|auto|full-access|read-only>"
+                                            .into(),
+                                    ));
+                                } else if let Some(mode) = permission_mode_from_arg(arg) {
+                                    cfg.permission_mode.set(mode);
+                                    let id = permission_mode_id(mode);
+                                    state.set_permission_mode(id);
+                                    let label = permission_mode_label(id);
+                                    let message = format!("Permissions updated to {label}");
+                                    state.blocks.push(Block::Notice(message.clone()));
+                                    if let Some(path) = &cfg.settings_path
+                                        && let Err(err) =
+                                            crate::settings::save_permission_mode(path, mode)
+                                    {
+                                        state.blocks.push(Block::Error(format!(
+                                            "settings: failed to save permission mode: {err}"
+                                        )));
+                                    }
+                                    #[cfg(feature = "codex_tui_parity")]
+                                    parity_surface.apply_update(parity_mapper.map_notice(message));
+                                } else {
+                                    state.blocks.push(Block::Notice(format!(
+                                        "Unknown permission mode: {arg}"
+                                    )));
                                 }
                             }
                             "/goal" if running => state.blocks.push(Block::Notice(
-                                "Attends la fin du tour en cours.".into(),
+                                "Wait for the current turn to finish.".into(),
                             )),
                             "/goal" => match arg {
                                 "" => state.blocks.push(Block::Notice(match &cfg.goal {
-                                    Some(g) => format!("Objectif actif : {g}"),
-                                    None => "Aucun objectif. Usage : /goal <objectif à accomplir>".into(),
+                                    Some(g) => format!("Active goal: {g}"),
+                                    None => "No goal. Usage: /goal <goal to complete>".into(),
                                 })),
                                 "clear" => {
                                     cfg.goal = None;
@@ -556,7 +666,7 @@ async fn event_loop(
                                     if let Err(e) = remove_if_exists(&goal_iters_path) {
                                         state.blocks.push(Block::Error(format!("goal: {e}")));
                                     }
-                                    state.blocks.push(Block::Notice("Objectif effacé.".into()));
+                                    state.blocks.push(Block::Notice("Goal cleared.".into()));
                                 }
                                 g => {
                                     // Fixe l'objectif de cette session et lance le travail.
@@ -572,7 +682,14 @@ async fn event_loop(
                                     #[cfg(feature = "codex_tui_parity")]
                                     parity_surface
                                         .apply_update(parity_mapper.map_user_message(g.to_string()));
-                                    launch_turn(&conversation, &cfg, &deps, &agent_tx, g, true);
+                                    active_turn.start(
+                                        &conversation,
+                                        &cfg,
+                                        &deps,
+                                        &agent_tx,
+                                        g,
+                                        true,
+                                    );
                                     running = true;
                                 }
                             },
@@ -580,7 +697,7 @@ async fn event_loop(
                             // fichier de persistance est en cours d'écriture par le stream).
                             "/resume" | "/new" | "/clear" if running => {
                                 state.blocks.push(Block::Notice(
-                                    "Attends la fin du tour en cours.".into(),
+                                    "Wait for the current turn to finish.".into(),
                                 ));
                             }
                             "/resume" => {
@@ -623,9 +740,9 @@ async fn event_loop(
                                                 parity_mapper = TranscriptMapper::new();
                                                 parity_surface = ChatSurface::from_messages(&msgs);
                                             }
-                                            // L'historique reste global au dossier (déjà chargé).
+                                            // Prompt history stays folder-wide.
                                             state.blocks.push(Block::Notice(format!(
-                                                "Session reprise ({} messages).",
+                                                "Session resumed ({} messages).",
                                                 msgs.len()
                                             )));
                                             state.sessions =
@@ -656,7 +773,7 @@ async fn event_loop(
                                         state.blocks.clear();
                                         state
                                             .blocks
-                                            .push(Block::Notice("Session vide.".into()));
+                                            .push(Block::Notice("Empty session.".into()));
                                         #[cfg(feature = "codex_tui_parity")]
                                         {
                                             parity_mapper = TranscriptMapper::new();
@@ -708,20 +825,20 @@ async fn event_loop(
                             }
                             "/providers" => match arg {
                                 "apikey" => state.blocks.push(Block::Notice(
-                                    "L'authentification par clé API arrive bientôt.".into(),
+                                    "API key authentication is coming soon.".into(),
                                 )),
                                 "subscription anthropic" => state.blocks.push(Block::Notice(
-                                    "Anthropic (Claude Pro/Max) arrive bientôt.".into(),
+                                    "Anthropic (Claude Pro/Max) is coming soon.".into(),
                                 )),
                                 "subscription codex connect" => {
                                     if state.provider_connected {
                                         state
                                             .blocks
-                                            .push(Block::Notice("Déjà connecté à Codex.".into()));
+                                            .push(Block::Notice("Already connected to Codex.".into()));
                                     } else {
                                         state.blocks.push(Block::Notice(
-                                            "Quitte puis relance `pyxis` : l'onboarding intégré \
-                                             reconnectera ChatGPT."
+                                            "Quit and restart `pyxis`: the built-in onboarding \
+                                             will reconnect ChatGPT."
                                                 .into(),
                                         ));
                                     }
@@ -731,49 +848,79 @@ async fn event_loop(
                                         if let Err(e) = agent_auth::store::delete(KEYRING_ACCOUNT) {
                                             state
                                                 .blocks
-                                                .push(Block::Error(format!("déconnexion : {e}")));
+                                                .push(Block::Error(format!("disconnect: {e}")));
                                         } else if let Err(e) = deps.provider.disconnect_auth().await {
                                             state.blocks.push(Block::Error(format!(
-                                                "déconnexion provider : {e}"
+                                                "provider disconnect: {e}"
                                             )));
                                         } else {
                                                 state.provider_connected = false;
                                                 state.blocks.push(Block::Notice(
-                                                    "Déconnecté de Codex (credential supprimée). \
-                                                     Relance le login avant le prochain appel modèle."
+                                                    "Disconnected from Codex (credential removed). \
+                                                     Log in again before the next model call."
                                                         .into(),
                                                 ));
                                         }
                                     } else {
                                         state
                                             .blocks
-                                            .push(Block::Notice("Déjà déconnecté.".into()));
+                                            .push(Block::Notice("Already disconnected.".into()));
                                     }
                                 }
                                 "" | "subscription" | "subscription codex" => {
                                     state.blocks.push(Block::Notice(
-                                        "Choisis un fournisseur puis une action dans le sous-menu."
+                                        "Choose a provider and then an action in the submenu."
                                             .into(),
                                     ))
                                 }
                                 other => state
                                     .blocks
-                                    .push(Block::Notice(format!("Fournisseur inconnu : {other}"))),
+                                    .push(Block::Notice(format!("Unknown provider: {other}"))),
                             },
                             "/mcp" => {
                                 handle_mcp(arg, &mcp, &mcp_tx, &cfg.command_hardener, &mut state)
                             }
                             "/skills" => state.blocks.push(Block::Notice(
-                                "Choisis un skill dans le sous-menu /skills.".into(),
+                                "Choose a skill in the /skills submenu.".into(),
                             )),
                             "/quit" => state.should_quit = true,
                             other => state
                                 .blocks
-                                .push(Block::Notice(format!("Commande inconnue : {other}"))),
+                                .push(Block::Notice(format!("Unknown command: {other}"))),
                         }
                         state.scroll = 0;
                     }
                     InputAction::Quit => state.should_quit = true,
+                    InputAction::Interrupt if running => {
+                        if let Some(resp) = pending_resp.take() {
+                            let _ = resp.send(false);
+                        }
+                        active_turn.abort();
+                        let interrupted = AgentEvent::Interrupted;
+                        state.apply(&interrupted);
+                        #[cfg(feature = "codex_tui_parity")]
+                        {
+                            for update in parity_mapper.map_event(&interrupted) {
+                                parity_surface.apply_update(update);
+                            }
+                        }
+                        running = false;
+                        turn_start = None;
+                        state.end_turn();
+                        if let Some(next) = queued_prompts.pop_front() {
+                            goal_iters = 0;
+                            active_turn.start(
+                                &conversation,
+                                &cfg,
+                                &deps,
+                                &agent_tx,
+                                &next,
+                                true,
+                            );
+                            running = true;
+                        }
+                    }
+                    InputAction::Interrupt => {}
                     InputAction::Permission(allow) => {
                         if let Some(resp) = pending_resp.take() {
                             let _ = resp.send(allow);
@@ -785,11 +932,18 @@ async fn event_loop(
                 }
             }
             ev = agent_rx.recv(), if running => {
-                if let Some(ev) = ev {
+                if let Some(turn_event) = ev {
+                    if !active_turn.is_current(turn_event.turn_id) {
+                        continue;
+                    }
+                    let ev = turn_event.event;
                     let endturn = matches!(ev, AgentEvent::EndTurn);
                     let stop = matches!(
                         ev,
-                        AgentEvent::EndTurn | AgentEvent::Error(_) | AgentEvent::Exhausted(_)
+                        AgentEvent::EndTurn
+                            | AgentEvent::Interrupted
+                            | AgentEvent::Error(_)
+                            | AgentEvent::Exhausted(_)
                     );
                     state.apply(&ev);
                     #[cfg(feature = "codex_tui_parity")]
@@ -799,6 +953,7 @@ async fn event_loop(
                         }
                     }
                     if stop {
+                        active_turn.finish();
                         // Boucle d'objectif : sur un EndTurn « propre » avec un goal
                         // actif, on relance tant que le marqueur de complétion n'est
                         // pas émis (le modèle ne décide pas seul de s'arrêter).
@@ -813,7 +968,7 @@ async fn event_loop(
                                 }
                                 state
                                     .blocks
-                                    .push(Block::Notice("✓ Objectif atteint — effacé.".into()));
+                                    .push(Block::Notice("Goal completed and cleared.".into()));
                                 running = false;
                             } else if goal_iters < MAX_GOAL_ITERS {
                                 goal_iters += 1;
@@ -823,9 +978,11 @@ async fn event_loop(
                                     continue;
                                 }
                                 state.blocks.push(Block::Notice(format!(
-                                    "↻ poursuite de l'objectif ({goal_iters}/{MAX_GOAL_ITERS})…"
+                                    "Continuing goal ({goal_iters}/{MAX_GOAL_ITERS})..."
                                 )));
-                                launch_turn(
+                                turn_start = None;
+                                state.end_turn();
+                                active_turn.start(
                                     &conversation,
                                     &cfg,
                                     &deps,
@@ -836,8 +993,8 @@ async fn event_loop(
                                 // running reste true : un nouveau tour est lancé.
                             } else {
                                 state.blocks.push(Block::Notice(format!(
-                                    "Objectif non confirmé après {MAX_GOAL_ITERS} relances — \
-                                     arrêt. /goal clear pour abandonner."
+                                    "Goal not confirmed after {MAX_GOAL_ITERS} retries. \
+                                     Use /goal clear to abandon it."
                                 )));
                                 running = false;
                             }
@@ -848,7 +1005,16 @@ async fn event_loop(
                             && let Some(next) = queued_prompts.pop_front()
                         {
                             goal_iters = 0;
-                            launch_turn(&conversation, &cfg, &deps, &agent_tx, &next, true);
+                            turn_start = None;
+                            state.end_turn();
+                            active_turn.start(
+                                &conversation,
+                                &cfg,
+                                &deps,
+                                &agent_tx,
+                                &next,
+                                true,
+                            );
                             running = true;
                         }
                     }
@@ -879,26 +1045,25 @@ async fn event_loop(
                     match ev {
                         McpEvent::Connected { name, conn, tools } => {
                             let n = tools.len();
-                            // Verrou empoisonné → on ferme la connexion au lieu de la
-                            // dropper en silence (sinon sous-process orphelin).
+                            // Poisoned lock: close the connection instead of silently dropping it.
                             match mcp.lock() {
                                 Ok(mut r) => {
                                     if let Some(c) = r.finish_connect(&name, conn, tools) {
-                                        // Déconnecté pendant la connexion → session orpheline.
+                                        // Disconnected while connecting: cancel the orphan session.
                                         tokio::spawn(async move { c.cancel().await });
                                         state.blocks.push(Block::Notice(format!(
-                                            "MCP « {name} » : connexion annulée."
+                                            "MCP \"{name}\": connection canceled."
                                         )));
                                     } else {
                                         state.blocks.push(Block::Notice(format!(
-                                            "✓ MCP « {name} » connecté ({n} outils)."
+                                            "MCP \"{name}\" connected ({n} tools)."
                                         )));
                                     }
                                 }
                                 Err(_) => {
                                     tokio::spawn(async move { conn.cancel().await });
                                     state.blocks.push(Block::Error(
-                                        "MCP : registre indisponible — connexion fermée.".into(),
+                                        "MCP: registry unavailable, connection closed.".into(),
                                     ));
                                 }
                             }
@@ -909,7 +1074,7 @@ async fn event_loop(
                             }
                             state
                                 .blocks
-                                .push(Block::Error(format!("✗ MCP « {name} » : {error}")));
+                                .push(Block::Error(format!("MCP \"{name}\": {error}")));
                         }
                     }
                     state.mcp_servers = mcp_metas(&mcp);
@@ -924,8 +1089,12 @@ async fn event_loop(
                 let elapsed = turn_start.map(|t| t.elapsed()).unwrap_or_default();
                 state.tick_progress(elapsed);
             }
+            _ = tokio::time::sleep(state.quit_shortcut_remaining().unwrap_or(Duration::ZERO)), if state.quit_shortcut_hint_visible() => {
+                state.clear_quit_shortcut_hint();
+            }
         }
     }
+    active_turn.abort();
     Ok(())
 }
 
@@ -944,7 +1113,7 @@ fn handle_mcp(
     }
     let Some((server, action)) = arg.rsplit_once(' ') else {
         state.blocks.push(Block::Notice(
-            "Sélectionne un serveur puis une action dans le sous-menu /mcp. Diagnostics: /mcp issues."
+            "Select a server and then an action in the /mcp submenu. Diagnostics: /mcp issues."
                 .into(),
         ));
         return;
@@ -953,7 +1122,7 @@ fn handle_mcp(
     if server.is_empty() {
         state
             .blocks
-            .push(Block::Notice("Usage : /mcp <serveur> <action>.".into()));
+            .push(Block::Notice("Usage: /mcp <server> <action>.".into()));
         return;
     }
     match action {
@@ -966,7 +1135,7 @@ fn handle_mcp(
                 && mcp_requires_trust(&cfg)
             {
                 let lead =
-                    format!("Connexion bloquée avant spawn. Relance avec /mcp {server} trust.");
+                    format!("Connection blocked before spawn. Retry with /mcp {server} trust.");
                 state
                     .blocks
                     .push(Block::Notice(mcp_trust_notice(server, &cfg, &lead)));
@@ -984,14 +1153,14 @@ fn handle_mcp(
                 None => {
                     state
                         .blocks
-                        .push(Block::Notice(format!("MCP « {server} » inconnu.")));
+                        .push(Block::Notice(format!("Unknown MCP server: {server}.")));
                     return;
                 }
             };
             state.blocks.push(Block::Notice(mcp_trust_notice(
                 server,
                 &cfg,
-                "Trust confirmé pour cette connexion.",
+                "Trust confirmed for this connection.",
             )));
             start_mcp_connect(server, mcp, mcp_tx, command_hardener, state, Some(cfg));
         }
@@ -1002,11 +1171,11 @@ fn handle_mcp(
                     tokio::spawn(async move { old.cancel().await });
                     state
                         .blocks
-                        .push(Block::Notice(format!("MCP « {server} » déconnecté.")));
+                        .push(Block::Notice(format!("MCP \"{server}\" disconnected.")));
                 }
                 None => state
                     .blocks
-                    .push(Block::Notice(format!("MCP « {server} » non connecté."))),
+                    .push(Block::Notice(format!("MCP \"{server}\" is not connected."))),
             }
             state.mcp_servers = mcp_metas(mcp);
         }
@@ -1021,22 +1190,22 @@ fn handle_mcp(
                             .collect::<Vec<_>>()
                             .join(", ");
                         state.blocks.push(Block::Notice(format!(
-                            "MCP « {server} » ({} outils) : {names}",
+                            "MCP \"{server}\" ({} tools): {names}",
                             s.tools().len()
                         )));
                     }
                     Some(_) => state.blocks.push(Block::Notice(format!(
-                        "MCP « {server} » : aucun outil exposé."
+                        "MCP \"{server}\": no exposed tools."
                     ))),
                     None => state
                         .blocks
-                        .push(Block::Notice(format!("MCP « {server} » inconnu."))),
+                        .push(Block::Notice(format!("Unknown MCP server: {server}."))),
                 }
             }
         }
         other => state
             .blocks
-            .push(Block::Notice(format!("Action MCP inconnue : {other}"))),
+            .push(Block::Notice(format!("Unknown MCP action: {other}"))),
     }
 }
 
@@ -1067,10 +1236,10 @@ fn start_mcp_connect(
                     tokio::spawn(async move { old.cancel().await });
                 }
                 if let Ok(mut r) = mcp.lock() {
-                    r.fail(server, "config MCP modifiée pendant le trust".to_string());
+                    r.fail(server, "MCP config changed during trust".to_string());
                 }
                 state.blocks.push(Block::Error(format!(
-                    "MCP « {server} » : config modifiée pendant le trust."
+                    "MCP \"{server}\": config changed during trust."
                 )));
                 state.mcp_servers = mcp_metas(mcp);
                 return;
@@ -1081,7 +1250,7 @@ fn start_mcp_connect(
             state.mcp_servers = mcp_metas(mcp);
             state
                 .blocks
-                .push(Block::Notice(format!("MCP « {server} » : connexion…")));
+                .push(Block::Notice(format!("MCP \"{server}\": connecting...")));
             let tx = mcp_tx.clone();
             let name = server.to_string();
             let harden = Arc::clone(command_hardener);
@@ -1108,7 +1277,7 @@ fn start_mcp_connect(
                         error: e.to_string(),
                     },
                 };
-                // Canal fermé: on récupère la connexion et on ferme le sous-process.
+                // Closed channel: recover the connection and close the subprocess.
                 if let Err(mpsc::error::SendError(ev)) = tx.send(ev).await
                     && let McpEvent::Connected { conn, .. } = ev
                 {
@@ -1116,7 +1285,7 @@ fn start_mcp_connect(
                 }
             });
         }
-        Err(e) => state.blocks.push(Block::Notice(format!("MCP : {e}"))),
+        Err(e) => state.blocks.push(Block::Notice(format!("MCP: {e}"))),
     }
 }
 
@@ -1133,13 +1302,13 @@ fn show_mcp_issues(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>, state: &mut AppStat
     let Ok(reg) = mcp.lock() else {
         state
             .blocks
-            .push(Block::Error("MCP : registre indisponible.".into()));
+            .push(Block::Error("MCP: registry unavailable.".into()));
         return;
     };
     if reg.issues().is_empty() {
         state
             .blocks
-            .push(Block::Notice("MCP : aucun diagnostic de config.".into()));
+            .push(Block::Notice("MCP: no config diagnostics.".into()));
         return;
     }
     let mut lines = reg
@@ -1150,7 +1319,7 @@ fn show_mcp_issues(mcp: &Arc<Mutex<agent_mcp::McpRegistry>>, state: &mut AppStat
         .collect::<Vec<_>>();
     if reg.issue_count() > lines.len() {
         lines.push(format!(
-            "{} autres diagnostics",
+            "{} more diagnostics",
             reg.issue_count() - lines.len()
         ));
     }
@@ -1192,28 +1361,28 @@ fn mcp_sensitive_env_keys(cfg: &agent_mcp::McpServerConfig) -> Vec<&str> {
 
 fn mcp_trust_notice(server: &str, cfg: &agent_mcp::McpServerConfig, lead: &str) -> String {
     let args = if cfg.args.is_empty() {
-        "(aucun)".to_string()
+        "(none)".to_string()
     } else {
         cfg.args.join(" ")
     };
     let env_keys = if cfg.env.is_empty() {
-        "(aucune)".to_string()
+        "(none)".to_string()
     } else {
         cfg.env.keys().cloned().collect::<Vec<_>>().join(", ")
     };
     let sensitive = mcp_sensitive_env_keys(cfg);
     let sensitive = if sensitive.is_empty() {
-        "(aucune)".to_string()
+        "(none)".to_string()
     } else {
         sensitive.join(", ")
     };
     let shadow = if cfg.shadows_lower_priority {
-        "\nShadowing: masque une config MCP de priorité plus basse."
+        "\nShadowing: hides a lower-priority MCP config."
     } else {
         ""
     };
     format!(
-        "MCP « {server} » : {lead}\nSource: {}\nCommande: {}\nArgs: {args}\nEnv: {env_keys} (valeurs masquées)\nEnv sensible: {sensitive}{shadow}",
+        "MCP \"{server}\": {lead}\nSource: {}\nCommand: {}\nArgs: {args}\nEnv: {env_keys} (values masked)\nSensitive env: {sensitive}{shadow}",
         cfg.source.display(),
         cfg.command
     )
@@ -1249,7 +1418,7 @@ fn load_sessions(dir: &Path, exclude: &Path) -> Vec<SessionMeta> {
         .map(|s| {
             let label = match s.summary.lines().next().map(str::trim) {
                 Some(l) if !l.is_empty() => l.to_string(),
-                _ => "(sans titre)".to_string(),
+                _ => "(untitled)".to_string(),
             };
             SessionMeta {
                 id: s.id,
@@ -1309,20 +1478,20 @@ fn is_mentionable_file_name(name: &str) -> bool {
     )
 }
 
-/// Âge lisible d'une session (« il y a 3 min »).
+/// Human-readable session age.
 fn relative_time(modified: SystemTime) -> String {
     let secs = SystemTime::now()
         .duration_since(modified)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if secs < 60 {
-        format!("il y a {secs}s")
+        format!("{secs}s ago")
     } else if secs < 3_600 {
-        format!("il y a {} min", secs / 60)
+        format!("{} min ago", secs / 60)
     } else if secs < 86_400 {
-        format!("il y a {} h", secs / 3_600)
+        format!("{}h ago", secs / 3_600)
     } else {
-        format!("il y a {} j", secs / 86_400)
+        format!("{}d ago", secs / 86_400)
     }
 }
 
@@ -1359,18 +1528,24 @@ mod tests {
 
     #[test]
     fn compose_system_pins_completion_directive() {
-        let base = "Tu es Pyxis.";
+        let base = "You are Pyxis.";
         assert_eq!(compose_system(base, None), base);
         assert_eq!(
             compose_system(base, Some("   ")),
             base,
-            "objectif vide → base"
+            "empty goal leaves base unchanged"
         );
-        let with = compose_system(base, Some("refonds l'UI"));
+        let with = compose_system(base, Some("refactor the UI"));
         assert!(with.starts_with(base));
-        assert!(with.contains("NE T'ARRÊTE PAS"), "directive de complétion");
-        assert!(with.contains(GOAL_DONE_MARKER), "marqueur instruit");
-        assert!(with.contains("refonds l'UI"));
+        assert!(
+            with.contains("DO NOT STOP"),
+            "completion directive should be present"
+        );
+        assert!(
+            with.contains(GOAL_DONE_MARKER),
+            "marker should be instructed"
+        );
+        assert!(with.contains("refactor the UI"));
     }
 
     #[test]
@@ -1398,22 +1573,22 @@ mod tests {
     #[test]
     fn take_goal_done_detects_and_strips_marker() {
         let mut s = AppState::new("gpt-5", false);
-        // Pas de marqueur → non atteint.
+        // No marker: goal is not complete.
         s.blocks.push(Block::Assistant {
-            text: "j'ai commencé".into(),
+            text: "I started".into(),
             streaming: false,
         });
         assert!(!take_goal_done(&mut s));
-        // Marqueur présent → atteint + strippé de l'affichage.
+        // Marker present: complete and stripped from display.
         s.blocks.push(Block::Assistant {
-            text: format!("c'est terminé\n{GOAL_DONE_MARKER}"),
+            text: format!("done\n{GOAL_DONE_MARKER}"),
             streaming: false,
         });
         assert!(take_goal_done(&mut s));
         assert!(
             matches!(s.blocks.last(), Some(Block::Assistant { text, .. })
-                if text == "c'est terminé" && !text.contains(GOAL_DONE_MARKER)),
-            "marqueur strippé du dernier bloc",
+                if text == "done" && !text.contains(GOAL_DONE_MARKER)),
+            "marker should be stripped from the last block",
         );
     }
 
@@ -1421,13 +1596,13 @@ mod tests {
     fn take_goal_done_requires_marker_as_last_line() {
         let mut s = AppState::new("gpt-5", false);
         s.blocks.push(Block::Assistant {
-            text: format!("texte {GOAL_DONE_MARKER} au milieu"),
+            text: format!("text {GOAL_DONE_MARKER} in the middle"),
             streaming: false,
         });
         assert!(!take_goal_done(&mut s));
 
         s.blocks.push(Block::Assistant {
-            text: format!("terminé\n{GOAL_DONE_MARKER}\n\n"),
+            text: format!("done\n{GOAL_DONE_MARKER}\n\n"),
             streaming: false,
         });
         assert!(take_goal_done(&mut s));
