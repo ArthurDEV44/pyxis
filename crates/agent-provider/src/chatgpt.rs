@@ -76,6 +76,14 @@ fn model_profile(model: &str, fallback_max_context: u32) -> ModelProfile {
     }
 }
 
+fn reasoning_effort_for_request(effort: &str) -> &str {
+    if effort.eq_ignore_ascii_case("ultra") {
+        "max"
+    } else {
+        effort
+    }
+}
+
 /// Borne du corps d'erreur HTTP capturé (évite un message géant en log).
 const MAX_ERR_BODY: usize = 2000;
 
@@ -533,7 +541,10 @@ impl Provider for OpenAiChatGptProvider {
         // 2. corps Responses (SSE stateless).
         let profile = model_profile(&req.model, self.capabilities.max_context);
         let reasoning_effort = if profile.supports_reasoning {
-            self.reasoning_effort.as_deref()
+            req.reasoning_effort
+                .as_deref()
+                .or(self.reasoning_effort.as_deref())
+                .map(reasoning_effort_for_request)
         } else {
             None
         };
@@ -757,6 +768,13 @@ mod tests {
         let unknown = model_profile("unknown-model", 12_345);
         assert!(!unknown.supports_reasoning);
         assert!(!unknown.parallel_tool_calls);
+    }
+
+    #[test]
+    fn ultra_reasoning_effort_is_sent_as_max() {
+        assert_eq!(reasoning_effort_for_request("ultra"), "max");
+        assert_eq!(reasoning_effort_for_request("Ultra"), "max");
+        assert_eq!(reasoning_effort_for_request("xhigh"), "xhigh");
     }
 
     #[test]

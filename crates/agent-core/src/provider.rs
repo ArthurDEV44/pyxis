@@ -280,6 +280,8 @@ pub enum ToolSpecValidationError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CanonicalRequest {
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     pub system: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
@@ -479,6 +481,7 @@ mod tests {
         };
         let req = CanonicalRequest {
             model: "gpt".into(),
+            reasoning_effort: None,
             system: None,
             messages: vec![invalid_message],
             tools: vec![],
@@ -491,6 +494,7 @@ mod tests {
 
         let req = CanonicalRequest {
             model: "gpt".into(),
+            reasoning_effort: None,
             system: None,
             messages: vec![Message::user("ok")],
             tools: vec![ToolSpec {
@@ -516,6 +520,7 @@ mod tests {
     fn canonical_request_rejects_non_strict_tool_schemas_and_duplicate_names() {
         let req = CanonicalRequest {
             model: "gpt".into(),
+            reasoning_effort: None,
             system: None,
             messages: vec![Message::user("ok")],
             tools: vec![ToolSpec {
@@ -548,6 +553,7 @@ mod tests {
         };
         let req = CanonicalRequest {
             model: "gpt".into(),
+            reasoning_effort: None,
             system: None,
             messages: vec![Message::user("ok")],
             tools: vec![strict_tool.clone(), strict_tool],

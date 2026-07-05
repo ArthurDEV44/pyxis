@@ -509,12 +509,31 @@ async fn run(
 ) -> anyhow::Result<()> {
     let run_config = run_config_from_args(&args)?;
     let headless = args.prompt.is_some();
+    let settings_path = if headless {
+        None
+    } else {
+        settings::default_settings_path()
+    };
+    let saved_reasoning_effort =
+        settings_path
+            .as_deref()
+            .and_then(|path| match settings::load_reasoning_effort(path) {
+                Ok(effort) => effort,
+                Err(err) => {
+                    eprintln!("[settings] reasoning_effort: {err}");
+                    None
+                }
+            });
+    let initial_reasoning_effort = saved_reasoning_effort
+        .as_deref()
+        .and_then(|effort| agent_tui::normalize_reasoning_effort_for_model(&args.model, effort))
+        .or_else(|| agent_tui::default_reasoning_effort_for_model(&args.model).map(str::to_string));
     // 1. Credential abonnement ChatGPT chargée avant le sandbox. Si elle manque en
     // interactif, l'onboarding OAuth a déjà tourné avant d'arriver ici.
     let mut chatgpt = OpenAiChatGptProvider::new(
         cred,
         agent_provider::DEFAULT_MAX_CONTEXT,
-        Some(agent_provider::DEFAULT_REASONING_EFFORT.to_string()),
+        initial_reasoning_effort.clone(),
     );
     // US-022 : idle timeout SSE configurable par session (défaut 60 s). Une valeur
     // env invalide/0 est ignorée → garde le défaut (watchdog jamais désactivé).
@@ -570,11 +589,6 @@ async fn run(
     // 4. Registry d'outils + approbateur (TUI en interactif, auto en headless).
     let (perm_tx, perm_rx) = tokio::sync::mpsc::channel(8);
     let policy = permission_policy(headless, args.yes, sandbox_enforced);
-    let settings_path = if headless {
-        None
-    } else {
-        settings::default_settings_path()
-    };
     let initial_permission_mode = settings_path
         .as_deref()
         .and_then(|path| match settings::load_permission_mode(path) {
@@ -631,6 +645,7 @@ async fn run(
         messages.push(Message::user(prompt));
         let ctx = AgentContext {
             model: args.model,
+            reasoning_effort: initial_reasoning_effort.clone(),
             system: Some(interactive::compose_system(&base, goal.as_deref())),
             messages,
             tools: tool_specs,
@@ -664,6 +679,7 @@ async fn run(
 
         let cfg = InteractiveConfig {
             model: args.model,
+            reasoning_effort: initial_reasoning_effort,
             tool_guidelines,
             context_messages: context_msgs,
             run_config,

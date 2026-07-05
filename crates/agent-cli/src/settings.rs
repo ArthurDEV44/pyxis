@@ -5,6 +5,7 @@ use agent_tools::PermissionMode;
 
 const SETTINGS_FILE: &str = "settings.toml";
 const PERMISSION_MODE_KEY: &str = "permission_mode";
+const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 
 pub fn permission_mode_id(mode: PermissionMode) -> &'static str {
     match mode {
@@ -37,6 +38,28 @@ pub fn default_settings_path() -> Option<PathBuf> {
 }
 
 pub fn load_permission_mode(path: &Path) -> io::Result<Option<PermissionMode>> {
+    Ok(load_string_key(path, PERMISSION_MODE_KEY)?
+        .as_deref()
+        .and_then(permission_mode_from_arg))
+}
+
+pub fn save_permission_mode(path: &Path, mode: PermissionMode) -> io::Result<()> {
+    save_string_key(path, PERMISSION_MODE_KEY, Some(permission_mode_id(mode)))
+}
+
+pub fn load_reasoning_effort(path: &Path) -> io::Result<Option<String>> {
+    Ok(load_string_key(path, REASONING_EFFORT_KEY)?.filter(|value| !value.trim().is_empty()))
+}
+
+pub fn save_reasoning_effort(path: &Path, effort: Option<&str>) -> io::Result<()> {
+    save_string_key(
+        path,
+        REASONING_EFFORT_KEY,
+        effort.map(str::trim).filter(|value| !value.is_empty()),
+    )
+}
+
+fn load_string_key(path: &Path, expected_key: &str) -> io::Result<Option<String>> {
     let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -45,35 +68,35 @@ pub fn load_permission_mode(path: &Path) -> io::Result<Option<PermissionMode>> {
 
     Ok(contents.lines().find_map(|line| {
         let (key, value) = line.split_once('=')?;
-        if key.trim() != PERMISSION_MODE_KEY {
+        if key.trim() != expected_key {
             return None;
         }
-        let value = parse_tomlish_string(value.trim())?;
-        permission_mode_from_arg(value)
+        parse_tomlish_string(value.trim()).map(str::to_string)
     }))
 }
 
-pub fn save_permission_mode(path: &Path, mode: PermissionMode) -> io::Result<()> {
-    let value = permission_mode_id(mode);
-    let new_line = format!("{PERMISSION_MODE_KEY} = \"{value}\"");
+fn save_string_key(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
+    let new_line = value.map(|value| format!("{key} = \"{value}\""));
     let mut replaced = false;
     let mut lines = match std::fs::read_to_string(path) {
         Ok(contents) => contents
             .lines()
-            .map(|line| {
-                if is_permission_mode_line(line) && !replaced {
+            .filter_map(|line| {
+                if is_key_line(line, key) {
+                    if replaced {
+                        return None;
+                    }
                     replaced = true;
-                    new_line.clone()
-                } else {
-                    line.to_string()
+                    return new_line.clone();
                 }
+                Some(line.to_string())
             })
             .collect::<Vec<_>>(),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
         Err(err) => return Err(err),
     };
 
-    if !replaced {
+    if !replaced && let Some(new_line) = new_line {
         lines.push(new_line);
     }
     let mut contents = lines.join("\n");
@@ -85,11 +108,11 @@ pub fn save_permission_mode(path: &Path, mode: PermissionMode) -> io::Result<()>
     std::fs::write(path, contents)
 }
 
-fn is_permission_mode_line(line: &str) -> bool {
+fn is_key_line(line: &str, expected_key: &str) -> bool {
     let Some((key, _)) = line.split_once('=') else {
         return false;
     };
-    key.trim() == PERMISSION_MODE_KEY
+    key.trim() == expected_key
 }
 
 fn parse_tomlish_string(value: &str) -> Option<&str> {
@@ -154,6 +177,70 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "model = \"gpt\"\npermission_mode = \"full-access\"\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_reasoning_effort_reads_saved_value() {
+        let path = temp_path("effort-load");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "reasoning_effort = \"high\" # keep\n").unwrap();
+
+        let effort = load_reasoning_effort(&path).unwrap();
+
+        assert_eq!(effort.as_deref(), Some("high"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_reasoning_effort_creates_file() {
+        let path = temp_path("effort-create");
+        let _ = std::fs::remove_file(&path);
+
+        save_reasoning_effort(&path, Some("xhigh")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "reasoning_effort = \"xhigh\"\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_reasoning_effort_replaces_existing_key_and_preserves_other_lines() {
+        let path = temp_path("effort-replace");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "permission_mode = \"ask\"\nreasoning_effort = \"low\"\n",
+        )
+        .unwrap();
+
+        save_reasoning_effort(&path, Some("high")).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "permission_mode = \"ask\"\nreasoning_effort = \"high\"\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_reasoning_effort_none_removes_existing_key() {
+        let path = temp_path("effort-remove");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            "reasoning_effort = \"low\"\npermission_mode = \"ask\"\n",
+        )
+        .unwrap();
+
+        save_reasoning_effort(&path, None).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "permission_mode = \"ask\"\n"
         );
         let _ = std::fs::remove_file(path);
     }

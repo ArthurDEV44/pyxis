@@ -275,6 +275,7 @@ mod tests {
     fn req(messages: Vec<Message>, tools: Vec<ToolSpec>, system: Option<&str>) -> CanonicalRequest {
         CanonicalRequest {
             model: "gpt-5.4".into(),
+            reasoning_effort: None,
             system: system.map(String::from),
             messages,
             tools,

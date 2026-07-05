@@ -19,7 +19,8 @@ use agent_provider::KEYRING_ACCOUNT;
 use agent_tools::PermissionModeState;
 use agent_tui::{
     AppState, Block, COMMANDS, InputAction, McpServerMeta, McpStatus, SessionMeta,
-    blocks_from_messages, permission_mode_label,
+    blocks_from_messages, default_reasoning_effort_for_model, normalize_reasoning_effort_for_model,
+    permission_mode_label, reasoning_effort_label, supported_reasoning_efforts_for_model,
 };
 #[cfg(feature = "codex_tui_parity")]
 use agent_tui::{
@@ -115,6 +116,7 @@ impl ActiveTurn {
 
 pub struct InteractiveConfig {
     pub model: String,
+    pub reasoning_effort: Option<String>,
     /// Guidelines comportementales des outils (US-026), injectées dans le system
     /// prompt. Stockées brutes (pas pré-composées) car le system de base dépend du
     /// slug courant (US-027) et est recomposé par tour.
@@ -139,7 +141,7 @@ pub struct InteractiveConfig {
     pub command_hardener: agent_tools::CommandHardener,
     /// Mode de permissions mutable, partagé avec le registre d'outils.
     pub permission_mode: PermissionModeState,
-    /// Settings utilisateur globaux, utilisés pour persister le mode de permissions.
+    /// Settings utilisateur globaux, utilisés pour persister les choix interactifs.
     pub settings_path: Option<PathBuf>,
 }
 
@@ -157,6 +159,20 @@ const GOAL_CONTINUE_PROMPT: &str = "Continue the session goal. If work remains, 
 
 const MCP_DISABLED_NOTICE: &str =
     "MCP: config diagnostics only. MCP tool execution is not exposed in this build.";
+
+fn persist_reasoning_effort(
+    state: &mut AppState,
+    settings_path: Option<&Path>,
+    effort: Option<&str>,
+) {
+    if let Some(path) = settings_path
+        && let Err(err) = crate::settings::save_reasoning_effort(path, effort)
+    {
+        state.blocks.push(Block::Error(format!(
+            "settings: failed to save reasoning effort: {err}"
+        )));
+    }
+}
 
 /// Compose le system prompt effectif : base + DIRECTIVE de complétion. L'objectif
 /// vit dans `instructions` (re-envoyé chaque tour) donc survit à la compaction —
@@ -246,6 +262,7 @@ fn launch_turn(
     );
     let ctx = AgentContext {
         model: cfg.model.clone(),
+        reasoning_effort: cfg.reasoning_effort.clone(),
         system: Some(compose_system(&base, cfg.goal.as_deref())),
         messages: msgs,
         tools: cfg.tool_specs.clone(),
@@ -419,7 +436,7 @@ async fn event_loop(
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    state.reasoning_effort = Some(agent_provider::DEFAULT_REASONING_EFFORT.to_string());
+    state.reasoning_effort = cfg.reasoning_effort.clone();
     state.provider_connected = cfg.connected;
     state.reduced_motion = cfg.reduced_motion;
     state.skills = std::mem::take(&mut cfg.skills);
@@ -629,16 +646,80 @@ async fn event_loop(
                                             .lock()
                                             .map(|mut msgs| scrub_encrypted_reasoning(&mut msgs[..]));
                                     }
+                                    let previous_effort = cfg.reasoning_effort.clone();
+                                    let next_effort = previous_effort
+                                        .as_deref()
+                                        .and_then(|effort| {
+                                            normalize_reasoning_effort_for_model(arg, effort)
+                                        })
+                                        .or_else(|| {
+                                            default_reasoning_effort_for_model(arg)
+                                                .map(str::to_string)
+                                        });
                                     cfg.model = arg.to_string();
+                                    cfg.reasoning_effort = next_effort.clone();
                                     state.model = arg.to_string();
+                                    state.reasoning_effort = next_effort.clone();
                                     let suffix = if removed > 0 {
                                         format!(" ({removed} reasoning items removed)")
                                     } else {
                                         String::new()
                                     };
-                                    state
-                                        .blocks
-                                        .push(Block::Notice(format!("Model: {arg}{suffix}")));
+                                    let effort_suffix = next_effort
+                                        .as_deref()
+                                        .map(|effort| {
+                                            format!(" [{}]", reasoning_effort_label(effort))
+                                        })
+                                        .unwrap_or_default();
+                                    state.blocks.push(Block::Notice(format!(
+                                        "Model: {arg}{effort_suffix}{suffix}"
+                                    )));
+                                    persist_reasoning_effort(
+                                        &mut state,
+                                        cfg.settings_path.as_deref(),
+                                        next_effort.as_deref(),
+                                    );
+                                }
+                            }
+                            "/effort" => {
+                                let supported = supported_reasoning_efforts_for_model(&cfg.model);
+                                if arg.is_empty() {
+                                    if supported.is_empty() {
+                                        state.blocks.push(Block::Notice(format!(
+                                            "No known reasoning efforts for model {}",
+                                            cfg.model
+                                        )));
+                                    } else {
+                                        state.blocks.push(Block::Notice(format!(
+                                            "Usage : /effort <{}>",
+                                            supported.join("|")
+                                        )));
+                                    }
+                                } else if let Some(effort) =
+                                    normalize_reasoning_effort_for_model(&cfg.model, arg)
+                                {
+                                    cfg.reasoning_effort = Some(effort.clone());
+                                    state.reasoning_effort = Some(effort.clone());
+                                    state.blocks.push(Block::Notice(format!(
+                                        "Reasoning effort: {}",
+                                        reasoning_effort_label(&effort)
+                                    )));
+                                    persist_reasoning_effort(
+                                        &mut state,
+                                        cfg.settings_path.as_deref(),
+                                        Some(&effort),
+                                    );
+                                } else if supported.is_empty() {
+                                    state.blocks.push(Block::Notice(format!(
+                                        "No known reasoning efforts for model {}",
+                                        cfg.model
+                                    )));
+                                } else {
+                                    state.blocks.push(Block::Notice(format!(
+                                        "Unsupported reasoning effort for {}: {arg}. Available: {}",
+                                        cfg.model,
+                                        supported.join("|")
+                                    )));
                                 }
                             }
                             "/permissions" => {

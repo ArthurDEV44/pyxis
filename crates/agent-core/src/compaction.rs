@@ -160,6 +160,7 @@ pub async fn full_compact(
 
     let req = CanonicalRequest {
         model: model.to_string(),
+        reasoning_effort: None,
         system: Some(SUMMARY_SYSTEM.to_string()),
         messages: to_summarize,
         tools: Vec::new(),

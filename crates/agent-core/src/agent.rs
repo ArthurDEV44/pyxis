@@ -67,6 +67,7 @@ impl Default for RunConfig {
 /// Contexte d'une exécution d'agent (modèle, system, transcript, outils).
 pub struct AgentContext {
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub system: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
@@ -85,6 +86,7 @@ impl AgentContext {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             model: model.into(),
+            reasoning_effort: None,
             system: None,
             messages: Vec::new(),
             tools: Vec::new(),
@@ -117,6 +119,7 @@ impl AgentContext {
 
 fn make_request(
     model: &str,
+    reasoning_effort: &Option<String>,
     system: &Option<String>,
     context_messages: &[Message],
     messages: &[Message],
@@ -134,6 +137,7 @@ fn make_request(
     all.extend_from_slice(ephemeral_messages);
     CanonicalRequest {
         model: model.to_string(),
+        reasoning_effort: reasoning_effort.clone(),
         system: system.clone(),
         messages: all,
         tools: tools.to_vec(),
@@ -328,6 +332,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
     async_stream::stream! {
         let AgentContext {
             mut model,
+            reasoning_effort,
             system,
             mut messages,
             tools,
@@ -441,6 +446,7 @@ pub fn run_agent(ctx: AgentContext, deps: Deps) -> impl Stream<Item = AgentEvent
                     budget.begin_turn();
                     let req = make_request(
                         &model,
+                        &reasoning_effort,
                         &system,
                         &context_messages,
                         &messages,

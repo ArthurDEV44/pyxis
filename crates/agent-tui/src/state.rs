@@ -57,6 +57,7 @@ pub enum Status {
 pub const COMMANDS: &[(&str, &str, bool)] = &[
     ("/help", "Show available commands", false),
     ("/models", "Choose the active model", true),
+    ("/effort", "Choose the reasoning effort", true),
     (
         "/permissions",
         "Choose when Pyxis asks for confirmation",
@@ -86,15 +87,152 @@ pub const SUB_PROVIDERS: &[(&str, &str, bool)] = &[
     ("anthropic", "Anthropic (Claude Pro/Max)", false),
 ];
 
-/// Modèles disponibles : (slug, tag provider). Sous-menu de `/models`. Le premier
-/// est le défaut (cf. `agent_provider::DEFAULT_MODEL`). Liste VOLATILE : le
-/// backend Codex retire/ajoute des slugs (cf. mémoire abonnement ChatGPT).
-pub const MODELS: &[(&str, &str)] = &[
-    ("gpt-5.5", "[openai-codex]"),
-    ("gpt-5.4", "[openai-codex]"),
-    ("gpt-5.4-mini", "[openai-codex]"),
-    ("gpt-5.3-codex-spark", "[openai-codex]"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReasoningEffortMeta {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub hint: &'static str,
+}
+
+pub const REASONING_EFFORTS: &[ReasoningEffortMeta] = &[
+    ReasoningEffortMeta {
+        id: "none",
+        label: "None",
+        hint: "no reasoning",
+    },
+    ReasoningEffortMeta {
+        id: "minimal",
+        label: "Minimal",
+        hint: "smallest reasoning budget",
+    },
+    ReasoningEffortMeta {
+        id: "low",
+        label: "Low",
+        hint: "light reasoning",
+    },
+    ReasoningEffortMeta {
+        id: "medium",
+        label: "Medium",
+        hint: "default",
+    },
+    ReasoningEffortMeta {
+        id: "high",
+        label: "High",
+        hint: "deeper reasoning",
+    },
+    ReasoningEffortMeta {
+        id: "xhigh",
+        label: "Extra high",
+        hint: "highest standard option",
+    },
+    ReasoningEffortMeta {
+        id: "max",
+        label: "Max",
+        hint: "maximum backend effort",
+    },
+    ReasoningEffortMeta {
+        id: "ultra",
+        label: "Ultra",
+        hint: "sent as max",
+    },
 ];
+
+pub const GPT5_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelMeta {
+    pub slug: &'static str,
+    pub tag: &'static str,
+    pub default_reasoning_effort: Option<&'static str>,
+    pub supported_reasoning_efforts: &'static [&'static str],
+}
+
+/// Modèles disponibles. Sous-menu de `/models`. Le premier est le défaut
+/// (cf. `agent_provider::DEFAULT_MODEL`). Liste VOLATILE : le backend Codex
+/// retire/ajoute des slugs, donc garder cette table alignée avec le catalogue.
+pub const MODELS: &[ModelMeta] = &[
+    ModelMeta {
+        slug: "gpt-5.5",
+        tag: "[openai-codex]",
+        default_reasoning_effort: Some("medium"),
+        supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
+    },
+    ModelMeta {
+        slug: "gpt-5.4",
+        tag: "[openai-codex]",
+        default_reasoning_effort: Some("medium"),
+        supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
+    },
+    ModelMeta {
+        slug: "gpt-5.4-mini",
+        tag: "[openai-codex]",
+        default_reasoning_effort: Some("medium"),
+        supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
+    },
+    ModelMeta {
+        slug: "gpt-5.3-codex",
+        tag: "[openai-codex]",
+        default_reasoning_effort: Some("medium"),
+        supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
+    },
+];
+
+pub fn reasoning_effort_label(id: &str) -> String {
+    let trimmed = id.trim();
+    REASONING_EFFORTS
+        .iter()
+        .find(|effort| effort.id.eq_ignore_ascii_case(trimmed))
+        .map(|effort| effort.label.to_string())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    REASONING_EFFORTS
+        .iter()
+        .find(|effort| effort.id == lower || effort.label.to_ascii_lowercase() == lower)
+        .map(|effort| effort.id.to_string())
+        .or_else(|| Some(trimmed.to_string()))
+}
+
+pub fn model_meta(model: &str) -> Option<&'static ModelMeta> {
+    let trimmed = model.trim();
+    MODELS.iter().find(|meta| meta.slug == trimmed)
+}
+
+pub fn supported_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
+    let trimmed = model.trim();
+    if let Some(meta) = model_meta(trimmed) {
+        return meta.supported_reasoning_efforts;
+    }
+    if trimmed.starts_with("gpt-5.") {
+        return GPT5_REASONING_EFFORTS;
+    }
+    &[]
+}
+
+pub fn default_reasoning_effort_for_model(model: &str) -> Option<&'static str> {
+    let trimmed = model.trim();
+    if let Some(meta) = model_meta(trimmed) {
+        return meta.default_reasoning_effort;
+    }
+    if trimmed.starts_with("gpt-5.") {
+        return Some("medium");
+    }
+    None
+}
+
+pub fn normalize_reasoning_effort_for_model(model: &str, value: &str) -> Option<String> {
+    let normalized = normalize_reasoning_effort(value)?;
+    supported_reasoning_efforts_for_model(model)
+        .iter()
+        .any(|effort| effort.eq_ignore_ascii_case(&normalized))
+        .then_some(normalized)
+}
 
 pub const DEFAULT_PERMISSION_MODE_ID: &str = "ask";
 pub const QUIT_SHORTCUT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -188,6 +326,7 @@ enum Menu {
     None,
     Commands,
     Models,
+    Effort,
     Resume,
     Skills,
     Files,
@@ -979,6 +1118,8 @@ impl AppState {
             Menu::Resume
         } else if i.starts_with("/models ") {
             Menu::Models
+        } else if i.starts_with("/effort ") {
+            Menu::Effort
         } else if i.starts_with("/permissions ") {
             Menu::Permissions
         } else if i.starts_with("/skills ") {
@@ -1006,13 +1147,46 @@ impl AppState {
                 let q = self.input.strip_prefix("/models ").unwrap_or("");
                 let mut items = MODELS
                     .iter()
-                    .filter(|(slug, _)| slug.starts_with(q))
-                    .map(|(slug, tag)| MenuItem::new(slug, slug, tag, true))
+                    .filter(|meta| meta.slug.starts_with(q))
+                    .map(|meta| MenuItem::new(meta.slug, meta.slug, meta.tag, true))
                     .collect::<Vec<_>>();
-                if !q.trim().is_empty() && !MODELS.iter().any(|(slug, _)| *slug == q) {
+                if !q.trim().is_empty() && !MODELS.iter().any(|meta| meta.slug == q) {
                     items.push(MenuItem::new(q, q, "custom", true));
                 }
                 items
+            }
+            Menu::Effort => {
+                let q = self.input.strip_prefix("/effort ").unwrap_or("").trim();
+                let q_lower = q.to_ascii_lowercase();
+                let supported = supported_reasoning_efforts_for_model(&self.model);
+                REASONING_EFFORTS
+                    .iter()
+                    .filter(|effort| {
+                        supported
+                            .iter()
+                            .any(|supported| supported.eq_ignore_ascii_case(effort.id))
+                    })
+                    .filter(|effort| {
+                        q.is_empty()
+                            || effort.id.starts_with(&q_lower)
+                            || effort.label.to_ascii_lowercase().contains(&q_lower)
+                    })
+                    .map(|effort| {
+                        let mut hint = effort.hint.to_string();
+                        if self
+                            .reasoning_effort
+                            .as_deref()
+                            .is_some_and(|current| current.eq_ignore_ascii_case(effort.id))
+                        {
+                            hint = if hint.is_empty() {
+                                "current".into()
+                            } else {
+                                format!("{hint} · current")
+                            };
+                        }
+                        MenuItem::new(effort.id, effort.label, &hint, true)
+                    })
+                    .collect()
             }
             Menu::Permissions => {
                 let q = self.input.strip_prefix("/permissions ").unwrap_or("");
@@ -1255,6 +1429,7 @@ impl AppState {
         let value = match kind {
             Menu::Commands => format!("{} ", item.id),
             Menu::Models => format!("/models {}", item.id),
+            Menu::Effort => format!("/effort {}", item.id),
             Menu::Permissions => format!("/permissions {}", item.id),
             Menu::Skills => format!("/{} ", item.id),
             Menu::ProviderAuth if item.id == "subscription" => "/providers subscription ".into(),
@@ -1293,6 +1468,10 @@ impl AppState {
             Menu::Models => {
                 self.clear_input();
                 InputAction::Command(format!("/models {}", item.id))
+            }
+            Menu::Effort => {
+                self.clear_input();
+                InputAction::Command(format!("/effort {}", item.id))
             }
             Menu::Permissions => {
                 self.clear_input();
@@ -2190,6 +2369,74 @@ mod tests {
         assert_eq!(items[0].hint, "custom");
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(action, InputAction::Command("/models gpt-6-preview".into()));
+    }
+
+    #[test]
+    fn effort_submenu_opens_and_selection_routes_command() {
+        let mut s = AppState::new("gpt-5.5", false);
+        s.on_key(key('/'));
+        let effort_idx = COMMANDS
+            .iter()
+            .position(|(name, _, _)| *name == "/effort")
+            .unwrap();
+        for _ in 0..effort_idx {
+            s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert_eq!(
+            s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputAction::None
+        );
+        assert_eq!(s.input, "/effort ");
+        assert!(s.menu_open());
+        assert_eq!(
+            s.menu_items()
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high", "xhigh"]
+        );
+
+        s.set_input("/effort extra".into());
+        let items = s.menu_items();
+        assert!(items.iter().any(|item| item.id == "xhigh"));
+        let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, InputAction::Command("/effort xhigh".into()));
+    }
+
+    #[test]
+    fn effort_submenu_filters_out_unsupported_values() {
+        let mut s = AppState::new("gpt-5.5", false);
+        s.set_input("/effort ".into());
+        let ids = s
+            .menu_items()
+            .into_iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        assert!(!ids.iter().any(|id| id == "none"));
+        assert!(!ids.iter().any(|id| id == "minimal"));
+        assert!(!ids.iter().any(|id| id == "max"));
+        assert!(!ids.iter().any(|id| id == "ultra"));
+    }
+
+    #[test]
+    fn effort_submenu_has_no_items_for_unknown_model() {
+        let mut s = AppState::new("legacy-model", false);
+        s.set_input("/effort future".into());
+        let items = s.menu_items();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn effort_normalization_is_model_aware() {
+        assert_eq!(
+            normalize_reasoning_effort_for_model("gpt-5.5", "xhigh"),
+            Some("xhigh".into())
+        );
+        assert_eq!(normalize_reasoning_effort_for_model("gpt-5.5", "max"), None);
+        assert_eq!(
+            default_reasoning_effort_for_model("gpt-5.4-mini"),
+            Some("medium")
+        );
     }
 
     #[test]
