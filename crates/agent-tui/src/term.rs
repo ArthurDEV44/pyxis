@@ -37,7 +37,11 @@ pub fn enter() -> io::Result<Tui> {
         return Err(e);
     }
     #[cfg(feature = "codex_tui_parity")]
-    let inline_height = size().map(|(_, rows)| rows.max(1)).unwrap_or(24);
+    let measured = size();
+    #[cfg(feature = "codex_tui_parity")]
+    crate::debug_log::log(&format!("enter: crossterm::size() = {measured:?}"));
+    #[cfg(feature = "codex_tui_parity")]
+    let inline_height = measured.map(|(_, rows)| rows.max(1)).unwrap_or(24);
     #[cfg(feature = "codex_tui_parity")]
     if let Err(e) = execute!(
         out,
@@ -58,6 +62,15 @@ pub fn enter() -> io::Result<Tui> {
         },
     );
     match terminal {
+        #[cfg(feature = "codex_tui_parity")]
+        Ok(mut tui) => {
+            crate::debug_log::log(&format!(
+                "enter: inline_height={inline_height} viewport={:?}",
+                tui.get_frame().area()
+            ));
+            Ok(tui)
+        }
+        #[cfg(not(feature = "codex_tui_parity"))]
         Ok(tui) => Ok(tui),
         Err(e) => {
             let mut out = io::stdout();

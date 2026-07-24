@@ -9,6 +9,9 @@
 /.claude/settings.local.json
 /.claude/agent-memory
 
+# Trace de diagnostic du TUI (PYXIS_DEBUG_TUI)
+/pyxis-tui-debug.log
+
 # Editor / OS cruft
 *.swp
 *.swo
