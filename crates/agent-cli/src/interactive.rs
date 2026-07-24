@@ -165,6 +165,16 @@ const KEY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MCP_DISABLED_NOTICE: &str =
     "MCP: config diagnostics only. MCP tool execution is not exposed in this build.";
 
+fn persist_model(state: &mut AppState, settings_path: Option<&Path>, model: &str) {
+    if let Some(path) = settings_path
+        && let Err(err) = crate::settings::save_model(path, model)
+    {
+        state
+            .blocks
+            .push(Block::Error(format!("settings: failed to save model: {err}")));
+    }
+}
+
 fn persist_reasoning_effort(
     state: &mut AppState,
     settings_path: Option<&Path>,
@@ -728,6 +738,7 @@ async fn event_loop(
                                     state.blocks.push(Block::Notice(format!(
                                         "Model: {arg}{effort_suffix}{suffix}"
                                     )));
+                                    persist_model(&mut state, cfg.settings_path.as_deref(), arg);
                                     persist_reasoning_effort(
                                         &mut state,
                                         cfg.settings_path.as_deref(),

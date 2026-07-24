@@ -59,7 +59,14 @@ pub enum SandboxError {
 #[cfg(target_os = "linux")]
 const STANDARD_DEVICES: &[&str] = &["/dev/tty", "/dev/null"];
 
-pub fn enforce_process(workspace: &std::path::Path) -> Result<SandboxStatus, SandboxError> {
+/// `writable_files` : fichiers EXISTANTS hors workspace auxquels le process garde
+/// un droit d'écriture (`~/.pyxis/settings.toml`). Portée volontairement réduite
+/// au fichier, jamais à son dossier : le confinement reste vrai pour tout le reste
+/// du home. Un chemin absent est ignoré (la règle Landlock exige un fd ouvrable).
+pub fn enforce_process(
+    workspace: &std::path::Path,
+    writable_files: &[&std::path::Path],
+) -> Result<SandboxStatus, SandboxError> {
     use landlock::{
         ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
         RulesetCreatedAttr, RulesetStatus,
@@ -104,6 +111,22 @@ pub fn enforce_process(workspace: &std::path::Path) -> Result<SandboxStatus, San
             .map_err(|e| SandboxError::Landlock(e.to_string()))?;
     }
 
+    // Écriture au fichier près : `from_file` est le sous-ensemble applicable à un
+    // fichier régulier (`WriteFile`, `Truncate`…). `from_all` y ajouterait des
+    // droits de répertoire, que le kernel refuse sur un fichier — la ruleset
+    // retomberait alors en `PartiallyEnforced` et déclencherait un faux
+    // avertissement de confinement dégradé. Les droits de création vivant sur le
+    // dossier parent, un fichier supprimé après l'enforcement n'est plus
+    // recréable : la sauvegarde échoue alors explicitement.
+    for file in writable_files {
+        let Ok(fd) = PathFd::new(file) else {
+            continue;
+        };
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, AccessFs::from_file(abi)))
+            .map_err(|e| SandboxError::Landlock(e.to_string()))?;
+    }
+
     let status = ruleset
         .restrict_self()
         .map_err(|e| SandboxError::Landlock(e.to_string()))?;
@@ -118,7 +141,10 @@ pub fn enforce_process(workspace: &std::path::Path) -> Result<SandboxStatus, San
 /// Hors Linux : dégradation explicite (AC3). Le sandbox FS est désactivé ;
 /// l'appelant DOIT avertir l'utilisateur via `SandboxStatus::warning`.
 #[cfg(not(target_os = "linux"))]
-pub fn enforce_process(_workspace: &std::path::Path) -> Result<SandboxStatus, SandboxError> {
+pub fn enforce_process(
+    _workspace: &std::path::Path,
+    _writable_files: &[&std::path::Path],
+) -> Result<SandboxStatus, SandboxError> {
     Ok(SandboxStatus::UnsupportedPlatform)
 }
 
@@ -141,7 +167,7 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_linux_degrades() {
-        let st = enforce_process(std::path::Path::new("/tmp")).unwrap();
+        let st = enforce_process(std::path::Path::new("/tmp"), &[]).unwrap();
         assert_eq!(st, SandboxStatus::UnsupportedPlatform);
     }
 }

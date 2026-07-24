@@ -38,6 +38,9 @@ struct Args {
     prompt: Option<String>,
     resume: Option<String>,
     model: String,
+    /// `--model` passé explicitement : distingue le défaut de compilation d'un
+    /// choix utilisateur, et prime donc sur le modèle persisté.
+    model_from_cli: bool,
     allow_hosts: Vec<String>,
     yes: bool,
     sandbox: bool,
@@ -90,6 +93,7 @@ where
         prompt: None,
         resume: None,
         model: agent_provider::DEFAULT_MODEL.to_string(),
+        model_from_cli: false,
         allow_hosts: Vec::new(),
         yes: false,
         sandbox: true,
@@ -111,7 +115,10 @@ where
                     _ => Some(String::new()),
                 };
             }
-            "--model" => args.model = next_value(&mut it, "--model")?,
+            "--model" => {
+                args.model = next_value(&mut it, "--model")?;
+                args.model_from_cli = true;
+            }
             "--allow" => args.allow_hosts.push(next_value(&mut it, "--allow")?),
             "--yes" | "-y" => args.yes = true,
             "--no-sandbox" => args.sandbox = false,
@@ -279,7 +286,11 @@ fn permission_policy(headless: bool, yes: bool, _sandbox_enforced: bool) -> CliP
     }
 }
 
-fn sandbox_enforced_from_args(args: &Args, workspace: &std::path::Path) -> bool {
+fn sandbox_enforced_from_args(
+    args: &Args,
+    workspace: &std::path::Path,
+    settings_path: Option<&std::path::Path>,
+) -> bool {
     if !args.sandbox {
         if args.yes {
             eprintln!(
@@ -290,7 +301,8 @@ fn sandbox_enforced_from_args(args: &Args, workspace: &std::path::Path) -> bool 
         }
         return false;
     }
-    match agent_sandbox::enforce_process(workspace) {
+    let writable: Vec<&std::path::Path> = settings_path.into_iter().collect();
+    match agent_sandbox::enforce_process(workspace, &writable) {
         Ok(status) => {
             if let Some(w) = status.warning() {
                 eprintln!("[sandbox] {w}");
@@ -338,8 +350,23 @@ fn main() -> anyhow::Result<()> {
 
     let credential = prepare_credential_before_sandbox(&args)?;
 
+    // Réglages persistants (`~/.pyxis/settings.toml`) : hors workspace, donc le
+    // fichier doit exister AVANT Landlock pour recevoir sa règle d'écriture. En
+    // headless (-p) rien n'est persisté : la session est pilotée par les flags.
+    let settings_path = if args.prompt.is_none() {
+        settings::default_settings_path().filter(|path| match settings::ensure_file(path) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("[settings] {}: {err}", path.display());
+                false
+            }
+        })
+    } else {
+        None
+    };
+
     // Sandbox FS AVANT le runtime (thread principal → hérité par les workers).
-    let sandbox_enforced = sandbox_enforced_from_args(&args, &workspace);
+    let sandbox_enforced = sandbox_enforced_from_args(&args, &workspace, settings_path.as_deref());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -347,11 +374,14 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(run(
         args,
         workspace,
-        skills,
-        mcp_config,
-        context_msgs,
+        PreSandbox {
+            skills,
+            mcp_config,
+            context_msgs,
+            cred: credential,
+            settings_path,
+        },
         sandbox_enforced,
-        credential,
     ))
 }
 
@@ -498,22 +528,48 @@ fn read_skills() -> Vec<String> {
     skills
 }
 
-async fn run(
-    args: Args,
-    workspace: std::path::PathBuf,
+/// Tout ce qui touche un chemin hors workspace, donc chargé ou créé AVANT
+/// l'enforcement Landlock : au-delà, seul le workspace (et le fichier de réglages)
+/// reste accessible en écriture.
+struct PreSandbox {
     skills: Vec<String>,
     mcp_config: agent_mcp::McpConfigFile,
     context_msgs: Vec<Message>,
-    sandbox_enforced: bool,
     cred: OAuthCredential,
+    settings_path: Option<std::path::PathBuf>,
+}
+
+async fn run(
+    mut args: Args,
+    workspace: std::path::PathBuf,
+    pre: PreSandbox,
+    sandbox_enforced: bool,
 ) -> anyhow::Result<()> {
+    let PreSandbox {
+        skills,
+        mcp_config,
+        context_msgs,
+        cred,
+        settings_path,
+    } = pre;
+    // `--model` explicite prime ; sinon on reprend le dernier modèle choisi via
+    // `/models`. Résolu AVANT tout le reste : la validation du fallback et l'effort
+    // initial se calculent sur le modèle réellement utilisé.
+    if !args.model_from_cli
+        && let Some(model) = settings_path
+            .as_deref()
+            .and_then(|path| match settings::load_model(path) {
+                Ok(model) => model,
+                Err(err) => {
+                    eprintln!("[settings] model: {err}");
+                    None
+                }
+            })
+    {
+        args.model = model;
+    }
     let run_config = run_config_from_args(&args)?;
     let headless = args.prompt.is_some();
-    let settings_path = if headless {
-        None
-    } else {
-        settings::default_settings_path()
-    };
     let saved_reasoning_effort =
         settings_path
             .as_deref()
@@ -743,6 +799,7 @@ mod tests {
     fn args() -> Args {
         Args {
             model: "mock".into(),
+            model_from_cli: true,
             prompt: None,
             resume: None,
             allow_hosts: Vec::new(),

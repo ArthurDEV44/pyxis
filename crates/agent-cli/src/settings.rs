@@ -6,6 +6,7 @@ use agent_tools::PermissionMode;
 const SETTINGS_FILE: &str = "settings.toml";
 const PERMISSION_MODE_KEY: &str = "permission_mode";
 const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+const MODEL_KEY: &str = "model";
 
 pub fn permission_mode_id(mode: PermissionMode) -> &'static str {
     match mode {
@@ -57,6 +58,28 @@ pub fn save_reasoning_effort(path: &Path, effort: Option<&str>) -> io::Result<()
         REASONING_EFFORT_KEY,
         effort.map(str::trim).filter(|value| !value.is_empty()),
     )
+}
+
+pub fn load_model(path: &Path) -> io::Result<Option<String>> {
+    Ok(load_string_key(path, MODEL_KEY)?.filter(|value| !value.trim().is_empty()))
+}
+
+pub fn save_model(path: &Path, model: &str) -> io::Result<()> {
+    save_string_key(path, MODEL_KEY, Some(model.trim()).filter(|v| !v.is_empty()))
+}
+
+/// Crée le fichier (vide) et son dossier s'ils manquent. À appeler AVANT le
+/// sandbox : Landlock ne sait accorder un droit d'écriture qu'à un chemin déjà
+/// ouvrable, et le dossier parent reste, lui, en lecture seule.
+pub fn ensure_file(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(|_| ())
 }
 
 fn load_string_key(path: &Path, expected_key: &str) -> io::Result<Option<String>> {
@@ -223,6 +246,36 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "permission_mode = \"ask\"\nreasoning_effort = \"high\"\n"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_model_round_trips_and_preserves_other_keys() {
+        let path = temp_path("model-round-trip");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "reasoning_effort = \"xhigh\"\n").unwrap();
+
+        save_model(&path, "gpt-5.6-sol").unwrap();
+
+        assert_eq!(load_model(&path).unwrap().as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(
+            load_reasoning_effort(&path).unwrap().as_deref(),
+            Some("xhigh")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ensure_file_creates_empty_settings_without_clobbering() {
+        let path = temp_path("ensure").with_extension("d").join("settings.toml");
+        let _ = std::fs::remove_file(&path);
+
+        ensure_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        save_model(&path, "gpt-5.5").unwrap();
+        ensure_file(&path).unwrap();
+        assert_eq!(load_model(&path).unwrap().as_deref(), Some("gpt-5.5"));
         let _ = std::fs::remove_file(path);
     }
 
