@@ -101,7 +101,6 @@ impl Tool for Bash {
 
         #[cfg(not(windows))]
         {
-            use std::os::unix::process::CommandExt;
             cmd.arg("-c").arg(&input.command);
             cmd.process_group(0);
         }
