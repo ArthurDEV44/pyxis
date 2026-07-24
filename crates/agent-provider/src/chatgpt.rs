@@ -87,6 +87,11 @@ fn reasoning_effort_for_request(effort: &str) -> &str {
 /// Borne du corps d'erreur HTTP capturé (évite un message géant en log).
 const MAX_ERR_BODY: usize = 2000;
 
+/// Budget total de la découverte du catalogue (`/models`). Hors chemin critique :
+/// un backend lent ne doit jamais retarder la session, le catalogue embarqué prend
+/// le relais.
+const MODELS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Timeout d'ÉTABLISSEMENT de connexion (US-022). Un backend qui n'établit jamais
 /// la connexion (proxy d'entreprise, DNS noir) échoue ici plutôt que de geler ;
 /// l'erreur `reqwest` est mappée `Transport` → classifiée `Retryable`. Pi : 20 s.
@@ -225,6 +230,38 @@ impl OpenAiChatGptProvider {
             .read()
             .map(|key| key.clone())
             .unwrap_or_else(|_| new_session_id())
+    }
+
+    /// Catalogue des modèles offerts au compte connecté (`GET /models`), trié par
+    /// priorité backend. Découverte à chaud : jamais une liste figée dans le
+    /// binaire (le backend retire/ajoute des slugs sans préavis). Hors du trait
+    /// `Provider` : la notion de catalogue est propre à cet adapter.
+    pub async fn list_models(&self) -> Result<Vec<crate::models::CatalogModel>, ProviderError> {
+        let spec = self.creds.models_spec().await?;
+        let mut req = self.http.get(&spec.url).timeout(MODELS_TIMEOUT);
+        for (name, value) in &spec.headers {
+            req = req.header(name, value);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(format!("models: {e}")))?;
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| ProviderError::Transport(format!("models body: {e}")))?;
+        if !status.is_success() {
+            let mut message = body;
+            message.truncate(MAX_ERR_BODY);
+            return Err(ProviderError::Http {
+                status: status.as_u16(),
+                message,
+                retry_after_ms: None,
+            });
+        }
+        crate::models::parse_catalog(&body)
+            .map_err(|e| ProviderError::Decode(format!("models: {e}")))
     }
 }
 

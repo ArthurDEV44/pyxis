@@ -75,7 +75,27 @@ pub fn originator_for(pyxis_accepted: bool) -> &'static str {
 
 pub const CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub const RESPONSES_PATH: &str = "/responses";
+pub const MODELS_PATH: &str = "/models";
 pub const OPENAI_BETA_SSE: &str = "responses=experimental";
+
+/// Version client annoncée au backend sur `/models`. Le backend FILTRE le
+/// catalogue sur le `minimal_client_version` de chaque modèle : annoncer une
+/// version trop basse renvoie une liste vide (mesuré le 2026-07-24 : `0.1.0` → 0
+/// modèle, `0.98.0` → 3, `0.124.0` → 5, `0.145.0` → 8). Ce n'est donc PAS la
+/// version de Pyxis mais un numéro de compatibilité de catalogue Codex.
+/// **Volatile, mise à jour manuelle** : refléter le dernier tag `rust-vX.Y.Z` de
+/// `openai/codex` (`gh release view --repo openai/codex --json tagName`) à chaque
+/// release, sinon les modèles introduits depuis restent invisibles dans `/models`.
+/// Override à chaud via `PYXIS_CODEX_CLIENT_VERSION`.
+pub const CODEX_CLIENT_VERSION: &str = "0.145.0"; // openai/codex rust-v0.145.0, 2026-07-21
+
+/// `client_version` effectif envoyé sur `/models` (cf. `CODEX_CLIENT_VERSION`).
+pub fn codex_client_version() -> String {
+    match std::env::var("PYXIS_CODEX_CLIENT_VERSION") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => CODEX_CLIENT_VERSION.to_string(),
+    }
+}
 
 // ──────────────────────────────── Erreurs ────────────────────────────────
 
@@ -314,6 +334,34 @@ impl std::fmt::Debug for RequestSpec {
 /// En-têtes d'inférence SSE pour une credential abonnement ChatGPT. Le
 /// `chatgpt-account-id` (dérivé du JWT) est requis pour router vers le compte.
 pub fn responses_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> {
+    let mut headers = auth_headers(cred)?;
+    headers.push(("OpenAI-Beta".to_string(), OPENAI_BETA_SSE.to_string()));
+    headers.push(("accept".to_string(), "text/event-stream".to_string()));
+    headers.push(("content-type".to_string(), "application/json".to_string()));
+    Ok(RequestSpec {
+        url: format!("{CHATGPT_BASE_URL}{RESPONSES_PATH}"),
+        headers,
+    })
+}
+
+/// Requête de découverte du catalogue de modèles (`GET /models`). Le backend
+/// renvoie les modèles accessibles AU COMPTE connecté (champ `available_in_plans`
+/// déjà appliqué), filtrés par `client_version` (cf. `CODEX_CLIENT_VERSION`).
+pub fn models_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthError> {
+    let mut headers = auth_headers(cred)?;
+    headers.push(("accept".to_string(), "application/json".to_string()));
+    let mut url = url::Url::parse(&format!("{CHATGPT_BASE_URL}{MODELS_PATH}"))
+        .map_err(|e| AuthError::Callback(e.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("client_version", &codex_client_version());
+    Ok(RequestSpec {
+        url: url.to_string(),
+        headers,
+    })
+}
+
+/// En-têtes d'identification communs à toutes les requêtes backend Codex.
+fn auth_headers(cred: &OAuthCredential) -> Result<Vec<(String, String)>, AuthError> {
     if cred.provider != ProviderId::OpenAiChatGpt {
         return Err(AuthError::WrongProvider(cred.provider));
     }
@@ -321,20 +369,14 @@ pub fn responses_request(cred: &OAuthCredential) -> Result<RequestSpec, AuthErro
         .account_id
         .as_deref()
         .ok_or(AuthError::MissingAccountId)?;
-    Ok(RequestSpec {
-        url: format!("{CHATGPT_BASE_URL}{RESPONSES_PATH}"),
-        headers: vec![
-            (
-                "Authorization".to_string(),
-                format!("Bearer {}", cred.access.expose()),
-            ),
-            ("chatgpt-account-id".to_string(), account_id.to_string()),
-            ("originator".to_string(), originator()),
-            ("OpenAI-Beta".to_string(), OPENAI_BETA_SSE.to_string()),
-            ("accept".to_string(), "text/event-stream".to_string()),
-            ("content-type".to_string(), "application/json".to_string()),
-        ],
-    })
+    Ok(vec![
+        (
+            "Authorization".to_string(),
+            format!("Bearer {}", cred.access.expose()),
+        ),
+        ("chatgpt-account-id".to_string(), account_id.to_string()),
+        ("originator".to_string(), originator()),
+    ])
 }
 
 // ──────────────────────────── Réseau (token exchange / refresh) ────────────────────────────

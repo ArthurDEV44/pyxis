@@ -44,6 +44,19 @@ impl CredentialManager {
     /// Garantit un access token frais (refresh + réécriture keyring si nécessaire)
     /// et retourne la spec de requête d'inférence (URL + en-têtes propriétaires).
     pub async fn request_spec(&self) -> Result<RequestSpec, ProviderError> {
+        self.fresh_spec(openai_chatgpt::responses_request).await
+    }
+
+    /// Idem `request_spec` pour la découverte du catalogue de modèles (`/models`).
+    pub async fn models_spec(&self) -> Result<RequestSpec, ProviderError> {
+        self.fresh_spec(openai_chatgpt::models_request).await
+    }
+
+    /// Garantit un access token frais puis fabrique la spec via `build`.
+    async fn fresh_spec(
+        &self,
+        build: fn(&OAuthCredential) -> Result<RequestSpec, AuthError>,
+    ) -> Result<RequestSpec, ProviderError> {
         let mut state = self.state.lock().await;
         let now = openai_chatgpt::now_ms();
         if state.cred.is_none() {
@@ -59,7 +72,7 @@ impl CredentialManager {
             self.refresh_locked(&mut state, now).await?;
         }
         let cred = state.cred.as_ref().ok_or_else(disconnected_error)?;
-        openai_chatgpt::responses_request(cred).map_err(convert_auth_err)
+        build(cred).map_err(convert_auth_err)
     }
 
     /// Force un refresh même si l'horloge locale pense encore le token valide.

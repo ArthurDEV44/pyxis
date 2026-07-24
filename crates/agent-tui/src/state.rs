@@ -4,6 +4,7 @@
 //! que la boucle agent-cli interprète (soumission, permission, quit, scroll).
 
 use std::cell::{Cell, RefCell};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use agent_core::AgentEvent;
@@ -138,6 +139,12 @@ pub const REASONING_EFFORTS: &[ReasoningEffortMeta] = &[
 ];
 
 pub const GPT5_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
+const EFFORTS_TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const EFFORTS_TO_ULTRA: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+
+/// Tag provider affiché en hint dans le sous-menu `/models`. Un seul canal de
+/// modèles est câblé aujourd'hui (abonnement ChatGPT via le backend Codex).
+const CODEX_TAG: &str = "[openai-codex]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelMeta {
@@ -147,35 +154,102 @@ pub struct ModelMeta {
     pub supported_reasoning_efforts: &'static [&'static str],
 }
 
-/// Modèles disponibles. Sous-menu de `/models`. Le premier est le défaut
-/// (cf. `agent_provider::DEFAULT_MODEL`). Liste VOLATILE : le backend Codex
-/// retire/ajoute des slugs, donc garder cette table alignée avec le catalogue.
-pub const MODELS: &[ModelMeta] = &[
+/// Catalogue de SECOURS, utilisé tant que le backend n'a pas répondu (démarrage,
+/// hors ligne, token expiré). La liste faisant autorité est celle que le compte
+/// connecté renvoie sur `GET /models` : voir `set_models` / `models()`. Snapshot
+/// du 2026-07-24, ordre = priorité backend.
+const BUNDLED_MODELS: &[ModelMeta] = &[
+    ModelMeta {
+        slug: "gpt-5.6-sol",
+        tag: CODEX_TAG,
+        default_reasoning_effort: Some("low"),
+        supported_reasoning_efforts: EFFORTS_TO_ULTRA,
+    },
+    ModelMeta {
+        slug: "gpt-5.6-terra",
+        tag: CODEX_TAG,
+        default_reasoning_effort: Some("medium"),
+        supported_reasoning_efforts: EFFORTS_TO_ULTRA,
+    },
+    ModelMeta {
+        slug: "gpt-5.6-luna",
+        tag: CODEX_TAG,
+        default_reasoning_effort: Some("medium"),
+        supported_reasoning_efforts: EFFORTS_TO_MAX,
+    },
     ModelMeta {
         slug: "gpt-5.5",
-        tag: "[openai-codex]",
+        tag: CODEX_TAG,
         default_reasoning_effort: Some("medium"),
         supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
     },
     ModelMeta {
         slug: "gpt-5.4",
-        tag: "[openai-codex]",
+        tag: CODEX_TAG,
         default_reasoning_effort: Some("medium"),
         supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
     },
     ModelMeta {
         slug: "gpt-5.4-mini",
-        tag: "[openai-codex]",
+        tag: CODEX_TAG,
         default_reasoning_effort: Some("medium"),
         supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
     },
     ModelMeta {
-        slug: "gpt-5.3-codex",
-        tag: "[openai-codex]",
-        default_reasoning_effort: Some("medium"),
+        slug: "gpt-5.3-codex-spark",
+        tag: CODEX_TAG,
+        default_reasoning_effort: Some("high"),
         supported_reasoning_efforts: GPT5_REASONING_EFFORTS,
     },
 ];
+
+/// Catalogue publié par le backend pour le compte connecté. Écrit une seule fois
+/// par process (`set_models`), lu sans verrou par le rendu.
+static REMOTE_MODELS: OnceLock<&'static [ModelMeta]> = OnceLock::new();
+
+/// Modèle tel que le provider l'a découvert, avant conversion en `ModelMeta`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCatalogEntry {
+    pub slug: String,
+    pub default_reasoning_effort: Option<String>,
+    pub supported_reasoning_efforts: Vec<String>,
+}
+
+/// Catalogue actif : celui du backend dès qu'il est connu, sinon `BUNDLED_MODELS`.
+pub fn models() -> &'static [ModelMeta] {
+    REMOTE_MODELS.get().copied().unwrap_or(BUNDLED_MODELS)
+}
+
+/// Publie le catalogue découvert sur le backend. Renvoie `false` si la liste est
+/// vide (backend qui ne connaît pas notre `client_version`) ou si un catalogue a
+/// déjà été publié : dans les deux cas le catalogue courant reste en place.
+///
+/// Les chaînes sont volontairement fuitées : le catalogue est immuable et vit
+/// aussi longtemps que le process, ce qui garde `ModelMeta: Copy` et les
+/// signatures `&'static` de tous les appelants.
+pub fn set_models(entries: Vec<ModelCatalogEntry>) -> bool {
+    if entries.is_empty() {
+        return false;
+    }
+    let metas: Vec<ModelMeta> = entries
+        .into_iter()
+        .map(|entry| ModelMeta {
+            slug: String::leak(entry.slug),
+            tag: CODEX_TAG,
+            default_reasoning_effort: entry
+                .default_reasoning_effort
+                .map(|effort| &*String::leak(effort)),
+            supported_reasoning_efforts: Vec::leak(
+                entry
+                    .supported_reasoning_efforts
+                    .into_iter()
+                    .map(|effort| &*String::leak(effort))
+                    .collect::<Vec<&'static str>>(),
+            ),
+        })
+        .collect();
+    REMOTE_MODELS.set(Box::leak(metas.into_boxed_slice())).is_ok()
+}
 
 pub fn reasoning_effort_label(id: &str) -> String {
     let trimmed = id.trim();
@@ -201,7 +275,7 @@ pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
 
 pub fn model_meta(model: &str) -> Option<&'static ModelMeta> {
     let trimmed = model.trim();
-    MODELS.iter().find(|meta| meta.slug == trimmed)
+    models().iter().find(|meta| meta.slug == trimmed)
 }
 
 pub fn supported_reasoning_efforts_for_model(model: &str) -> &'static [&'static str] {
@@ -1145,12 +1219,12 @@ impl AppState {
                 .collect(),
             Menu::Models => {
                 let q = self.input.strip_prefix("/models ").unwrap_or("");
-                let mut items = MODELS
+                let mut items = models()
                     .iter()
                     .filter(|meta| meta.slug.starts_with(q))
                     .map(|meta| MenuItem::new(meta.slug, meta.slug, meta.tag, true))
                     .collect::<Vec<_>>();
-                if !q.trim().is_empty() && !MODELS.iter().any(|meta| meta.slug == q) {
+                if !q.trim().is_empty() && !models().iter().any(|meta| meta.slug == q) {
                     items.push(MenuItem::new(q, q, "custom", true));
                 }
                 items
@@ -2352,11 +2426,14 @@ mod tests {
         );
         assert_eq!(s.input, "/models ");
         assert!(s.menu_open());
-        assert_eq!(s.menu_items().len(), MODELS.len());
+        assert_eq!(s.menu_items().len(), models().len());
         // Naviguer puis sélectionner un modèle → exécute `/models <slug>`.
-        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → gpt-5.4
+        s.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)); // → 2e du catalogue
         let action = s.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(action, InputAction::Command("/models gpt-5.4".into()));
+        assert_eq!(
+            action,
+            InputAction::Command(format!("/models {}", models()[1].slug))
+        );
     }
 
     #[test]

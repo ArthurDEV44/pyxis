@@ -544,7 +544,30 @@ async fn run(
     {
         chatgpt = chatgpt.with_idle_timeout(std::time::Duration::from_secs(secs));
     }
-    let provider: Arc<dyn Provider> = Arc::new(chatgpt);
+    let chatgpt = Arc::new(chatgpt);
+    // Catalogue `/models` découvert sur le compte connecté, hors chemin critique :
+    // la session démarre sur le catalogue embarqué et bascule dès la réponse. Un
+    // échec (hors ligne, token expiré) laisse simplement le catalogue embarqué.
+    if !headless {
+        let catalog_source = Arc::clone(&chatgpt);
+        tokio::spawn(async move {
+            // Erreur volontairement muette : le TUI occupe le terminal, et le
+            // catalogue embarqué reste un fallback correct.
+            if let Ok(models) = catalog_source.list_models().await {
+                agent_tui::set_models(
+                    models
+                        .into_iter()
+                        .map(|model| agent_tui::ModelCatalogEntry {
+                            slug: model.slug,
+                            default_reasoning_effort: model.default_reasoning_effort,
+                            supported_reasoning_efforts: model.supported_reasoning_efforts,
+                        })
+                        .collect(),
+                );
+            }
+        });
+    }
+    let provider: Arc<dyn Provider> = chatgpt;
 
     // 2. Proxy réseau allow-list (fail-closed). Durcit les commandes Bash.
     let proxy = agent_sandbox::spawn_proxy(ProxyPolicy::new(args.allow_hosts.clone())).await?;
